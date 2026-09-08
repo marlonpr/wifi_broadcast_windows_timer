@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/windows-controller/">
+    <Project Path="windows-controller/FactoryTimer.Controller/FactoryTimer.Controller.csproj" />
+    <Project Path="windows-controller/FactoryTimer.Controller.Core/FactoryTimer.Controller.Core.csproj" />
+    <Project Path="windows-controller/FactoryTimer.Protocol/FactoryTimer.Protocol.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FactoryTimer.Controller.Core.Tests/FactoryTimer.Controller.Core.Tests.csproj" />
+    <Project Path="tests/FactoryTimer.Protocol.Tests/FactoryTimer.Protocol.Tests.csproj" />
+  </Folder>
+</Solution>

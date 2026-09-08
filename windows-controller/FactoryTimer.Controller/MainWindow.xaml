@@ -1,0 +1,350 @@
+<Window
+    x:Class="FactoryTimer.Controller.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Title="Factory Countdown Controller">
+
+    <ScrollViewer>
+        <Grid MaxWidth="1160" Padding="32" HorizontalAlignment="Center">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <StackPanel Spacing="4">
+                <TextBlock Text="Factory countdown" Style="{ThemeResource TitleTextBlockStyle}" />
+                <TextBlock Text="Infrastructure Wi-Fi · FCT2 absolute-time synchronization · UDP 5000"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            </StackPanel>
+
+            <Border Grid.Row="1" Margin="0,24,0,0" Padding="24" CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                <Grid ColumnSpacing="24">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="1.25*" />
+                        <ColumnDefinition Width="1*" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Spacing="16">
+                        <TextBlock Text="Controller timer" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                        <StackPanel Orientation="Horizontal" Spacing="18" VerticalAlignment="Bottom">
+                            <TextBlock Text="{Binding ControllerRemaining}" FontSize="80" FontWeight="SemiBold"
+                                       FontFamily="Consolas" />
+                            <TextBlock Text="seconds" Margin="0,0,0,14"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding ControllerState}" FontSize="18" FontWeight="SemiBold" />
+                    </StackPanel>
+
+                    <StackPanel Grid.Column="1" Spacing="12">
+                        <TextBlock Text="Duration" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                        <NumberBox Header="Seconds" Value="{Binding DurationInput, Mode=TwoWay}"
+                                   Minimum="1" Maximum="86400" SmallChange="1" SpinButtonPlacementMode="Inline" />
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button Content="START_AT" Click="Start_Click" IsEnabled="{Binding CanSend}"
+                                    HorizontalAlignment="Stretch" Style="{StaticResource AccentButtonStyle}" />
+                            <Button Grid.Column="1" Content="RESET" Click="Reset_Click"
+                                    IsEnabled="{Binding CanSend}" HorizontalAlignment="Stretch" />
+                        </Grid>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Border Grid.Row="2" Margin="0,16,0,0" Padding="20" CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                <Grid ColumnSpacing="24">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="1.4*" />
+                        <ColumnDefinition Width="1*" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="Clock synchronization" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                        <TextBlock Text="Master monotonic time" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="{Binding MasterTime}" FontFamily="Consolas" FontSize="20" />
+                        <TextBlock Text="{Binding SynchronizationResolution}" TextWrapping="Wrap" />
+                        <TextBlock Text="{Binding StartSynchronizationResult}" TextWrapping="Wrap" FontWeight="SemiBold" />
+                        <Button Content="SYNC CLOCKS" Click="Sync_Click" IsEnabled="{Binding CanSend}"
+                                HorizontalAlignment="Left" Style="{StaticResource AccentButtonStyle}" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Spacing="10">
+                        <TextBlock Text="SYNC path-delay experiment" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                        <ComboBox Header="ESP02 calibration path"
+                                  SelectedIndex="{Binding SyncPathDelayModeIndex, Mode=TwoWay}"
+                                  IsEnabled="{Binding CanSend}"
+                                  HorizontalAlignment="Stretch">
+                            <ComboBoxItem Content="NONE — 0 / 0 ms" />
+                            <ComboBoxItem Content="SYMMETRIC — 250 / 250 ms" />
+                            <ComboBoxItem Content="ASYMMETRIC — 250 / 0 ms" />
+                        </ComboBox>
+                        <TextBlock Text="{Binding SyncPathDelayDescription}"
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="Only ESP02 calibration samples are injected. ESP01, ESP03, ESP04, and ESP05 are no-delay controls; verification and START_AT delivery remain delay-free for all five devices. Changing this mode invalidates the previous sync; press SYNC CLOCKS again."
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Border Grid.Row="3" Margin="0,16,0,0" Padding="20" CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                <Grid ColumnSpacing="24">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="0.9*" />
+                        <ColumnDefinition Width="1.7*" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Spacing="10">
+                        <TextBlock Text="Automatic benchmark" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                        <NumberBox Header="Trials (fresh SYNC + START_AT per trial)"
+                                   Value="{Binding BenchmarkTrialsInput, Mode=TwoWay}"
+                                   Minimum="1" Maximum="100" SmallChange="1" SpinButtonPlacementMode="Inline" />
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Button Content="RUN BENCHMARK" Click="Benchmark_Click" IsEnabled="{Binding CanSend}"
+                                    HorizontalAlignment="Stretch" Style="{StaticResource AccentButtonStyle}" />
+                            <Button Grid.Column="1" Content="STOP" Click="StopBenchmark_Click"
+                                    IsEnabled="{Binding CanCancelBenchmark}" />
+                        </Grid>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Spacing="7">
+                        <TextBlock Text="Benchmark result" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding BenchmarkProgress}" TextWrapping="Wrap" />
+                        <TextBlock Text="CSV output" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="{Binding BenchmarkCsvPath}" TextWrapping="Wrap" FontFamily="Consolas" />
+                        <TextBlock Text="Each trial performs a fresh 8-sample calibration and 4-sample delay-free verification on every device, sends one common absolute START_AT target, waits for STARTED telemetry from all five devices, records the measurements, then resets the countdown before the next trial. CSV files are saved automatically under Documents\FactoryTimerBenchmarks."
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="4" Margin="0,16,0,0" ColumnSpacing="16">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Padding="20" CornerRadius="12"
+                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                    <StackPanel Spacing="10">
+                        <Grid>
+                            <TextBlock Text="ESP01" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                            <TextBlock Text="{Binding Esp01.OnlineText}" HorizontalAlignment="Right"
+                                       Foreground="{Binding Esp01.OnlineBrush}" FontWeight="SemiBold" />
+                        </Grid>
+                        <Grid ColumnSpacing="12" RowSpacing="7">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="160" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="IP address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding Esp01.IpAddress}"/>
+                            <TextBlock Grid.Row="1" Text="Sync state" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Esp01.SynchronizationState}" FontWeight="SemiBold"/>
+                            <TextBlock Grid.Row="2" Text="Estimated Master" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding Esp01.EstimatedMasterTime}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="3" Text="Clock error" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding Esp01.ClockError}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="4" Text="Best sync RTT" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding Esp01.BestRtt}"/>
+                            <TextBlock Grid.Row="5" Text="Verify RTT" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding Esp01.VerificationRtt}"/>
+                            <TextBlock Grid.Row="6" Text="Applied offset" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding Esp01.AppliedOffset}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="7" Text="Verified start Master" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="7" Grid.Column="1" Text="{Binding Esp01.ActualStartMasterTime}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="8" Text="Start timing error" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="8" Grid.Column="1" Text="{Binding Esp01.StartTimingError}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="9" Text="Last command ID" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="9" Grid.Column="1" Text="{Binding Esp01.LastCommandId}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="10" Text="Remaining" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="10" Grid.Column="1" Text="{Binding Esp01.RemainingSeconds}"/>
+                            <TextBlock Grid.Row="11" Text="State" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="11" Grid.Column="1" Text="{Binding Esp01.State}"/>
+                            <TextBlock Grid.Row="12" Text="ACK status" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="12" Grid.Column="1" Text="{Binding Esp01.AckStatus}" TextWrapping="Wrap"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <Border Grid.Column="1" Padding="20" CornerRadius="12"
+                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                    <StackPanel Spacing="10">
+                        <Grid>
+                            <TextBlock Text="ESP02" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                            <TextBlock Text="{Binding Esp02.OnlineText}" HorizontalAlignment="Right"
+                                       Foreground="{Binding Esp02.OnlineBrush}" FontWeight="SemiBold" />
+                        </Grid>
+                        <Grid ColumnSpacing="12" RowSpacing="7">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="160" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="IP address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding Esp02.IpAddress}"/>
+                            <TextBlock Grid.Row="1" Text="Sync state" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Esp02.SynchronizationState}" FontWeight="SemiBold"/>
+                            <TextBlock Grid.Row="2" Text="Estimated Master" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding Esp02.EstimatedMasterTime}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="3" Text="Clock error" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding Esp02.ClockError}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="4" Text="Best sync RTT" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding Esp02.BestRtt}"/>
+                            <TextBlock Grid.Row="5" Text="Verify RTT" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding Esp02.VerificationRtt}"/>
+                            <TextBlock Grid.Row="6" Text="Applied offset" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding Esp02.AppliedOffset}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="7" Text="Verified start Master" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="7" Grid.Column="1" Text="{Binding Esp02.ActualStartMasterTime}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="8" Text="Start timing error" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="8" Grid.Column="1" Text="{Binding Esp02.StartTimingError}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="9" Text="Last command ID" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="9" Grid.Column="1" Text="{Binding Esp02.LastCommandId}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="10" Text="Remaining" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="10" Grid.Column="1" Text="{Binding Esp02.RemainingSeconds}"/>
+                            <TextBlock Grid.Row="11" Text="State" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="11" Grid.Column="1" Text="{Binding Esp02.State}"/>
+                            <TextBlock Grid.Row="12" Text="ACK status" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="12" Grid.Column="1" Text="{Binding Esp02.AckStatus}" TextWrapping="Wrap"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <Grid Grid.Row="5" Margin="0,16,0,0" ColumnSpacing="16">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Padding="20" CornerRadius="12"
+                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                    <StackPanel Spacing="10">
+                        <Grid>
+                            <TextBlock Text="ESP03" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                            <TextBlock Text="{Binding Esp03.OnlineText}" HorizontalAlignment="Right"
+                                       Foreground="{Binding Esp03.OnlineBrush}" FontWeight="SemiBold" />
+                        </Grid>
+                        <Grid ColumnSpacing="12" RowSpacing="7">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="160" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="IP address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding Esp03.IpAddress}"/>
+                            <TextBlock Grid.Row="1" Text="Sync state" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Esp03.SynchronizationState}" FontWeight="SemiBold"/>
+                            <TextBlock Grid.Row="2" Text="Estimated Master" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding Esp03.EstimatedMasterTime}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="3" Text="Clock error" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding Esp03.ClockError}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="4" Text="Best sync RTT" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding Esp03.BestRtt}"/>
+                            <TextBlock Grid.Row="5" Text="Verify RTT" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding Esp03.VerificationRtt}"/>
+                            <TextBlock Grid.Row="6" Text="Applied offset" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding Esp03.AppliedOffset}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="7" Text="Verified start Master" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="7" Grid.Column="1" Text="{Binding Esp03.ActualStartMasterTime}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="8" Text="Start timing error" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="8" Grid.Column="1" Text="{Binding Esp03.StartTimingError}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="9" Text="Last command ID" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="9" Grid.Column="1" Text="{Binding Esp03.LastCommandId}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="10" Text="Remaining" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="10" Grid.Column="1" Text="{Binding Esp03.RemainingSeconds}"/>
+                            <TextBlock Grid.Row="11" Text="State" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="11" Grid.Column="1" Text="{Binding Esp03.State}"/>
+                            <TextBlock Grid.Row="12" Text="ACK status" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="12" Grid.Column="1" Text="{Binding Esp03.AckStatus}" TextWrapping="Wrap"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <Border Grid.Column="1" Padding="20" CornerRadius="12"
+                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                    <StackPanel Spacing="10">
+                        <Grid>
+                            <TextBlock Text="ESP04" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                            <TextBlock Text="{Binding Esp04.OnlineText}" HorizontalAlignment="Right"
+                                       Foreground="{Binding Esp04.OnlineBrush}" FontWeight="SemiBold" />
+                        </Grid>
+                        <Grid ColumnSpacing="12" RowSpacing="7">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="160" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="IP address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding Esp04.IpAddress}"/>
+                            <TextBlock Grid.Row="1" Text="Sync state" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Esp04.SynchronizationState}" FontWeight="SemiBold"/>
+                            <TextBlock Grid.Row="2" Text="Estimated Master" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding Esp04.EstimatedMasterTime}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="3" Text="Clock error" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding Esp04.ClockError}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="4" Text="Best sync RTT" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding Esp04.BestRtt}"/>
+                            <TextBlock Grid.Row="5" Text="Verify RTT" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding Esp04.VerificationRtt}"/>
+                            <TextBlock Grid.Row="6" Text="Applied offset" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding Esp04.AppliedOffset}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="7" Text="Verified start Master" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="7" Grid.Column="1" Text="{Binding Esp04.ActualStartMasterTime}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="8" Text="Start timing error" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="8" Grid.Column="1" Text="{Binding Esp04.StartTimingError}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="9" Text="Last command ID" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="9" Grid.Column="1" Text="{Binding Esp04.LastCommandId}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="10" Text="Remaining" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="10" Grid.Column="1" Text="{Binding Esp04.RemainingSeconds}"/>
+                            <TextBlock Grid.Row="11" Text="State" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="11" Grid.Column="1" Text="{Binding Esp04.State}"/>
+                            <TextBlock Grid.Row="12" Text="ACK status" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="12" Grid.Column="1" Text="{Binding Esp04.AckStatus}" TextWrapping="Wrap"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <Border Grid.Row="6" Margin="0,16,0,0" Padding="20" CornerRadius="12"
+                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                    <StackPanel Spacing="10">
+                        <Grid>
+                            <TextBlock Text="ESP05" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                            <TextBlock Text="{Binding Esp05.OnlineText}" HorizontalAlignment="Right"
+                                       Foreground="{Binding Esp05.OnlineBrush}" FontWeight="SemiBold" />
+                        </Grid>
+                        <Grid ColumnSpacing="12" RowSpacing="7">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="160" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="IP address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding Esp05.IpAddress}"/>
+                            <TextBlock Grid.Row="1" Text="Sync state" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Esp05.SynchronizationState}" FontWeight="SemiBold"/>
+                            <TextBlock Grid.Row="2" Text="Estimated Master" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding Esp05.EstimatedMasterTime}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="3" Text="Clock error" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding Esp05.ClockError}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="4" Text="Best sync RTT" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding Esp05.BestRtt}"/>
+                            <TextBlock Grid.Row="5" Text="Verify RTT" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding Esp05.VerificationRtt}"/>
+                            <TextBlock Grid.Row="6" Text="Applied offset" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding Esp05.AppliedOffset}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="7" Text="Verified start Master" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="7" Grid.Column="1" Text="{Binding Esp05.ActualStartMasterTime}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="8" Text="Start timing error" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="8" Grid.Column="1" Text="{Binding Esp05.StartTimingError}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="9" Text="Last command ID" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="9" Grid.Column="1" Text="{Binding Esp05.LastCommandId}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="10" Text="Remaining" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="10" Grid.Column="1" Text="{Binding Esp05.RemainingSeconds}"/>
+                            <TextBlock Grid.Row="11" Text="State" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="11" Grid.Column="1" Text="{Binding Esp05.State}"/>
+                            <TextBlock Grid.Row="12" Text="ACK status" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="12" Grid.Column="1" Text="{Binding Esp05.AckStatus}" TextWrapping="Wrap"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+            <Border Grid.Row="7" Margin="0,16,0,32" Padding="20" CornerRadius="12"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="Network" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                    <ComboBox Header="Network interface" PlaceholderText="No usable interface selected"
+                              ItemsSource="{Binding NetworkInterfaces}" SelectedItem="{Binding SelectedNetworkInterface, Mode=TwoWay}"
+                              DisplayMemberPath="DisplayName" HorizontalAlignment="Stretch" />
+                    <TextBlock Text="{Binding NetworkSummary}" TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <Grid ColumnSpacing="16" RowSpacing="6">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                        <TextBlock Text="Local IPv4 address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding SelectedLocalAddress}" FontFamily="Consolas"/>
+                        <TextBlock Grid.Row="1" Text="Subnet mask" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding SelectedSubnetMask}" FontFamily="Consolas"/>
+                        <TextBlock Grid.Row="2" Text="Calculated broadcast" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding CalculatedBroadcastAddress}" FontFamily="Consolas"/>
+                        <TextBlock Grid.Row="3" Text="UDP destination" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding EffectiveBroadcastAddress}" FontFamily="Consolas"/>
+                    </Grid>
+                    <TextBox Header="Manual broadcast-address override (optional)" PlaceholderText="For example: 192.168.50.255"
+                             Text="{Binding ManualBroadcastOverride, Mode=TwoWay}" />
+                    <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
+                </StackPanel>
+            </Border>
+        </Grid>
+    </ScrollViewer>
+</Window>

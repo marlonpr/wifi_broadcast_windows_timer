@@ -1,0 +1,113 @@
+# ==================================================
+# Visual Studio user files
+# ==================================================
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.csproj.user
+*.pubxml.user
+*.rsuser
+
+# Other IDE settings
+.vscode/
+.idea/
+_ReSharper*/
+*.DotSettings.user
+
+# ==================================================
+# .NET build output
+# ==================================================
+[Bb]in/
+[Oo]bj/
+[Aa]rtifacts/
+[Dd]ebug/
+[Rr]elease/
+x86/
+x64/
+ARM/
+ARM64/
+
+# ==================================================
+# Tests and code coverage
+# ==================================================
+TestResults/
+coverage/
+BenchmarkDotNet.Artifacts/
+
+*.trx
+*.coverage
+*.coveragexml
+*.opencover.xml
+*.testlog
+
+# ==================================================
+# NuGet generated packages
+# ==================================================
+packages/
+*.nupkg
+*.snupkg
+
+# ==================================================
+# WinUI 3 / MSIX generated packages
+# ==================================================
+AppPackages/
+AppxPackages/
+BundleArtifacts/
+Generated Files/
+
+*.appx
+*.appxbundle
+*.appxupload
+*.appxsym
+*.appinstaller
+*.msix
+*.msixbundle
+*.msixupload
+*.msixsym
+*.appxrecipe
+*.pri
+
+Package.StoreAssociation.xml
+_pkginfo.txt
+
+# ==================================================
+# Signing certificates and private keys
+# Never upload these to GitHub
+# ==================================================
+*.pfx
+*.p12
+*.pvk
+*.snk
+*.key
+*_TemporaryKey.pfx
+*_TestKey.pfx
+
+# ==================================================
+# Local configuration and secrets
+# ==================================================
+.env
+.env.*
+!.env.example
+
+appsettings.Local.json
+appsettings.*.Local.json
+secrets.json
+
+# ==================================================
+# Temporary files and logs
+# ==================================================
+*.log
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# ==================================================
+# Operating-system files
+# ==================================================
+.DS_Store
+Thumbs.db
+Desktop.ini
+/Directory.Build.zip
