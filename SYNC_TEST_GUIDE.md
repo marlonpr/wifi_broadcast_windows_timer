@@ -4,7 +4,7 @@
 
 The controller establishes a per-device mapping between each ESP32 `esp_timer_get_time()` clock and the Windows Master monotonic clock. START then carries one future absolute Master timestamp rather than "wait N ms after reception".
 
-The app performs 8 calibration exchanges per device, selects the lowest-RTT valid sample, applies that offset with `SYNC_SET`, then performs 4 delay-free verification exchanges. START_AT is sent as the normal repeated absolute-time broadcast.
+The app performs 8 calibration exchanges per device, keeps the 3 lowest-RTT valid samples and applies their 1/RTT² weighted offset with `SYNC_SET`, then performs 8 delay-free verification exchanges and uses the same best-3 inverse-RTT² weighted estimator for verification. START_AT is sent as the normal repeated absolute-time broadcast.
 
 The watchdog-safe firmware uses a blocking 50 ms UDP receive timeout and a dedicated deadline task for the final START deadline; it does not continuously poll from `udp_command`.
 
@@ -16,7 +16,7 @@ ESP01 is always the control at 0/0 ms. Select one ESP02 calibration mode in the 
 - **SYMMETRIC — 250 / 250 ms**: `t1` is captured, the controller waits 250 ms before sending; the ESP captures `t3`, waits 250 ms, then replies.
 - **ASYMMETRIC — 250 / 0 ms**: `t1` is captured, the controller waits 250 ms before sending; the ESP replies without artificial reverse delay.
 
-The 4 verification exchanges are always 0/0 ms. START_AT is also always sent with no artificial path delay. This separation is deliberate.
+The 8 verification exchanges are always 0/0 ms. START_AT is also always sent with no artificial path delay. This separation is deliberate.
 
 ## Expected observations
 

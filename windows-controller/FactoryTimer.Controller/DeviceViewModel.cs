@@ -19,6 +19,7 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
     private string state = "UNKNOWN";
     private string ackStatus = "No ACK received";
     private string synchronizationState = "NOT SYNCED";
+    private string synchronizationQuality = "—";
     private string clockError = "—";
     private string bestRtt = "—";
     private string verificationRtt = "—";
@@ -26,8 +27,12 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
     private string estimatedMasterTime = "—";
     private string actualStartMasterTime = "—";
     private string startTimingError = "—";
+    private string rssi = "—";
+    private string wifiChannelText = "—";
+    private string bssid = "—";
     private readonly DeviceStatusTracker statusTracker = new();
     private ulong pendingCommandId;
+    private bool synchronizationAccepted;
     private long? residualErrorMicroseconds;
     private long? verificationOffsetMicroseconds;
     private long? appliedOffsetMicroseconds;
@@ -37,6 +42,15 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
     private long? lastSchedulerLatenessMicroseconds;
     private long? lastActualStartMasterMicroseconds;
     private ulong? lastStartedCommandId;
+    private long? initialResidualErrorMicroseconds;
+    private long? expectedSyncBiasMicroseconds;
+    private long? syncQualityDeviationMicroseconds;
+    private long? syncQualityThresholdMicroseconds;
+    private int syncAttemptCount;
+    private bool syncQualityAccepted;
+    private int? rssiDbm;
+    private int? wifiChannel;
+    private string? bssidValue;
 
     public string DeviceId { get; } = deviceId;
     public string OnlineText { get => onlineText; private set => SetProperty(ref onlineText, value); }
@@ -47,6 +61,7 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
     public string State { get => state; private set => SetProperty(ref state, value); }
     public string AckStatus { get => ackStatus; private set => SetProperty(ref ackStatus, value); }
     public string SynchronizationState { get => synchronizationState; private set => SetProperty(ref synchronizationState, value); }
+    public string SynchronizationQuality { get => synchronizationQuality; private set => SetProperty(ref synchronizationQuality, value); }
     public string ClockError { get => clockError; private set => SetProperty(ref clockError, value); }
     public string BestRtt { get => bestRtt; private set => SetProperty(ref bestRtt, value); }
     public string VerificationRtt { get => verificationRtt; private set => SetProperty(ref verificationRtt, value); }
@@ -54,6 +69,9 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
     public string EstimatedMasterTime { get => estimatedMasterTime; private set => SetProperty(ref estimatedMasterTime, value); }
     public string ActualStartMasterTime { get => actualStartMasterTime; private set => SetProperty(ref actualStartMasterTime, value); }
     public string StartTimingError { get => startTimingError; private set => SetProperty(ref startTimingError, value); }
+    public string Rssi { get => rssi; private set => SetProperty(ref rssi, value); }
+    public string WifiChannelText { get => wifiChannelText; private set => SetProperty(ref wifiChannelText, value); }
+    public string Bssid { get => bssid; private set => SetProperty(ref bssid, value); }
     public long? ResidualErrorMicroseconds => residualErrorMicroseconds;
     public long? VerificationOffsetMicroseconds => verificationOffsetMicroseconds;
     public long? AppliedOffsetMicroseconds => appliedOffsetMicroseconds;
@@ -63,7 +81,17 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
     public long? LastSchedulerLatenessMicroseconds => lastSchedulerLatenessMicroseconds;
     public long? LastActualStartMasterMicroseconds => lastActualStartMasterMicroseconds;
     public ulong? LastStartedCommandId => lastStartedCommandId;
-    public bool IsSynchronized => residualErrorMicroseconds.HasValue;
+    public long? InitialResidualErrorMicroseconds => initialResidualErrorMicroseconds;
+    public long? ExpectedSyncBiasMicroseconds => expectedSyncBiasMicroseconds;
+    public long? SyncQualityDeviationMicroseconds => syncQualityDeviationMicroseconds;
+    public long? SyncQualityThresholdMicroseconds => syncQualityThresholdMicroseconds;
+    public int SyncAttemptCount => syncAttemptCount;
+    public int SyncRetryCount => Math.Max(0, syncAttemptCount - 1);
+    public bool SyncQualityAccepted => syncQualityAccepted;
+    public int? RssiDbm => rssiDbm;
+    public int? WifiChannel => wifiChannel;
+    public string? BssidValue => bssidValue;
+    public bool IsSynchronized => synchronizationAccepted;
 
     public bool TryGetIpAddress(out IPAddress? address) =>
         IPAddress.TryParse(IpAddress, out address);
@@ -97,7 +125,6 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
             AckStatus = $"ACK for {FactoryProtocol.FormatCommandId(ack.CommandId)}";
         }
     }
-
 
     public void ClearStartMeasurement()
     {
@@ -140,12 +167,37 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
         LastCommandId = FactoryProtocol.FormatCommandId(status.CommandId);
         RemainingSeconds = status.RemainingSeconds.ToString(CultureInfo.InvariantCulture);
         State = status.State.ToString().ToUpperInvariant();
+
+        if (status.RssiDbm.HasValue)
+        {
+            rssiDbm = status.RssiDbm;
+            Rssi = $"{status.RssiDbm.Value} dBm";
+        }
+        if (status.WifiChannel.HasValue)
+        {
+            wifiChannel = status.WifiChannel;
+            WifiChannelText = status.WifiChannel.Value.ToString(CultureInfo.InvariantCulture);
+        }
+        if (!string.IsNullOrWhiteSpace(status.Bssid))
+        {
+            bssidValue = status.Bssid;
+            Bssid = status.Bssid;
+        }
+
         RefreshOnlineStatus(now);
     }
 
     public void MarkSynchronizing()
     {
+        synchronizationAccepted = false;
+        syncQualityAccepted = false;
+        syncAttemptCount = 0;
+        initialResidualErrorMicroseconds = null;
+        expectedSyncBiasMicroseconds = null;
+        syncQualityDeviationMicroseconds = null;
+        syncQualityThresholdMicroseconds = null;
         SynchronizationState = "SYNCHRONIZING";
+        SynchronizationQuality = "—";
         verificationOffsetMicroseconds = null;
         ClockError = "—";
         BestRtt = "—";
@@ -156,35 +208,92 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
         OnPropertyChanged(nameof(IsSynchronized));
     }
 
-    public void ApplySynchronization(
+    public void MarkSynchronizationAttemptFailed(int attempt, int maxAttempts, string failureKind)
+    {
+        syncAttemptCount = attempt;
+        syncQualityAccepted = false;
+        synchronizationAccepted = false;
+        SynchronizationState = "SYNC ERROR";
+        SynchronizationQuality = $"ERROR {attempt}/{maxAttempts}: {failureKind}";
+        OnPropertyChanged(nameof(IsSynchronized));
+    }
+
+    public void ApplySynchronizationMeasurement(
         long appliedOffsetMicroseconds,
         long bestRttMicroseconds,
         long residualMicroseconds,
         long verificationRttMicroseconds,
-        long verificationOffsetMicroseconds)
+        long verificationOffsetMicroseconds,
+        long initialResidualMicroseconds,
+        long expectedBiasMicroseconds,
+        long qualityDeviationMicroseconds,
+        long qualityThresholdMicroseconds,
+        int attempt,
+        int maxAttempts,
+        bool accepted)
     {
         residualErrorMicroseconds = residualMicroseconds;
         this.verificationOffsetMicroseconds = verificationOffsetMicroseconds;
         this.appliedOffsetMicroseconds = appliedOffsetMicroseconds;
         this.bestRttMicroseconds = bestRttMicroseconds;
         this.verificationRttMicroseconds = verificationRttMicroseconds;
-        SynchronizationState = "SYNCED";
+        initialResidualErrorMicroseconds = initialResidualMicroseconds;
+        expectedSyncBiasMicroseconds = expectedBiasMicroseconds;
+        syncQualityDeviationMicroseconds = qualityDeviationMicroseconds;
+        syncQualityThresholdMicroseconds = qualityThresholdMicroseconds;
+        syncAttemptCount = attempt;
+        syncQualityAccepted = accepted;
+        synchronizationAccepted = accepted;
+
+        SynchronizationState = accepted ? "SYNCED" : "QUALITY RETRY";
+        SynchronizationQuality = accepted
+            ? $"PASS {attempt}/{maxAttempts}; deviation {FormatSignedMilliseconds(qualityDeviationMicroseconds)}"
+            : $"RETRY {attempt}/{maxAttempts}; deviation {FormatSignedMilliseconds(qualityDeviationMicroseconds)}";
         ClockError = FormatSignedMilliseconds(residualMicroseconds);
         BestRtt = FormatMilliseconds(bestRttMicroseconds);
         VerificationRtt = FormatMilliseconds(verificationRttMicroseconds);
         AppliedOffset = $"{appliedOffsetMicroseconds:+#;-#;0} µs";
         OnPropertyChanged(nameof(IsSynchronized));
-        UpdateEstimatedMasterTime(MasterClock.NowMicroseconds);
+
+        if (accepted)
+        {
+            UpdateEstimatedMasterTime(MasterClock.NowMicroseconds);
+        }
+        else
+        {
+            EstimatedMasterTime = "—";
+        }
+    }
+
+    public void MarkSynchronizationQualityFailed(int maxAttempts)
+    {
+        synchronizationAccepted = false;
+        syncQualityAccepted = false;
+        SynchronizationState = "QUALITY FAILED";
+        SynchronizationQuality =
+            syncQualityDeviationMicroseconds.HasValue
+                ? $"FAIL {syncAttemptCount}/{maxAttempts}; deviation {FormatSignedMilliseconds(syncQualityDeviationMicroseconds.Value)}"
+                : $"FAIL {syncAttemptCount}/{maxAttempts}";
+        EstimatedMasterTime = "—";
+        OnPropertyChanged(nameof(IsSynchronized));
     }
 
     public void ClearSynchronization()
     {
+        synchronizationAccepted = false;
+        syncQualityAccepted = false;
         residualErrorMicroseconds = null;
         verificationOffsetMicroseconds = null;
         appliedOffsetMicroseconds = null;
         bestRttMicroseconds = null;
         verificationRttMicroseconds = null;
+        initialResidualErrorMicroseconds = null;
+        expectedSyncBiasMicroseconds = null;
+        syncQualityDeviationMicroseconds = null;
+        syncQualityThresholdMicroseconds = null;
+        syncAttemptCount = 0;
         SynchronizationState = "NOT SYNCED";
+        SynchronizationQuality = "—";
         ClockError = "—";
         BestRtt = "—";
         VerificationRtt = "—";
@@ -195,7 +304,7 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
 
     public void UpdateEstimatedMasterTime(long masterNowMicroseconds)
     {
-        if (!residualErrorMicroseconds.HasValue)
+        if (!synchronizationAccepted || !residualErrorMicroseconds.HasValue)
         {
             EstimatedMasterTime = "—";
             return;
@@ -228,6 +337,12 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
         statusTracker.MarkOffline();
         OnlineText = "OFFLINE";
         OnlineBrush = OfflineColor;
+        rssiDbm = null;
+        wifiChannel = null;
+        bssidValue = null;
+        Rssi = "—";
+        WifiChannelText = "—";
+        Bssid = "—";
         ClearSynchronization();
     }
 

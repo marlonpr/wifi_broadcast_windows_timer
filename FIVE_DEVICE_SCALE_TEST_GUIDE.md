@@ -12,7 +12,7 @@ For the first scaling run select **NONE — 0 / 0 ms**. All five devices then us
 
 1. Power all five ESP32 timers and wait until every card is ONLINE with a valid factory-LAN IPv4 address.
 2. Select **NONE — 0 / 0 ms**.
-3. Press **SYNC CLOCKS**. The controller synchronizes ESP01 through ESP05 sequentially (8 calibration + 4 verification samples per device).
+3. Press **SYNC CLOCKS**. The controller synchronizes ESP01 through ESP05 sequentially (8 calibration + 8 verification samples per device; each phase uses a 1/RTT² weighted offset over its 3 lowest-RTT valid samples).
 4. Record the total synchronization duration shown in the status message, each device's best sync RTT and verify RTT, the worst verified clock error, and the five-device clock spread.
 5. Press **START_AT** for a 20-second run. One shared absolute target is broadcast three times; all five devices must use the same command ID and target Master timestamp.
 6. Record every device's verification-corrected start error and the global five-device start spread.

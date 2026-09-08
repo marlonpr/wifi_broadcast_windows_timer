@@ -89,4 +89,240 @@ public sealed class ClockSynchronizationTests
         Assert.AreEqual(0L, symmetric.ExpectedOffsetBiasMicroseconds);
         Assert.AreEqual(-125_000L, asymmetric.ExpectedOffsetBiasMicroseconds);
     }
+    [TestMethod]
+    public void SyncQualityPolicyUsesExpectedExperimentBias()
+    {
+        SyncQualityEvaluation none = SyncQualityPolicy.Evaluate(
+            residualErrorMicroseconds: 2_400,
+            expectedBiasMicroseconds: 0,
+            thresholdMicroseconds: 3_000);
+        Assert.IsTrue(none.IsAccepted);
+        Assert.AreEqual(2_400L, none.DeviationMicroseconds);
+
+        SyncQualityEvaluation retry = SyncQualityPolicy.Evaluate(
+            residualErrorMicroseconds: -4_200,
+            expectedBiasMicroseconds: 0,
+            thresholdMicroseconds: 3_000);
+        Assert.IsFalse(retry.IsAccepted);
+
+        SyncQualityEvaluation asymmetric = SyncQualityPolicy.Evaluate(
+            residualErrorMicroseconds: -124_100,
+            expectedBiasMicroseconds: -125_000,
+            thresholdMicroseconds: 3_000);
+        Assert.IsTrue(asymmetric.IsAccepted);
+        Assert.AreEqual(900L, asymmetric.DeviationMicroseconds);
+    }
+
+    [TestMethod]
+    public void LowRttConsensusUsesMedianOffsetOfBestThreeRttSamples()
+    {
+        // Lowest RTT sample is deliberately offset-biased by +9 ms. A
+        // lowest-RTT-only estimator would choose it; the 3-sample median does not.
+        ClockSyncSample outlier = SampleWithRttAndOffset(8_000, 69_000);
+        ClockSyncSample goodA = SampleWithRttAndOffset(9_000, 60_100);
+        ClockSyncSample goodB = SampleWithRttAndOffset(10_000, 59_900);
+        ClockSyncSample slower = SampleWithRttAndOffset(30_000, 72_000);
+
+        ClockSyncConsensus consensus = ClockSyncEstimator.SelectLowRttMedianOffset(
+            [outlier, goodA, goodB, slower],
+            lowRttSampleCount: 3);
+
+        Assert.AreEqual(60_100L, consensus.MasterMinusLocalOffsetMicroseconds);
+        Assert.AreEqual(8_000L, consensus.BestRttMicroseconds);
+        Assert.AreEqual(goodA, consensus.RepresentativeSample);
+        Assert.AreEqual(3, consensus.LowRttSampleCount);
+    }
+
+    [TestMethod]
+    public void LowRttConsensusPreservesPersistentAsymmetricDelayBias()
+    {
+        ClockSyncConsensus consensus = ClockSyncEstimator.SelectLowRttMedianOffset(
+        [
+            SampleWithRttAndOffset(250_000, -65_300),
+            SampleWithRttAndOffset(251_000, -65_000),
+            SampleWithRttAndOffset(252_000, -64_700),
+            SampleWithRttAndOffset(400_000, 60_000),
+        ],
+        lowRttSampleCount: 3);
+
+        // True offset in the experiment is +60 ms, so approximately -65 ms is
+        // the intentional -125 ms forward-path bias. Consensus must not hide it.
+        Assert.AreEqual(-65_000L, consensus.MasterMinusLocalOffsetMicroseconds);
+        Assert.AreEqual(-125_000L, consensus.MasterMinusLocalOffsetMicroseconds - 60_000L);
+    }
+
+    [TestMethod]
+    public void LowRttConsensusRequiresRequestedNumberOfValidSamples()
+    {
+        InvalidOperationException? exception = null;
+
+        try
+        {
+            ClockSyncEstimator.SelectLowRttMedianOffset(
+            [
+                SampleWithRttAndOffset(8_000, 60_000),
+                SampleWithRttAndOffset(9_000, 60_100),
+            ],
+            lowRttSampleCount: 3);
+        }
+        catch (InvalidOperationException caught)
+        {
+            exception = caught;
+        }
+
+        Assert.IsNotNull(exception);
+        StringAssert.Contains(exception!.Message, "At least 3 valid");
+    }
+
+    [TestMethod]
+    public void LowRttConsensusRejectsEvenCandidateCount()
+    {
+        bool threwExpectedException = false;
+
+        try
+        {
+            ClockSyncEstimator.SelectLowRttMedianOffset(
+                [SampleWithRttAndOffset(8_000, 60_000)],
+                lowRttSampleCount: 2);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            threwExpectedException = true;
+        }
+
+        Assert.IsTrue(threwExpectedException);
+    }
+
+    [TestMethod]
+    public void InverseSquareWeightedConsensusUsesBestThreeRttSamples()
+    {
+        ClockSyncConsensus consensus = ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
+        [
+            SampleWithRttAndOffset(10_000, 100),
+            SampleWithRttAndOffset(20_000, 200),
+            SampleWithRttAndOffset(40_000, 400),
+            SampleWithRttAndOffset(80_000, 50_000),
+        ],
+        lowRttSampleCount: 3);
+
+        // Relative weights are 1, 1/4 and 1/16, so the weighted offset is
+        // (100 + 50 + 25) / 1.3125 = 133.333... us -> 133 us.
+        Assert.AreEqual(133L, consensus.MasterMinusLocalOffsetMicroseconds);
+        Assert.AreEqual(10_000L, consensus.BestRttMicroseconds);
+        Assert.AreEqual(10_000L, consensus.RepresentativeSample.NetworkRttMicroseconds);
+        Assert.AreEqual(3, consensus.LowRttSampleCount);
+    }
+
+    [TestMethod]
+    public void InverseSquareWeightedConsensusPreservesPersistentAsymmetricDelayBias()
+    {
+        ClockSyncConsensus consensus = ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
+        [
+            SampleWithRttAndOffset(250_000, -65_300),
+            SampleWithRttAndOffset(251_000, -65_000),
+            SampleWithRttAndOffset(252_000, -64_700),
+            SampleWithRttAndOffset(400_000, 60_000),
+        ],
+        lowRttSampleCount: 3);
+
+        Assert.AreEqual(-65_002L, consensus.MasterMinusLocalOffsetMicroseconds);
+        Assert.AreEqual(-125_002L, consensus.MasterMinusLocalOffsetMicroseconds - 60_000L);
+    }
+
+    [TestMethod]
+    public void InverseSquareWeightedConsensusRequiresRequestedNumberOfValidSamples()
+    {
+        InvalidOperationException? exception = null;
+
+        try
+        {
+            ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
+            [
+                SampleWithRttAndOffset(8_000, 60_000),
+                SampleWithRttAndOffset(9_000, 60_100),
+            ],
+            lowRttSampleCount: 3);
+        }
+        catch (InvalidOperationException caught)
+        {
+            exception = caught;
+        }
+
+        Assert.IsNotNull(exception);
+        StringAssert.Contains(exception!.Message, "At least 3 valid");
+    }
+
+    [TestMethod]
+    public void InverseSquareWeightedConsensusRejectsNonPositiveCandidateCount()
+    {
+        bool threwExpectedException = false;
+
+        try
+        {
+            ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
+                [SampleWithRttAndOffset(8_000, 60_000)],
+                lowRttSampleCount: 0);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            threwExpectedException = true;
+        }
+
+        Assert.IsTrue(threwExpectedException);
+    }
+
+    [TestMethod]
+    public void InverseSquareWeightedConsensusKeepsObservedBorderlineCaseInsideThreeMilliseconds()
+    {
+        ClockSyncConsensus calibration = ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
+        [
+            SampleWithRttAndOffset(26_226, -598_669_250),
+            SampleWithRttAndOffset(26_626, -598_665_146),
+            SampleWithRttAndOffset(29_830, -598_661_175),
+        ],
+        lowRttSampleCount: 3);
+
+        ClockSyncConsensus verification = ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
+        [
+            SampleWithRttAndOffset(19_604, -598_670_082),
+            SampleWithRttAndOffset(20_832, -598_666_270),
+            SampleWithRttAndOffset(26_426, -598_669_052),
+        ],
+        lowRttSampleCount: 3);
+
+        long residual = calibration.MasterMinusLocalOffsetMicroseconds -
+            verification.MasterMinusLocalOffsetMicroseconds;
+        SyncQualityEvaluation quality = SyncQualityPolicy.Evaluate(residual, 0, 3_000);
+
+        Assert.AreEqual(2_940L, residual);
+        Assert.IsTrue(quality.IsAccepted);
+    }
+
+    [TestMethod]
+    public void InverseSquareWeightedConsensusHandlesZeroRttWithoutDivisionByZero()
+    {
+        ClockSyncConsensus consensus = ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
+        [
+            SampleWithRttAndOffset(0, 60_000),
+            SampleWithRttAndOffset(10_000, 80_000),
+            SampleWithRttAndOffset(20_000, 40_000),
+        ],
+        lowRttSampleCount: 3);
+
+        Assert.AreEqual(60_000L, consensus.MasterMinusLocalOffsetMicroseconds);
+        Assert.AreEqual(0L, consensus.BestRttMicroseconds);
+    }
+
+    private static ClockSyncSample SampleWithRttAndOffset(long rttMicroseconds, long offsetMicroseconds)
+    {
+        // Device processing time is zero. Pick t1=1,000,000 us and solve a
+        // symmetric synthetic sample for the requested RTT and NTP offset.
+        const long t1 = 1_000_000;
+        long oneWay = rttMicroseconds / 2;
+        long t2 = t1 - offsetMicroseconds + oneWay;
+        long t3 = t2;
+        long t4 = t1 + rttMicroseconds;
+        return new ClockSyncSample(t1, t2, t3, t4);
+    }
+
 }

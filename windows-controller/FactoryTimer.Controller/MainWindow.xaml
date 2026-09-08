@@ -126,9 +126,13 @@
                     <StackPanel Grid.Column="1" Spacing="7">
                         <TextBlock Text="Benchmark result" FontWeight="SemiBold" />
                         <TextBlock Text="{Binding BenchmarkProgress}" TextWrapping="Wrap" />
-                        <TextBlock Text="CSV output" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="Summary CSV" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         <TextBlock Text="{Binding BenchmarkCsvPath}" TextWrapping="Wrap" FontFamily="Consolas" />
-                        <TextBlock Text="Each trial performs a fresh 8-sample calibration and 4-sample delay-free verification on every device, sends one common absolute START_AT target, waits for STARTED telemetry from all five devices, records the measurements, then resets the countdown before the next trial. CSV files are saved automatically under Documents\FactoryTimerBenchmarks."
+                        <TextBlock Text="Raw SYNC sample CSV" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="{Binding BenchmarkDiagnosticsCsvPath}" TextWrapping="Wrap" FontFamily="Consolas" />
+                        <TextBlock Text="Each trial performs a fresh 8-sample calibration and 8-sample delay-free verification on every device; each phase uses a 1/RTT² weighted offset over its 3 lowest-RTT valid samples. The controller then sends one common absolute START_AT target, waits for STARTED telemetry from all five devices, records the measurements, and resets the countdown before the next trial. Both CSV files are saved automatically under Documents\FactoryTimerBenchmarks."
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="SYNC quality gate: calibration and verification each use 8 timestamp exchanges. The controller keeps the 3 lowest-RTT valid samples and uses a 1/RTT² weighted offset, then accepts only when the verified residual is within ±3.000 ms of the expected experiment bias. A failing device is recalibrated automatically, up to 5 total attempts with a 150 ms quiet retry interval. Periodic STATUS discovery is paused and drained before timing-critical synchronization. NONE and SYMMETRIC expect 0 ms bias; ASYMMETRIC expects approximately -125 ms. The summary CSV records final device/fleet results; the raw SYNC CSV records completed timestamp exchanges plus partial/error attempts, RTT, offset, low-RTT selection, representative sample, weighted consensus, and per-attempt outcome/failure information."
                                    TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                     </StackPanel>
                 </Grid>
@@ -157,6 +161,8 @@
                                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <TextBlock Text="IP address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding Esp01.IpAddress}"/>
                             <TextBlock Grid.Row="1" Text="Sync state" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Esp01.SynchronizationState}" FontWeight="SemiBold"/>
@@ -171,6 +177,10 @@
                             <TextBlock Grid.Row="10" Text="Remaining" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="10" Grid.Column="1" Text="{Binding Esp01.RemainingSeconds}"/>
                             <TextBlock Grid.Row="11" Text="State" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="11" Grid.Column="1" Text="{Binding Esp01.State}"/>
                             <TextBlock Grid.Row="12" Text="ACK status" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="12" Grid.Column="1" Text="{Binding Esp01.AckStatus}" TextWrapping="Wrap"/>
+                            <TextBlock Grid.Row="13" Text="RSSI" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="13" Grid.Column="1" Text="{Binding Esp01.Rssi}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="14" Text="Wi-Fi channel" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="14" Grid.Column="1" Text="{Binding Esp01.WifiChannelText}"/>
+                            <TextBlock Grid.Row="15" Text="BSSID" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="15" Grid.Column="1" Text="{Binding Esp01.Bssid}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="16" Text="Sync quality" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="16" Grid.Column="1" Text="{Binding Esp01.SynchronizationQuality}" TextWrapping="Wrap"/>
                         </Grid>
                     </StackPanel>
                 </Border>
@@ -192,6 +202,8 @@
                                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <TextBlock Text="IP address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding Esp02.IpAddress}"/>
                             <TextBlock Grid.Row="1" Text="Sync state" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Esp02.SynchronizationState}" FontWeight="SemiBold"/>
@@ -206,6 +218,10 @@
                             <TextBlock Grid.Row="10" Text="Remaining" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="10" Grid.Column="1" Text="{Binding Esp02.RemainingSeconds}"/>
                             <TextBlock Grid.Row="11" Text="State" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="11" Grid.Column="1" Text="{Binding Esp02.State}"/>
                             <TextBlock Grid.Row="12" Text="ACK status" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="12" Grid.Column="1" Text="{Binding Esp02.AckStatus}" TextWrapping="Wrap"/>
+                            <TextBlock Grid.Row="13" Text="RSSI" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="13" Grid.Column="1" Text="{Binding Esp02.Rssi}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="14" Text="Wi-Fi channel" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="14" Grid.Column="1" Text="{Binding Esp02.WifiChannelText}"/>
+                            <TextBlock Grid.Row="15" Text="BSSID" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="15" Grid.Column="1" Text="{Binding Esp02.Bssid}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="16" Text="Sync quality" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="16" Grid.Column="1" Text="{Binding Esp02.SynchronizationQuality}" TextWrapping="Wrap"/>
                         </Grid>
                     </StackPanel>
                 </Border>
@@ -234,6 +250,8 @@
                                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <TextBlock Text="IP address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding Esp03.IpAddress}"/>
                             <TextBlock Grid.Row="1" Text="Sync state" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Esp03.SynchronizationState}" FontWeight="SemiBold"/>
@@ -248,6 +266,10 @@
                             <TextBlock Grid.Row="10" Text="Remaining" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="10" Grid.Column="1" Text="{Binding Esp03.RemainingSeconds}"/>
                             <TextBlock Grid.Row="11" Text="State" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="11" Grid.Column="1" Text="{Binding Esp03.State}"/>
                             <TextBlock Grid.Row="12" Text="ACK status" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="12" Grid.Column="1" Text="{Binding Esp03.AckStatus}" TextWrapping="Wrap"/>
+                            <TextBlock Grid.Row="13" Text="RSSI" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="13" Grid.Column="1" Text="{Binding Esp03.Rssi}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="14" Text="Wi-Fi channel" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="14" Grid.Column="1" Text="{Binding Esp03.WifiChannelText}"/>
+                            <TextBlock Grid.Row="15" Text="BSSID" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="15" Grid.Column="1" Text="{Binding Esp03.Bssid}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="16" Text="Sync quality" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="16" Grid.Column="1" Text="{Binding Esp03.SynchronizationQuality}" TextWrapping="Wrap"/>
                         </Grid>
                     </StackPanel>
                 </Border>
@@ -269,6 +291,8 @@
                                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <TextBlock Text="IP address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding Esp04.IpAddress}"/>
                             <TextBlock Grid.Row="1" Text="Sync state" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Esp04.SynchronizationState}" FontWeight="SemiBold"/>
@@ -283,6 +307,10 @@
                             <TextBlock Grid.Row="10" Text="Remaining" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="10" Grid.Column="1" Text="{Binding Esp04.RemainingSeconds}"/>
                             <TextBlock Grid.Row="11" Text="State" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="11" Grid.Column="1" Text="{Binding Esp04.State}"/>
                             <TextBlock Grid.Row="12" Text="ACK status" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="12" Grid.Column="1" Text="{Binding Esp04.AckStatus}" TextWrapping="Wrap"/>
+                            <TextBlock Grid.Row="13" Text="RSSI" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="13" Grid.Column="1" Text="{Binding Esp04.Rssi}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="14" Text="Wi-Fi channel" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="14" Grid.Column="1" Text="{Binding Esp04.WifiChannelText}"/>
+                            <TextBlock Grid.Row="15" Text="BSSID" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="15" Grid.Column="1" Text="{Binding Esp04.Bssid}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="16" Text="Sync quality" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="16" Grid.Column="1" Text="{Binding Esp04.SynchronizationQuality}" TextWrapping="Wrap"/>
                         </Grid>
                     </StackPanel>
                 </Border>
@@ -305,6 +333,8 @@
                                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <TextBlock Text="IP address" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Column="1" Text="{Binding Esp05.IpAddress}"/>
                             <TextBlock Grid.Row="1" Text="Sync state" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Esp05.SynchronizationState}" FontWeight="SemiBold"/>
@@ -319,6 +349,10 @@
                             <TextBlock Grid.Row="10" Text="Remaining" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="10" Grid.Column="1" Text="{Binding Esp05.RemainingSeconds}"/>
                             <TextBlock Grid.Row="11" Text="State" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="11" Grid.Column="1" Text="{Binding Esp05.State}"/>
                             <TextBlock Grid.Row="12" Text="ACK status" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="12" Grid.Column="1" Text="{Binding Esp05.AckStatus}" TextWrapping="Wrap"/>
+                            <TextBlock Grid.Row="13" Text="RSSI" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="13" Grid.Column="1" Text="{Binding Esp05.Rssi}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="14" Text="Wi-Fi channel" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="14" Grid.Column="1" Text="{Binding Esp05.WifiChannelText}"/>
+                            <TextBlock Grid.Row="15" Text="BSSID" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="15" Grid.Column="1" Text="{Binding Esp05.Bssid}" FontFamily="Consolas"/>
+                            <TextBlock Grid.Row="16" Text="Sync quality" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/><TextBlock Grid.Row="16" Grid.Column="1" Text="{Binding Esp05.SynchronizationQuality}" TextWrapping="Wrap"/>
                         </Grid>
                     </StackPanel>
                 </Border>

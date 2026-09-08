@@ -49,6 +49,9 @@ public enum ProtocolParseError
     Timestamp,
     Offset,
     Rtt,
+    Rssi,
+    Channel,
+    Bssid,
 }
 
 public sealed record CommandPacket(
@@ -80,7 +83,10 @@ public sealed record StatusPacket(
     string DeviceId,
     ulong CommandId,
     TimerState State,
-    uint RemainingSeconds) : InboundPacket(DeviceId);
+    uint RemainingSeconds,
+    int? RssiDbm = null,
+    int? WifiChannel = null,
+    string? Bssid = null) : InboundPacket(DeviceId);
 
 public sealed record SyncReplyPacket(
     string DeviceId,
@@ -362,6 +368,51 @@ public static class FactoryProtocol
             return true;
         }
 
+        // Extended FCT2 STATUS adds Wi-Fi diagnostics while the legacy FCT1
+        // six-field packet remains accepted for backward compatibility.
+        if (fields.Length == 9 && fields[0] == Version2 && fields[1] == "STATUS")
+        {
+            if (!ValidDeviceId(fields[2]))
+            {
+                error = ProtocolParseError.DeviceId;
+                return false;
+            }
+            if (!TryCommandId(fields[3], allowZero: true, out ulong commandId))
+            {
+                error = ProtocolParseError.CommandId;
+                return false;
+            }
+            if (!TryState(fields[4], out TimerState state))
+            {
+                error = ProtocolParseError.State;
+                return false;
+            }
+            if (!TryUInt(fields[5], 0, MaximumDurationSeconds, out uint remaining))
+            {
+                error = ProtocolParseError.Remaining;
+                return false;
+            }
+            if (!int.TryParse(fields[6], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out int rssi) ||
+                rssi is < -127 or > 0)
+            {
+                error = ProtocolParseError.Rssi;
+                return false;
+            }
+            if (!int.TryParse(fields[7], NumberStyles.None, CultureInfo.InvariantCulture, out int channel) ||
+                channel is < 0 or > 255)
+            {
+                error = ProtocolParseError.Channel;
+                return false;
+            }
+            if (!ValidBssid(fields[8]))
+            {
+                error = ProtocolParseError.Bssid;
+                return false;
+            }
+            packet = new StatusPacket(fields[2], commandId, state, remaining, rssi, channel, fields[8]);
+            return true;
+        }
+
         if (fields.Length != 6)
         {
             error = ProtocolParseError.FieldCount;
@@ -377,7 +428,7 @@ public static class FactoryProtocol
             error = ProtocolParseError.DeviceId;
             return false;
         }
-        if (!TryCommandId(fields[3], allowZero: fields[1] == "STATUS", out ulong commandId))
+        if (!TryCommandId(fields[3], allowZero: fields[1] == "STATUS", out ulong legacyCommandId))
         {
             error = ProtocolParseError.CommandId;
             return false;
@@ -395,7 +446,7 @@ public static class FactoryProtocol
                 error = ProtocolParseError.AckResult;
                 return false;
             }
-            packet = new AckPacket(fields[2], commandId, commandType, result);
+            packet = new AckPacket(fields[2], legacyCommandId, commandType, result);
             return true;
         }
         if (fields[1] == "STATUS")
@@ -410,7 +461,7 @@ public static class FactoryProtocol
                 error = ProtocolParseError.Remaining;
                 return false;
             }
-            packet = new StatusPacket(fields[2], commandId, state, remaining);
+            packet = new StatusPacket(fields[2], legacyCommandId, state, remaining);
             return true;
         }
 
@@ -511,6 +562,23 @@ public static class FactoryProtocol
     private static bool ValidDeviceId(string value) =>
         value is { Length: >= 1 and <= 16 } &&
         value.All(character => character is >= 'A' and <= 'Z' or >= '0' and <= '9' or '_' or '-');
+
+    private static bool ValidBssid(string value)
+    {
+        if (value.Length != 17) return false;
+        for (int index = 0; index < value.Length; index++)
+        {
+            if (index is 2 or 5 or 8 or 11 or 14)
+            {
+                if (value[index] != ':') return false;
+            }
+            else if (!Uri.IsHexDigit(value[index]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
 
     private static bool TryCommandType(string value, out CommandType type)
     {

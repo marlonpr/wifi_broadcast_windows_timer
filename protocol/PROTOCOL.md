@@ -45,7 +45,7 @@ RTT = (t4 - t1) - (t3 - t2)
 master_minus_local_offset = ((t1 - t2) + (t4 - t3)) / 2
 ```
 
-The controller takes multiple samples and chooses the valid sample with the lowest RTT to reduce queueing/interference error.
+The controller takes multiple samples, retains the three valid samples with the lowest RTT, and computes a 1/RTT² weighted offset over those three. This gives the cleanest retained path the greatest influence while still using multiple measurements.
 
 ### SYNC_SET
 
@@ -124,7 +124,7 @@ The controlled delay experiment does not alter START_AT delivery. All configured
 
 ## Important limitation
 
-The NTP-style offset calculation assumes the forward and reverse Wi-Fi path delays are approximately symmetric. Arbitrary one-way/asymmetric network delay cannot be determined exactly from two unsynchronized clocks. Multiple samples, minimum-RTT selection, Wi-Fi power-save disablement, and verification reduce this error but do not create a hard real-time guarantee.
+The NTP-style offset calculation assumes the forward and reverse Wi-Fi path delays are approximately symmetric. Arbitrary one-way/asymmetric network delay cannot be determined exactly from two unsynchronized clocks. Multiple samples, best-3 low-RTT inverse-square weighting, Wi-Fi power-save disablement, and verification reduce this error but do not create a hard real-time guarantee.
 
 ## Controlled SYNC path-delay experiment
 
@@ -139,3 +139,33 @@ For forward delay, the controller captures `t1` first and waits before transmitt
 Expected behavior from the NTP-style estimator is `offset_bias=(reverse-forward)/2`: symmetric 250/250 adds about 500 ms RTT with near-zero artificial offset bias; asymmetric 250/0 adds about 250 ms RTT and biases the applied Master-minus-local offset by about -125 ms.
 
 START_AT transmission is never artificially delayed by this experiment. The controller uses the delay-free verification offset to reconstruct STARTED telemetry, so asymmetric calibration should show the resulting ~125 ms physical-start estimate instead of the self-consistent 0 ms error produced by the biased applied offset.
+
+## Extended STATUS diagnostics
+
+Updated firmware emits an FCT2 STATUS packet with Wi-Fi diagnostics:
+
+```text
+FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF
+```
+
+Fields after `remaining` are RSSI in dBm, Wi-Fi primary channel, and BSSID. The updated controller still accepts the legacy six-field FCT1 STATUS packet, so older firmware remains discoverable; diagnostic fields are simply unavailable for legacy STATUS.
+
+## Verification quality gate and retry
+
+After each 8-sample calibration and 8-sample delay-free verification, the controller forms a best-3 low-RTT 1/RTT² weighted offset for each phase and evaluates:
+
+```text
+residual_error = applied_offset - verification_offset
+quality_deviation = residual_error - expected_experiment_bias
+```
+
+The default gate is:
+
+```text
+|quality_deviation| <= 3000 us
+maximum synchronization attempts = 5
+```
+
+For NONE and SYMMETRIC modes, expected experiment bias is 0 us. For ASYMMETRIC 250/0 ms, expected bias is -125000 us, so the controlled experiment remains valid rather than being rejected as a bad production synchronization.
+
+A failed quality check discards the calibration for START_AT purposes and recalibrates that device. If all five attempts miss the threshold, that device is left unsynchronized and the benchmark trial fails instead of starting with a known poor clock estimate.

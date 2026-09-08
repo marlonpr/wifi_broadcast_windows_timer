@@ -2,7 +2,7 @@
 
 ## Absolute-time synchronization test revision
 
-This revision adds a 100% infrastructure-Wi-Fi synchronization experiment: the Windows controller synchronizes each ESP32 to its monotonic Master clock with multiple NTP-style timestamp exchanges, selects the lowest-RTT sample, applies the per-device offset, verifies the residual error, and then sends a future absolute `START_AT` timestamp.
+This revision adds a 100% infrastructure-Wi-Fi synchronization experiment: the Windows controller synchronizes each ESP32 to its monotonic Master clock with multiple NTP-style timestamp exchanges, keeps the three lowest-RTT samples, applies an inverse-RTT-squared weighted offset, verifies the residual error with the same weighted low-RTT estimator, and then sends a future absolute `START_AT` timestamp.
 
 The UI shows Master time, each device's reconstructed Master time, signed residual clock error, best/verification RTT, applied offset, the estimated worst Master error and full five-device spread. When START_AT executes, each ESP sends `STARTED` telemetry. The controller reconstructs start time with the delay-free verification offset so the displayed START error can expose a deliberately biased calibration offset.
 
@@ -40,6 +40,7 @@ Run these commands in PowerShell from the repository root:
 ```powershell
 dotnet restore .\FactoryTimer.slnx
 dotnet build .\FactoryTimer.slnx --configuration Release --no-restore
+dotnet test .\tests\FactoryTimer.Controller.Core.Tests\FactoryTimer.Controller.Core.Tests.csproj --configuration Release --no-restore
 dotnet test .\tests\FactoryTimer.Protocol.Tests\FactoryTimer.Protocol.Tests.csproj --configuration Release --no-restore
 dotnet run --project .\windows-controller\FactoryTimer.Controller\FactoryTimer.Controller.csproj --configuration Release --no-restore
 ```
@@ -183,7 +184,7 @@ Changing the SYNC path-delay selector now clears all five devices' synchronizati
 
 ## Five-device scaling revision
 
-The controller now recognizes `ESP01` through `ESP05`. Discovery, ONLINE/OFFLINE tracking, RESET, START_AT ACK handling, STARTED telemetry, clock verification, and UI cards cover all five devices. `SYNC CLOCKS` requires all five devices to have discovered IP addresses and synchronizes them sequentially using 8 calibration samples plus 4 delay-free verification samples per device.
+The controller now recognizes `ESP01` through `ESP05`. Discovery, ONLINE/OFFLINE tracking, RESET, START_AT ACK handling, STARTED telemetry, clock verification, and UI cards cover all five devices. `SYNC CLOCKS` requires all five devices to have discovered IP addresses and synchronizes them sequentially using 8 calibration samples plus 8 delay-free verification samples per device; each phase uses an inverse-RTT-squared weighted offset over the 3 lowest-RTT valid samples.
 
 The synchronization summary now reports the worst absolute verified clock error across the five devices and the fleet spread (`max(error) - min(error)`). The START summary reports the analogous verification-corrected five-device start spread. The completion status also reports total fleet synchronization duration.
 
@@ -191,10 +192,32 @@ For the first five-device performance baseline, select **NONE — 0 / 0 ms**. Th
 
 ## Automatic multi-run benchmark revision
 
-The five-device controller now includes an **Automatic benchmark** panel. A benchmark trial is a fresh independent synchronization measurement, not merely another START using an old offset. Each trial performs 8 calibration samples plus 4 delay-free verification samples for each of ESP01 through ESP05, broadcasts one common future `START_AT`, waits until all five `STARTED` packets for that command ID arrive, records the result, and then resets the countdown so the next trial can begin without waiting for the full display duration.
+The five-device controller now includes an **Automatic benchmark** panel. A benchmark trial is a fresh independent synchronization measurement, not merely another START using an old offset. Each trial performs 8 calibration samples plus 8 delay-free verification samples for each of ESP01 through ESP05, using the best-3 inverse-RTT-squared weighted offset in both phases, broadcasts one common future `START_AT`, waits until all five `STARTED` packets for that command ID arrive, records the result, and then resets the countdown so the next trial can begin without waiting for the full display duration.
 
 The default is 10 trials and the accepted range is 1-100. The selected SYNC path-delay mode is recorded in every row, so NONE, SYMMETRIC, and ASYMMETRIC experiments can all be benchmarked; for fleet scaling use **NONE — 0 / 0 ms**.
 
 At completion the controller automatically writes a CSV under `Documents\FactoryTimerBenchmarks`. Each device produces one row per trial. Numeric fields are stored in microseconds and include calibration RTT, verification RTT, applied and verification offsets, verified clock error, verification-corrected START error, locally reconstructed scheduler lateness, fleet synchronization duration, worst absolute clock/START errors, and five-device clock/START spreads. The UI reports success count, mean/P95/max START spread, mean worst START error, and mean fleet synchronization duration.
 
 The benchmark waits for STARTED telemetry rather than the full countdown to finish. Once the START edge has been measured, it sends RESET and advances to the next trial. The STOP button cancels the benchmark and still saves all completed/failed rows collected so far.
+
+## Synchronization quality retry and timing-quiet revision
+
+The ±3 ms quality gate is retained. Each device now has up to **5 total synchronization attempts**, with a **150 ms quiet interval** before a quality retry. Periodic `STATUS_REQUEST` discovery is stopped and fully drained before timing-critical synchronization, followed by a **100 ms drain interval** before the first SYNC sample. During an automatic benchmark trial discovery remains paused through synchronization, START_AT, STARTED telemetry, and RESET, then resumes between trials.
+
+The v5 offset estimator collects **8 samples** for calibration and verification, retains the **3 lowest-RTT valid samples**, and computes a **1/RTT² weighted offset** over those three. The minimum-RTT sample carries the real `SyncId` used by `SYNC_SET`; the offset itself is the weighted estimate. `BestSyncRttUs` and `VerifyRttUs` continue to report the minimum RTT in the retained set.
+
+The current hardware mapping used by the CSV is ESP01/ESP02/ESP04 = classic ESP32 and ESP03/ESP05 = ESP32-S3. See `SYNC_QUALITY_RETRY_GUIDE.md` for details.
+
+
+## Raw synchronization sample diagnostics revision
+
+The automatic benchmark now writes a second CSV next to the normal five-row-per-trial summary:
+
+```text
+factory_timer_5_device_benchmark_YYYYMMDD_HHMMSS.csv
+factory_timer_5_device_sync_samples_YYYYMMDD_HHMMSS.csv
+```
+
+Both files share the same run timestamp. The raw SYNC file contains one row for every completed calibration or verification timestamp exchange. v5 also preserves partial attempts: successful samples collected before an error are written, followed by an error marker row identifying the failing phase/sample, `SyncId` when known, `AttemptOutcome`, `FailureKind`, and `FailureMessage`. Complete rows record the four NTP-style timestamps, RTT/offset, low-RTT selection, the representative minimum-RTT sample, weighted consensus offset, and final quality result.
+
+This diagnostic file is intended to distinguish isolated outliers from multi-packet latency/asymmetry bursts and transport failures without changing the ±3 ms quality gate or five-attempt retry policy. See `RTT_WEIGHTED_ESTIMATOR_V5.md` and `SYNC_PARTIAL_DIAGNOSTICS_V5.md`.

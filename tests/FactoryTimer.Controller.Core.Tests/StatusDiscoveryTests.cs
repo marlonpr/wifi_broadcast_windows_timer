@@ -148,6 +148,26 @@ public sealed class StatusDiscoveryTests
         Assert.HasCount(1, transport.Requests);
     }
 
+    [TestMethod]
+    public async Task StopAndWaitDoesNotReturnUntilAnInFlightStatusRequestHasExited()
+    {
+        var transport = new BlockingStatusTransport();
+        using var discovery = new StatusDiscoveryService(
+            transport,
+            new SequenceCommandIdGenerator(88),
+            new ControlledDiscoveryDelay());
+        ControllerNetworkInterface wifi = Interface(
+            "wifi", ControllerInterfaceType.Wifi, "Intel Wi-Fi", "192.168.1.10", 24);
+
+        discovery.StartOrRestart(wifi, () => null);
+        await transport.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        await discovery.StopAndWaitAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.IsFalse(discovery.IsRunning);
+        Assert.IsTrue(transport.Exited);
+    }
+
     private static ControllerNetworkInterface Interface(
         string id,
         ControllerInterfaceType type,
@@ -189,6 +209,29 @@ public sealed class StatusDiscoveryTests
     }
 
     private sealed record StatusRequestRecord(ulong CommandId, IPAddress Destination);
+
+    private sealed class BlockingStatusTransport : IStatusRequestTransport
+    {
+        public TaskCompletionSource Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool Exited { get; private set; }
+
+        public async Task SendStatusRequestAsync(
+            ulong commandId,
+            IPAddress destination,
+            CancellationToken cancellationToken = default)
+        {
+            Started.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            finally
+            {
+                Exited = true;
+            }
+        }
+    }
 
     private sealed class SequenceCommandIdGenerator(params ulong[] values) : ICommandIdGenerator
     {

@@ -56,6 +56,12 @@ public sealed record ClockSyncSample(
         NetworkRttMicroseconds >= 0;
 }
 
+public readonly record struct ClockSyncConsensus(
+    ClockSyncSample RepresentativeSample,
+    long MasterMinusLocalOffsetMicroseconds,
+    long BestRttMicroseconds,
+    int LowRttSampleCount);
+
 public static class ClockSyncEstimator
 {
     public static ClockSyncSample SelectBest(IEnumerable<ClockSyncSample> samples)
@@ -67,10 +73,154 @@ public static class ClockSyncEstimator
         return best ?? throw new InvalidOperationException("No valid clock synchronization sample was received.");
     }
 
+    // Historical v3 estimator retained for regression tests: first retain the N valid
+    // samples with the lowest network RTT, then use the median offset inside that
+    // low-RTT set. v5 production synchronization uses inverse-square weighting.
+    // With an odd sample count the median is an actual measured sample.
+    public static ClockSyncConsensus SelectLowRttMedianOffset(
+        IEnumerable<ClockSyncSample> samples,
+        int lowRttSampleCount)
+    {
+        if (lowRttSampleCount <= 0 || (lowRttSampleCount & 1) == 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(lowRttSampleCount),
+                "The low-RTT consensus sample count must be a positive odd number.");
+        }
+
+        ClockSyncSample[] lowRttSamples = samples
+            .Where(sample => sample.IsValid)
+            .OrderBy(sample => sample.NetworkRttMicroseconds)
+            .ThenBy(sample => sample.MasterMinusLocalOffsetMicroseconds)
+            .Take(lowRttSampleCount)
+            .ToArray();
+
+        if (lowRttSamples.Length < lowRttSampleCount)
+        {
+            throw new InvalidOperationException(
+                $"At least {lowRttSampleCount} valid clock synchronization samples are required for low-RTT consensus.");
+        }
+
+        ClockSyncSample representative = lowRttSamples
+            .OrderBy(sample => sample.MasterMinusLocalOffsetMicroseconds)
+            .ThenBy(sample => sample.NetworkRttMicroseconds)
+            .ElementAt(lowRttSampleCount / 2);
+
+        return new ClockSyncConsensus(
+            representative,
+            representative.MasterMinusLocalOffsetMicroseconds,
+            lowRttSamples.Min(sample => sample.NetworkRttMicroseconds),
+            lowRttSampleCount);
+    }
+
+    // Production estimator used by v5: retain the N valid samples with the
+    // lowest network RTT, then compute an inverse-RTT-squared weighted offset.
+    // Scaling each weight by the minimum RTT keeps the arithmetic numerically
+    // well-conditioned while preserving the same relative 1/RTT^2 weighting.
+    // The lowest-RTT sample is retained as the representative sample only so
+    // SYNC_SET can carry a real synchronization ID; its measured offset is not
+    // substituted for the weighted estimate.
+    public static ClockSyncConsensus SelectLowRttInverseSquareWeightedOffset(
+        IEnumerable<ClockSyncSample> samples,
+        int lowRttSampleCount)
+    {
+        if (lowRttSampleCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(lowRttSampleCount),
+                "The low-RTT weighted sample count must be positive.");
+        }
+
+        ClockSyncSample[] lowRttSamples = samples
+            .Where(sample => sample.IsValid)
+            .OrderBy(sample => sample.NetworkRttMicroseconds)
+            .ThenBy(sample => sample.MasterMinusLocalOffsetMicroseconds)
+            .Take(lowRttSampleCount)
+            .ToArray();
+
+        if (lowRttSamples.Length < lowRttSampleCount)
+        {
+            throw new InvalidOperationException(
+                $"At least {lowRttSampleCount} valid clock synchronization samples are required for low-RTT weighted consensus.");
+        }
+
+        long bestRtt = lowRttSamples[0].NetworkRttMicroseconds;
+        ClockSyncSample representative = lowRttSamples[0];
+
+        double weightedOffsetSum = 0.0;
+        double weightSum = 0.0;
+
+        if (bestRtt == 0)
+        {
+            // A zero-RTT sample cannot be weighted with 1/RTT^2. If such samples
+            // ever occur, use only the zero-RTT subset because they dominate the
+            // inverse-square limit as RTT approaches zero.
+            ClockSyncSample[] zeroRttSamples = lowRttSamples
+                .Where(sample => sample.NetworkRttMicroseconds == 0)
+                .ToArray();
+            long zeroRttOffset = checked((long)Math.Round(
+                zeroRttSamples.Average(sample => (double)sample.MasterMinusLocalOffsetMicroseconds),
+                MidpointRounding.AwayFromZero));
+
+            return new ClockSyncConsensus(
+                representative,
+                zeroRttOffset,
+                bestRtt,
+                lowRttSampleCount);
+        }
+
+        foreach (ClockSyncSample sample in lowRttSamples)
+        {
+            double ratio = (double)bestRtt / sample.NetworkRttMicroseconds;
+            double weight = ratio * ratio;
+            weightedOffsetSum += weight * sample.MasterMinusLocalOffsetMicroseconds;
+            weightSum += weight;
+        }
+
+        long weightedOffset = checked((long)Math.Round(
+            weightedOffsetSum / weightSum,
+            MidpointRounding.AwayFromZero));
+
+        return new ClockSyncConsensus(
+            representative,
+            weightedOffset,
+            bestRtt,
+            lowRttSampleCount);
+    }
+
     // Positive means the device's reconstructed Master clock is ahead of Master.
     public static long CalculateResidualErrorMicroseconds(
         long appliedMasterMinusLocalOffsetMicroseconds,
         ClockSyncSample verificationSample) =>
         appliedMasterMinusLocalOffsetMicroseconds -
         verificationSample.MasterMinusLocalOffsetMicroseconds;
+}
+
+public readonly record struct SyncQualityEvaluation(
+    long ResidualErrorMicroseconds,
+    long ExpectedBiasMicroseconds,
+    long DeviationMicroseconds,
+    long ThresholdMicroseconds)
+{
+    public bool IsAccepted => Math.Abs(DeviationMicroseconds) <= ThresholdMicroseconds;
+}
+
+public static class SyncQualityPolicy
+{
+    public static SyncQualityEvaluation Evaluate(
+        long residualErrorMicroseconds,
+        long expectedBiasMicroseconds,
+        long thresholdMicroseconds)
+    {
+        if (thresholdMicroseconds < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(thresholdMicroseconds));
+        }
+
+        return new SyncQualityEvaluation(
+            residualErrorMicroseconds,
+            expectedBiasMicroseconds,
+            residualErrorMicroseconds - expectedBiasMicroseconds,
+            thresholdMicroseconds);
+    }
 }

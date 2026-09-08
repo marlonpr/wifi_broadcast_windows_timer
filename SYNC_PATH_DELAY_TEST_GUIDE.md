@@ -4,7 +4,7 @@ This build replaces the old "delay ESP02 session/START delivery" test with a con
 
 ## Test setup
 
-ESP01, ESP03, ESP04, and ESP05 are always no-delay controls. ESP02 receives the selected artificial delay only during the 8 calibration exchanges. The 4 verification exchanges are always delay-free, and START_AT uses the normal three-copy broadcast with no artificial delay.
+ESP01, ESP03, ESP04, and ESP05 are always no-delay controls. ESP02 receives the selected artificial delay only during the 8 calibration exchanges. The 8 verification exchanges are always delay-free, and START_AT uses the normal three-copy broadcast with no artificial delay.
 
 ## Mode 1: NONE
 
@@ -12,7 +12,7 @@ Select `NONE — 0 / 0 ms`, press **SYNC CLOCKS**, then **START_AT**. Record all
 
 ## Mode 2: SYMMETRIC
 
-Select `SYMMETRIC — 250 / 250 ms`. ESP02 calibration best RTT should rise by roughly 500 ms relative to normal Wi-Fi RTT, but its delay-free verification residual should remain close to the normal few-millisecond range. START should remain close to the baseline.
+Select `SYMMETRIC — 250 / 250 ms`. ESP02 calibration low-RTT consensus should rise by roughly 500 ms relative to normal Wi-Fi RTT, but its delay-free verification residual should remain close to the normal few-millisecond range. START should remain close to the baseline.
 
 ## Mode 3: ASYMMETRIC
 

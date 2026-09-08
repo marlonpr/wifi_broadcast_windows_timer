@@ -125,6 +125,14 @@ public sealed class FactoryProtocolTests
             out _));
         Assert.AreEqual(
             new StatusPacket("ESP02", 0x0123456789abcdef, TimerState.Running, 19), status);
+
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(
+            Encoding.ASCII.GetBytes("FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF"),
+            out InboundPacket? extendedStatus,
+            out _));
+        Assert.AreEqual(
+            new StatusPacket("ESP03", 0x0123456789abcdef, TimerState.Running, 19, -57, 6, "AA:BB:CC:DD:EE:FF"),
+            extendedStatus);
     }
 
     [TestMethod]
@@ -138,6 +146,9 @@ public sealed class FactoryProtocolTests
     [DataRow("FCT1|STATUS|ESP01|0123456789ABCDEF|BROKEN|19", ProtocolParseError.State)]
     [DataRow("FCT1|STATUS|ESP01|0123456789ABCDEF|RUNNING|-1", ProtocolParseError.Remaining)]
     [DataRow("FCT1|STATUS|ESP01|0123456789ABCDEF|RUNNING", ProtocolParseError.FieldCount)]
+    [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-200|6|AA:BB:CC:DD:EE:FF", ProtocolParseError.Rssi)]
+    [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|999|AA:BB:CC:DD:EE:FF", ProtocolParseError.Channel)]
+    [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|NOT-A-BSSID", ProtocolParseError.Bssid)]
     public void RejectsMalformedOrUnsupportedInbound(string text, ProtocolParseError expected)
     {
         Assert.IsFalse(FactoryProtocol.TryParseInbound(text, out _, out ProtocolParseError actual));

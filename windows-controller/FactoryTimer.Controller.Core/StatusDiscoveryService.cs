@@ -123,6 +123,29 @@ public sealed class StatusDiscoveryService : IDisposable
         CancelAndDispose(oldCancellation);
     }
 
+    public async Task StopAndWaitAsync()
+    {
+        CancellationTokenSource? oldCancellation;
+        Task oldCompletion;
+        lock (gate)
+        {
+            oldCancellation = cancellation;
+            cancellation = null;
+            generation++;
+            oldCompletion = completion;
+        }
+
+        CancelAndDispose(oldCancellation);
+        try
+        {
+            await oldCompletion.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation is the normal way the discovery loop exits.
+        }
+    }
+
     private async Task RunAfterPreviousAsync(
         Task previousCompletion,
         long activeGeneration,
