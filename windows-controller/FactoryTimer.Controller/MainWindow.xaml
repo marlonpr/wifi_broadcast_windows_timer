@@ -95,6 +95,28 @@
                                    TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         <TextBlock Text="Only ESP02 calibration samples are injected. ESP01, ESP03, ESP04, and ESP05 are no-delay controls; verification and START_AT delivery remain delay-free for all five devices. Changing this mode invalidates the previous sync; press SYNC CLOCKS again."
                                    TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Margin="0,8,0,0" Text="SYNC sample-count experiment" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                        <ComboBox Header="Calibration / verification samples"
+                                  SelectedIndex="{Binding SyncSamplingModeIndex, Mode=TwoWay}"
+                                  IsEnabled="{Binding CanSend}"
+                                  HorizontalAlignment="Stretch">
+                            <ComboBoxItem Content="8 + 8 — baseline" />
+                            <ComboBoxItem Content="4 + 4 — candidate" />
+                        </ComboBox>
+                        <TextBlock Text="{Binding SyncSamplingModeDescription}"
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="Changing the sample-count profile invalidates the previous synchronization. Keep the estimator, ±3 ms quality gate, retry policy, firmware scheduler, and START_AT path unchanged for the A/B test."
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Margin="0,8,0,0" Text="Windows T4 receive path" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                        <ComboBox Header="Master receive timestamp path"
+                                  SelectedIndex="{Binding ReceiveTimestampModeIndex, Mode=TwoWay}"
+                                  IsEnabled="{Binding CanSend}"
+                                  HorizontalAlignment="Stretch">
+                            <ComboBoxItem Content="ASYNC_AWAIT — diagnostic/reference" />
+                            <ComboBoxItem Content="BLOCKING_THREAD_T4 — production default" />
+                        </ComboBox>
+                        <TextBlock Text="{Binding ReceiveTimestampModeDescription}"
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                     </StackPanel>
                 </Grid>
             </Border>
@@ -130,9 +152,11 @@
                         <TextBlock Text="{Binding BenchmarkCsvPath}" TextWrapping="Wrap" FontFamily="Consolas" />
                         <TextBlock Text="Raw SYNC sample CSV" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         <TextBlock Text="{Binding BenchmarkDiagnosticsCsvPath}" TextWrapping="Wrap" FontFamily="Consolas" />
-                        <TextBlock Text="Each trial performs a fresh 8-sample calibration and 8-sample delay-free verification on every device; each phase uses a 1/RTT² weighted offset over its 3 lowest-RTT valid samples. The controller then sends one common absolute START_AT target, waits for STARTED telemetry from all five devices, records the measurements, and resets the countdown before the next trial. Both CSV files are saved automatically under Documents\FactoryTimerBenchmarks."
+                        <TextBlock Text="{Binding SyncSamplingModeDescription}"
                                    TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                        <TextBlock Text="SYNC quality gate: calibration and verification each use 8 timestamp exchanges. The controller keeps the 3 lowest-RTT valid samples and uses a 1/RTT² weighted offset, then accepts only when the verified residual is within ±3.000 ms of the expected experiment bias. A failing device is recalibrated automatically, up to 5 total attempts with a 150 ms quiet retry interval. Periodic STATUS discovery is paused and drained before timing-critical synchronization. NONE and SYMMETRIC expect 0 ms bias; ASYMMETRIC expects approximately -125 ms. The summary CSV records final device/fleet results; the raw SYNC CSV records completed timestamp exchanges plus partial/error attempts, RTT, offset, low-RTT selection, representative sample, weighted consensus, and per-attempt outcome/failure information."
+                        <TextBlock Text="Each trial performs a fresh synchronization using the selected sample-count profile, then sends one common absolute START_AT target, waits for STARTED telemetry from all five devices, records the measurements, and resets the countdown before the next trial. The SyncMode field in both CSVs records the active sample profile and T4 receive path. Both CSV files are saved automatically under Documents\FactoryTimerBenchmarks."
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="SYNC quality gate remains unchanged: each phase keeps the 3 lowest-RTT valid samples and uses the 1/RTT² weighted offset, then accepts only when the verified residual is within ±3.000 ms of the expected experiment bias. A failing device is recalibrated automatically, up to 5 total attempts with a 150 ms quiet retry interval. Periodic STATUS discovery is paused and drained before timing-critical synchronization."
                                    TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                     </StackPanel>
                 </Grid>

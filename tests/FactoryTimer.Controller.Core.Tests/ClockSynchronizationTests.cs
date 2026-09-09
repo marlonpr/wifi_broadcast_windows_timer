@@ -6,6 +6,20 @@ namespace FactoryTimer.Controller.Core.Tests;
 public sealed class ClockSynchronizationTests
 {
     [TestMethod]
+    public void SamplingExperimentProfilesMatchBaselineAndFourPlusFourCandidate()
+    {
+        SyncSamplingProfile baseline = SyncSamplingExperiment.GetProfile(
+            SyncSamplingMode.Baseline8Plus8);
+        SyncSamplingProfile candidate = SyncSamplingExperiment.GetProfile(
+            SyncSamplingMode.Candidate4Plus4);
+
+        Assert.AreEqual(new SyncSamplingProfile(8, 8, 3), baseline);
+        Assert.AreEqual(new SyncSamplingProfile(4, 4, 3), candidate);
+        Assert.AreEqual(16, baseline.ExchangesPerDevice);
+        Assert.AreEqual(8, candidate.ExchangesPerDevice);
+    }
+
+    [TestMethod]
     public void NtpStyleSampleCalculatesRttAndMasterMinusLocalOffset()
     {
         var sample = new ClockSyncSample(
@@ -311,6 +325,29 @@ public sealed class ClockSynchronizationTests
 
         Assert.AreEqual(60_000L, consensus.MasterMinusLocalOffsetMicroseconds);
         Assert.AreEqual(0L, consensus.BestRttMicroseconds);
+    }
+
+
+    [TestMethod]
+    public void SyncRetryPolicyRetriesTimeoutsAndTransientSocketErrors()
+    {
+        Assert.IsTrue(SyncRetryPolicy.IsRetryableTransportFailure(
+            new TimeoutException("SYNC timed out.")));
+        Assert.IsTrue(SyncRetryPolicy.IsRetryableTransportFailure(
+            new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.TimedOut)));
+        Assert.IsTrue(SyncRetryPolicy.IsRetryableTransportFailure(
+            new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.ConnectionReset)));
+    }
+
+    [TestMethod]
+    public void SyncRetryPolicyDoesNotRetryAdapterLossCancellationOrProtocolErrors()
+    {
+        Assert.IsFalse(SyncRetryPolicy.IsRetryableTransportFailure(
+            new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.NetworkDown)));
+        Assert.IsFalse(SyncRetryPolicy.IsRetryableTransportFailure(
+            new OperationCanceledException("cancelled")));
+        Assert.IsFalse(SyncRetryPolicy.IsRetryableTransportFailure(
+            new InvalidOperationException("Unexpected SYNC_REPLY while synchronizing ESP03.")));
     }
 
     private static ClockSyncSample SampleWithRttAndOffset(long rttMicroseconds, long offsetMicroseconds)

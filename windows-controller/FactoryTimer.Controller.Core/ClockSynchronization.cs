@@ -1,4 +1,31 @@
+using System.Net.Sockets;
+
 namespace FactoryTimer.Controller.Core;
+
+
+public enum SyncSamplingMode
+{
+    Baseline8Plus8 = 0,
+    Candidate4Plus4 = 1,
+}
+
+public readonly record struct SyncSamplingProfile(
+    int CalibrationSampleCount,
+    int VerificationSampleCount,
+    int LowRttSampleCount)
+{
+    public int ExchangesPerDevice => CalibrationSampleCount + VerificationSampleCount;
+}
+
+public static class SyncSamplingExperiment
+{
+    public static SyncSamplingProfile GetProfile(SyncSamplingMode mode) => mode switch
+    {
+        SyncSamplingMode.Baseline8Plus8 => new(8, 8, 3),
+        SyncSamplingMode.Candidate4Plus4 => new(4, 4, 3),
+        _ => throw new ArgumentOutOfRangeException(nameof(mode)),
+    };
+}
 
 public enum SyncPathDelayMode
 {
@@ -223,4 +250,33 @@ public static class SyncQualityPolicy
             residualErrorMicroseconds - expectedBiasMicroseconds,
             thresholdMicroseconds);
     }
+}
+
+
+public static class SyncRetryPolicy
+{
+    public static bool IsRetryableTransportFailure(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        return exception switch
+        {
+            TimeoutException => true,
+            SocketException socketException => IsRetryableSocketError(socketException.SocketErrorCode),
+            IOException { InnerException: SocketException socketException } =>
+                IsRetryableSocketError(socketException.SocketErrorCode),
+            _ => false,
+        };
+    }
+
+    private static bool IsRetryableSocketError(SocketError error) => error switch
+    {
+        SocketError.TimedOut => true,
+        SocketError.WouldBlock => true,
+        SocketError.TryAgain => true,
+        SocketError.NoBufferSpaceAvailable => true,
+        SocketError.ConnectionReset => true,
+        SocketError.HostUnreachable => true,
+        _ => false,
+    };
 }

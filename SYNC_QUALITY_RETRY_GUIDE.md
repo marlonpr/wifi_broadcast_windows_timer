@@ -19,7 +19,7 @@ The normal NONE-mode quality condition is:
 abs(applied_offset - verification_offset) <= 3000 us
 ```
 
-If it fails, only that device is recalibrated. There are at most 5 total attempts per device (4 retries). After a rejected verification, the controller leaves a 150 ms quiet interval before recalibrating that device. A benchmark trial does not issue START_AT unless all five devices pass.
+If it fails, only that device is recalibrated. There are at most 5 total attempts per device (4 retries). After a rejected verification, or after an eligible transient SYNC/SYNC_SET transport failure, the controller leaves a 150 ms quiet interval before recalibrating that device. A benchmark trial does not issue START_AT unless all five devices pass. Cancellation, protocol errors, explicit network-down conditions, and invalid configuration remain fail-fast.
 
 The path-delay experiment remains usable. The gate compares the residual against the experiment's expected bias:
 

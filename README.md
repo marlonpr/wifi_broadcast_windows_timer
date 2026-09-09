@@ -184,7 +184,7 @@ Changing the SYNC path-delay selector now clears all five devices' synchronizati
 
 ## Five-device scaling revision
 
-The controller now recognizes `ESP01` through `ESP05`. Discovery, ONLINE/OFFLINE tracking, RESET, START_AT ACK handling, STARTED telemetry, clock verification, and UI cards cover all five devices. `SYNC CLOCKS` requires all five devices to have discovered IP addresses and synchronizes them sequentially using 8 calibration samples plus 8 delay-free verification samples per device; each phase uses an inverse-RTT-squared weighted offset over the 3 lowest-RTT valid samples.
+The controller now recognizes `ESP01` through `ESP05`. Discovery, ONLINE/OFFLINE tracking, RESET, START_AT ACK handling, STARTED telemetry, clock verification, and UI cards cover all five devices. `SYNC CLOCKS` requires all five devices to have discovered IP addresses and synchronizes them sequentially using the selected sample-count profile. The baseline remains 8 calibration + 8 delay-free verification samples per device; the v8 candidate is 4 + 4. Both profiles use an inverse-RTT-squared weighted offset over the 3 lowest-RTT valid samples in each phase.
 
 The synchronization summary now reports the worst absolute verified clock error across the five devices and the fleet spread (`max(error) - min(error)`). The START summary reports the analogous verification-corrected five-device start spread. The completion status also reports total fleet synchronization duration.
 
@@ -192,9 +192,9 @@ For the first five-device performance baseline, select **NONE — 0 / 0 ms**. Th
 
 ## Automatic multi-run benchmark revision
 
-The five-device controller now includes an **Automatic benchmark** panel. A benchmark trial is a fresh independent synchronization measurement, not merely another START using an old offset. Each trial performs 8 calibration samples plus 8 delay-free verification samples for each of ESP01 through ESP05, using the best-3 inverse-RTT-squared weighted offset in both phases, broadcasts one common future `START_AT`, waits until all five `STARTED` packets for that command ID arrive, records the result, and then resets the countdown so the next trial can begin without waiting for the full display duration.
+The five-device controller now includes an **Automatic benchmark** panel. A benchmark trial is a fresh independent synchronization measurement, not merely another START using an old offset. Each trial uses the currently selected synchronization sample-count profile for each of ESP01 through ESP05, keeps the best-3 inverse-RTT-squared weighted offset in both phases, broadcasts one common future `START_AT`, waits until all five `STARTED` packets for that command ID arrive, records the result, and then resets the countdown so the next trial can begin without waiting for the full display duration.
 
-The default is 10 trials and the accepted range is 1-100. The selected SYNC path-delay mode is recorded in every row, so NONE, SYMMETRIC, and ASYMMETRIC experiments can all be benchmarked; for fleet scaling use **NONE — 0 / 0 ms**.
+The default is 10 trials and the accepted range is 1-100. The selected SYNC path-delay mode, Windows T4 receive path, and synchronization sample-count profile are recorded in `SyncMode`, so matched A/B runs remain identifiable in both CSVs. For fleet scaling use **NONE — 0 / 0 ms**.
 
 At completion the controller automatically writes a CSV under `Documents\FactoryTimerBenchmarks`. Each device produces one row per trial. Numeric fields are stored in microseconds and include calibration RTT, verification RTT, applied and verification offsets, verified clock error, verification-corrected START error, locally reconstructed scheduler lateness, fleet synchronization duration, worst absolute clock/START errors, and five-device clock/START spreads. The UI reports success count, mean/P95/max START spread, mean worst START error, and mean fleet synchronization duration.
 
@@ -202,12 +202,17 @@ The benchmark waits for STARTED telemetry rather than the full countdown to fini
 
 ## Synchronization quality retry and timing-quiet revision
 
-The ±3 ms quality gate is retained. Each device now has up to **5 total synchronization attempts**, with a **150 ms quiet interval** before a quality retry. Periodic `STATUS_REQUEST` discovery is stopped and fully drained before timing-critical synchronization, followed by a **100 ms drain interval** before the first SYNC sample. During an automatic benchmark trial discovery remains paused through synchronization, START_AT, STARTED telemetry, and RESET, then resumes between trials.
+The ±3 ms quality gate is retained. Each device now has up to **5 total synchronization attempts**, with a **150 ms quiet interval** before either a quality retry or an eligible transient SYNC transport retry. Periodic `STATUS_REQUEST` discovery is stopped and fully drained before timing-critical synchronization, followed by a **100 ms drain interval** before the first SYNC sample. During an automatic benchmark trial discovery remains paused through synchronization, START_AT, STARTED telemetry, and RESET, then resumes between trials.
 
-The v5 offset estimator collects **8 samples** for calibration and verification, retains the **3 lowest-RTT valid samples**, and computes a **1/RTT² weighted offset** over those three. The minimum-RTT sample carries the real `SyncId` used by `SYNC_SET`; the offset itself is the weighted estimate. `BestSyncRttUs` and `VerifyRttUs` continue to report the minimum RTT in the retained set.
+The estimator retains the **3 lowest-RTT valid samples** in each phase and computes a **1/RTT² weighted offset** over those three. The v8 sample-count experiment changes only how many raw exchanges are collected before that unchanged estimator: either 8+8 baseline or 4+4 candidate. The minimum-RTT sample carries the real `SyncId` used by `SYNC_SET`; the offset itself is the weighted estimate. `BestSyncRttUs` and `VerifyRttUs` continue to report the minimum RTT in the retained set.
 
 The current hardware mapping used by the CSV is ESP01/ESP02/ESP04 = classic ESP32 and ESP03/ESP05 = ESP32-S3. See `SYNC_QUALITY_RETRY_GUIDE.md` for details.
 
+
+
+### v6 transient transport retry
+
+The v5 inverse-RTT² estimator is unchanged. A `SYNC`/`SYNC_SET` timeout or selected transient UDP socket error now consumes one of the existing five attempts instead of aborting the whole fleet synchronization immediately. Partial raw diagnostics are retained for that failed attempt. Cancellation, protocol errors, explicit network-down conditions, and invalid configuration remain fail-fast. See `SYNC_TRANSPORT_RETRY_V6.md`.
 
 ## Raw synchronization sample diagnostics revision
 
@@ -221,3 +226,12 @@ factory_timer_5_device_sync_samples_YYYYMMDD_HHMMSS.csv
 Both files share the same run timestamp. The raw SYNC file contains one row for every completed calibration or verification timestamp exchange. v5 also preserves partial attempts: successful samples collected before an error are written, followed by an error marker row identifying the failing phase/sample, `SyncId` when known, `AttemptOutcome`, `FailureKind`, and `FailureMessage`. Complete rows record the four NTP-style timestamps, RTT/offset, low-RTT selection, the representative minimum-RTT sample, weighted consensus offset, and final quality result.
 
 This diagnostic file is intended to distinguish isolated outliers from multi-packet latency/asymmetry bursts and transport failures without changing the ±3 ms quality gate or five-attempt retry policy. See `RTT_WEIGHTED_ESTIMATOR_V5.md` and `SYNC_PARTIAL_DIAGNOSTICS_V5.md`.
+
+## v7 Windows T4 receive-path experiment
+
+This package adds an A/B-selectable Windows UDP receive timestamp path without changing ESP firmware or the synchronization estimator. See `HOST_T4_RECEIVE_AB_V7.md`.
+
+## v8 SYNC sample-count A/B experiment
+
+The Windows controller now exposes `8 + 8 — baseline` and `4 + 4 — candidate` sample-count profiles. `BLOCKING_THREAD_T4` is the production default; `ASYNC_AWAIT` remains available as a diagnostic/reference mode. Changing the sample-count profile invalidates the prior synchronization. No ESP32 firmware change is required. See `SYNC_SAMPLE_COUNT_AB_V8.md` for the counterbalanced benchmark procedure and acceptance criteria.
+

@@ -152,7 +152,7 @@ Fields after `remaining` are RSSI in dBm, Wi-Fi primary channel, and BSSID. The 
 
 ## Verification quality gate and retry
 
-After each 8-sample calibration and 8-sample delay-free verification, the controller forms a best-3 low-RTT 1/RTT² weighted offset for each phase and evaluates:
+After the selected calibration and delay-free verification sample counts are collected (8+8 baseline or 4+4 candidate in v8), the controller forms a best-3 low-RTT 1/RTT² weighted offset for each phase and evaluates:
 
 ```text
 residual_error = applied_offset - verification_offset

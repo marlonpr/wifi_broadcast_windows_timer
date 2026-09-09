@@ -8,11 +8,13 @@ This mode measures synchronization as an independent random/network event on eve
 
 1. Power ESP01 through ESP05 and wait until every card is ONLINE.
 2. Select **NONE — 0 / 0 ms**.
-3. Leave timer duration at 20 seconds. The benchmark does not wait 20 seconds between trials; it resets shortly after STARTED telemetry is captured.
-4. Set **Trials** to `30` for the current five-device validation.
-5. Press **RUN BENCHMARK**.
-6. Do not change Wi-Fi interface or SYNC path-delay mode while the benchmark is running.
-7. When complete, note the summary and both CSV paths shown in the UI.
+3. Keep **BLOCKING_THREAD_T4 — production default** selected.
+4. Select the requested SYNC sample-count profile (`8 + 8` baseline or `4 + 4` candidate).
+5. Leave timer duration at 20 seconds. The benchmark does not wait 20 seconds between trials; it resets shortly after STARTED telemetry is captured.
+6. Set **Trials** to the requested block size (10 trials is recommended for the v8 counterbalanced A/B sequence).
+7. Press **RUN BENCHMARK**.
+8. Do not change Wi-Fi interface, path-delay mode, T4 path, or sample-count profile while the benchmark is running.
+9. When complete, note the summary and both CSV paths shown in the UI.
 
 ## One trial
 
@@ -21,11 +23,11 @@ Each trial executes:
 ```text
 pause periodic STATUS_REQUEST and drain 100 ms
         ↓
-fresh SYNC of ESP01 (8 calibration + 8 verification, best-3 low-RTT 1/RTT² weighted offset, max 5 attempts)
-fresh SYNC of ESP02 (8 calibration + 8 verification, best-3 low-RTT 1/RTT² weighted offset, max 5 attempts)
-fresh SYNC of ESP03 (8 calibration + 8 verification, best-3 low-RTT 1/RTT² weighted offset, max 5 attempts)
-fresh SYNC of ESP04 (8 calibration + 8 verification, best-3 low-RTT 1/RTT² weighted offset, max 5 attempts)
-fresh SYNC of ESP05 (8 calibration + 8 verification, best-3 low-RTT 1/RTT² weighted offset, max 5 attempts)
+fresh SYNC of ESP01 (selected calibration + verification counts, best-3 low-RTT 1/RTT² weighted offset, max 5 attempts)
+fresh SYNC of ESP02 (selected calibration + verification counts, best-3 low-RTT 1/RTT² weighted offset, max 5 attempts)
+fresh SYNC of ESP03 (selected calibration + verification counts, best-3 low-RTT 1/RTT² weighted offset, max 5 attempts)
+fresh SYNC of ESP04 (selected calibration + verification counts, best-3 low-RTT 1/RTT² weighted offset, max 5 attempts)
+fresh SYNC of ESP05 (selected calibration + verification counts, best-3 low-RTT 1/RTT² weighted offset, max 5 attempts)
         ↓
 one common absolute START_AT target
         ↓
@@ -64,7 +66,7 @@ The **summary CSV** is long-form: five rows per trial, one row per device. Impor
 `SchedulerLatenessUs` is reconstructed from the firmware STARTED packet as `EstimatedMasterStart - TargetMasterStart`. It measures the local START scheduler using the same applied offset that armed the deadline; `StartErrorUs` instead uses the independent delay-free verification offset and therefore measures the estimated physical synchronization error.
 
 
-The **raw SYNC sample CSV** is named `factory_timer_5_device_sync_samples_YYYYMMDD_HHMMSS.csv`. It contains one row for each completed timestamp exchange. A normal first-attempt device produces 16 rows: 8 `CALIBRATION` rows and 8 `VERIFICATION` rows. Retries add another 16 rows per completed attempt.
+The **raw SYNC sample CSV** is named `factory_timer_5_device_sync_samples_YYYYMMDD_HHMMSS.csv`. It contains one row for each completed timestamp exchange. A normal first-attempt device produces 16 rows in the 8+8 baseline or 8 rows in the 4+4 candidate. Retries add another complete profile's worth of rows per completed attempt.
 
 Important raw columns:
 
@@ -102,7 +104,7 @@ A failed trial is retained in the CSV rather than discarded. This is intentional
 
 ## Synchronization quality retry
 
-This revision adds a verification gate before each device is considered synchronized. Calibration and verification each collect 8 exchanges, retain the 3 lowest-RTT valid samples, and use the 1/RTT² weighted offset of those 3. The controller accepts a device only when the verification residual is within ±3.000 ms of the expected path-delay experiment bias. A failing device is automatically recalibrated, up to 5 total attempts. Rejected attempts are separated by a 150 ms quiet interval.
+This revision adds a verification gate before each device is considered synchronized. Calibration and verification collect the number of exchanges selected by the active sample-count profile, retain the 3 lowest-RTT valid samples, and use the 1/RTT² weighted offset of those 3. The controller accepts a device only when the verification residual is within ±3.000 ms of the expected path-delay experiment bias. A failing device is automatically recalibrated, up to 5 total attempts. Quality rejections and eligible transient SYNC/SYNC_SET transport failures are separated from the next attempt by a 150 ms quiet interval. Cancellation, protocol errors, explicit network-down conditions, and invalid configuration remain fail-fast.
 
 The CSV now includes `SyncAttempts`, `SyncRetries`, `InitialClockErrorUs`, `ExpectedSyncBiasUs`, `SyncQualityDeviationUs`, `SyncQualityThresholdUs`, and `SyncQualityAccepted` so retries are visible rather than hidden.
 
@@ -113,3 +115,7 @@ The benchmark stops the 2-second periodic `STATUS_REQUEST` loop before each sync
 ## Wi-Fi diagnostics
 
 With the matching updated firmware, every STATUS packet also reports RSSI, Wi-Fi channel, and BSSID. The controller displays these values on each device card and exports `RssiDbm`, `WifiChannel`, and `Bssid` in the benchmark CSV. Legacy FCT1 STATUS remains accepted, but these three columns remain blank when legacy firmware is used.
+
+## v8 sample-count experiment
+
+For the 8+8 versus 4+4 counterbalanced procedure, fixed settings, and acceptance criteria, see `SYNC_SAMPLE_COUNT_AB_V8.md`.

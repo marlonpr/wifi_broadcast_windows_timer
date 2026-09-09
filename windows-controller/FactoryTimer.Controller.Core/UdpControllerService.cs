@@ -19,6 +19,21 @@ public sealed class PacketReceivedEventArgs(
 
 public sealed record ReceivedSyncReply(SyncReplyPacket Packet, long MasterT4Microseconds);
 
+public enum UdpReceiveTimestampMode
+{
+    AsyncAwait = 0,
+    DedicatedBlockingThread = 1,
+}
+
+public readonly record struct TimestampedUdpReceiveResult(
+    UdpReceiveResult Result,
+    long MasterReceiveMicroseconds);
+
+public interface ITimestampedBlockingControllerUdpSocket
+{
+    TimestampedUdpReceiveResult ReceiveTimestampedBlocking();
+}
+
 public interface IControllerUdpSocket : IDisposable
 {
     ValueTask<int> SendAsync(
@@ -39,7 +54,7 @@ public sealed class SystemControllerUdpSocketFactory : IControllerUdpSocketFacto
     public IControllerUdpSocket CreateBound(IPAddress localAddress, bool enableBroadcast) =>
         new SystemControllerUdpSocket(localAddress, enableBroadcast);
 
-    private sealed class SystemControllerUdpSocket : IControllerUdpSocket
+    private sealed class SystemControllerUdpSocket : IControllerUdpSocket, ITimestampedBlockingControllerUdpSocket
     {
         private readonly UdpClient client;
 
@@ -66,6 +81,19 @@ public sealed class SystemControllerUdpSocketFactory : IControllerUdpSocketFacto
         public ValueTask<UdpReceiveResult> ReceiveAsync(CancellationToken cancellationToken) =>
             client.ReceiveAsync(cancellationToken);
 
+        public TimestampedUdpReceiveResult ReceiveTimestampedBlocking()
+        {
+            byte[] buffer = new byte[2048];
+            EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+            int received = client.Client.ReceiveFrom(buffer, ref remote);
+            long masterReceiveMicroseconds = MasterClock.NowMicroseconds;
+
+            byte[] datagram = buffer.AsSpan(0, received).ToArray();
+            return new TimestampedUdpReceiveResult(
+                new UdpReceiveResult(datagram, (IPEndPoint)remote),
+                masterReceiveMicroseconds);
+        }
+
         public void Dispose() => client.Dispose();
     }
 }
@@ -80,11 +108,20 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
     private readonly ConcurrentDictionary<ulong, TaskCompletionSource<ReceivedSyncReply>> syncReplyWaiters = new();
     private readonly ConcurrentDictionary<ulong, TaskCompletionSource<SyncAppliedPacket>> syncAppliedWaiters = new();
     private SocketSession? session;
+    private UdpReceiveTimestampMode receiveTimestampMode = UdpReceiveTimestampMode.AsyncAwait;
     private bool disposed;
 
     public UdpControllerService(IControllerUdpSocketFactory? socketFactory = null)
     {
         this.socketFactory = socketFactory ?? new SystemControllerUdpSocketFactory();
+    }
+
+    public UdpReceiveTimestampMode ReceiveTimestampMode
+    {
+        get
+        {
+            lock (gate) return receiveTimestampMode;
+        }
     }
 
     public event EventHandler<PacketReceivedEventArgs>? PacketReceived;
@@ -123,9 +160,70 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
             CancelSyncWaiters();
             if (selection is null) return;
 
-            IControllerUdpSocket socket = socketFactory.CreateBound(selection.LocalAddress, enableBroadcast: true);
-            var replacement = new SocketSession(selection, socket);
-            lock (gate) session = replacement;
+            StartNewSession(selection);
+        }
+    }
+
+    public void ChangeReceiveTimestampMode(UdpReceiveTimestampMode mode)
+    {
+        if (!Enum.IsDefined(typeof(UdpReceiveTimestampMode), mode))
+        {
+            throw new ArgumentOutOfRangeException(nameof(mode));
+        }
+
+        lock (changeGate)
+        {
+            SocketSession? oldSession;
+            ControllerNetworkInterface? selection;
+            lock (gate)
+            {
+                ObjectDisposedException.ThrowIf(disposed, this);
+                if (receiveTimestampMode == mode) return;
+                receiveTimestampMode = mode;
+                oldSession = session;
+                selection = oldSession?.Selection;
+                session = null;
+            }
+
+            StopSession(oldSession);
+            CancelSyncWaiters();
+            if (selection is not null)
+            {
+                StartNewSession(selection);
+            }
+        }
+    }
+
+    private void StartNewSession(ControllerNetworkInterface selection)
+    {
+        IControllerUdpSocket socket = socketFactory.CreateBound(selection.LocalAddress, enableBroadcast: true);
+        var replacement = new SocketSession(selection, socket);
+        lock (gate) session = replacement;
+
+        if (ReceiveTimestampMode == UdpReceiveTimestampMode.DedicatedBlockingThread)
+        {
+            if (socket is not ITimestampedBlockingControllerUdpSocket)
+            {
+                lock (gate)
+                {
+                    if (ReferenceEquals(session, replacement)) session = null;
+                }
+                socket.Dispose();
+                replacement.Cancellation.Dispose();
+                throw new NotSupportedException(
+                    "The selected UDP socket implementation does not support the dedicated blocking T4 receiver.");
+            }
+
+            replacement.ReceiverThread = new Thread(() => ReceiveLoopBlocking(replacement))
+            {
+                Name = "FactoryTimer UDP T4 receiver",
+                IsBackground = true,
+                Priority = ThreadPriority.AboveNormal,
+            };
+            replacement.ReceiverThread.Start();
+        }
+        else
+        {
             replacement.ReceiverTask = ReceiveLoopAsync(replacement);
         }
     }
@@ -288,37 +386,7 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
                 UdpReceiveResult result = await activeSession.Socket.ReceiveAsync(token);
                 long masterReceiveMicroseconds = MasterClock.NowMicroseconds;
                 if (!IsCurrent(activeSession)) break;
-
-                if (FactoryProtocol.TryParseInbound(
-                    result.Buffer,
-                    out InboundPacket? packet,
-                    out ProtocolParseError error))
-                {
-                    if (packet is SyncReplyPacket syncReply &&
-                        syncReplyWaiters.TryGetValue(syncReply.SyncId, out TaskCompletionSource<ReceivedSyncReply>? syncWaiter))
-                    {
-                        syncWaiter.TrySetResult(new ReceivedSyncReply(syncReply, masterReceiveMicroseconds));
-                    }
-                    else if (packet is SyncAppliedPacket syncApplied &&
-                             syncAppliedWaiters.TryGetValue(syncApplied.SyncId, out TaskCompletionSource<SyncAppliedPacket>? appliedWaiter))
-                    {
-                        appliedWaiter.TrySetResult(syncApplied);
-                    }
-
-                    PacketReceived?.Invoke(
-                        this,
-                        new PacketReceivedEventArgs(
-                            packet!,
-                            result.RemoteEndPoint,
-                            activeSession.Selection,
-                            masterReceiveMicroseconds));
-                }
-                else
-                {
-                    ReceiveError?.Invoke(
-                        this,
-                        $"Discarded malformed response from {result.RemoteEndPoint}: {error}");
-                }
+                ProcessReceivedDatagram(activeSession, result, masterReceiveMicroseconds);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
@@ -343,6 +411,75 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         }
     }
 
+    private void ReceiveLoopBlocking(SocketSession activeSession)
+    {
+        CancellationToken token = activeSession.Cancellation.Token;
+        var blockingSocket = (ITimestampedBlockingControllerUdpSocket)activeSession.Socket;
+
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                TimestampedUdpReceiveResult received = blockingSocket.ReceiveTimestampedBlocking();
+                if (!IsCurrent(activeSession)) break;
+                ProcessReceivedDatagram(
+                    activeSession,
+                    received.Result,
+                    received.MasterReceiveMicroseconds);
+            }
+            catch (ObjectDisposedException) when (token.IsCancellationRequested || !IsCurrent(activeSession))
+            {
+                break;
+            }
+            catch (SocketException) when (token.IsCancellationRequested || !IsCurrent(activeSession))
+            {
+                break;
+            }
+            catch (SocketException exception)
+            {
+                ReceiveError?.Invoke(this, $"UDP blocking receive error: {exception.Message}");
+                if (token.WaitHandle.WaitOne(250)) break;
+            }
+        }
+    }
+
+    private void ProcessReceivedDatagram(
+        SocketSession activeSession,
+        UdpReceiveResult result,
+        long masterReceiveMicroseconds)
+    {
+        if (FactoryProtocol.TryParseInbound(
+            result.Buffer,
+            out InboundPacket? packet,
+            out ProtocolParseError error))
+        {
+            if (packet is SyncReplyPacket syncReply &&
+                syncReplyWaiters.TryGetValue(syncReply.SyncId, out TaskCompletionSource<ReceivedSyncReply>? syncWaiter))
+            {
+                syncWaiter.TrySetResult(new ReceivedSyncReply(syncReply, masterReceiveMicroseconds));
+            }
+            else if (packet is SyncAppliedPacket syncApplied &&
+                     syncAppliedWaiters.TryGetValue(syncApplied.SyncId, out TaskCompletionSource<SyncAppliedPacket>? appliedWaiter))
+            {
+                appliedWaiter.TrySetResult(syncApplied);
+            }
+
+            PacketReceived?.Invoke(
+                this,
+                new PacketReceivedEventArgs(
+                    packet!,
+                    result.RemoteEndPoint,
+                    activeSession.Selection,
+                    masterReceiveMicroseconds));
+        }
+        else
+        {
+            ReceiveError?.Invoke(
+                this,
+                $"Discarded malformed response from {result.RemoteEndPoint}: {error}");
+        }
+    }
+
     private bool IsCurrent(SocketSession candidate)
     {
         lock (gate) return ReferenceEquals(session, candidate);
@@ -353,6 +490,13 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         if (oldSession is null) return;
         oldSession.Cancellation.Cancel();
         oldSession.Socket.Dispose();
+
+        Thread? receiverThread = oldSession.ReceiverThread;
+        if (receiverThread is not null && receiverThread.IsAlive && receiverThread != Thread.CurrentThread)
+        {
+            receiverThread.Join(TimeSpan.FromSeconds(2));
+        }
+
         oldSession.Cancellation.Dispose();
     }
 
@@ -396,5 +540,6 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         public IControllerUdpSocket Socket { get; } = socket;
         public CancellationTokenSource Cancellation { get; } = new();
         public Task? ReceiverTask { get; set; }
+        public Thread? ReceiverThread { get; set; }
     }
 }

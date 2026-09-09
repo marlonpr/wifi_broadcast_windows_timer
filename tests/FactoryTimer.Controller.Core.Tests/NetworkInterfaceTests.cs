@@ -207,6 +207,25 @@ public sealed class NetworkInterfaceTests
     }
 
     [TestMethod]
+    public void ChangingReceiveTimestampModeRecreatesSelectedSocket()
+    {
+        var factory = new FakeUdpSocketFactory();
+        using var service = new UdpControllerService(factory);
+        ControllerNetworkInterface wifi = Interface(
+            "wifi", ControllerInterfaceType.Wifi, "Intel Wi-Fi", "192.168.5.168", 16);
+
+        service.ChangeSelection(wifi);
+        service.ChangeReceiveTimestampMode(UdpReceiveTimestampMode.DedicatedBlockingThread);
+
+        Assert.AreEqual(UdpReceiveTimestampMode.DedicatedBlockingThread, service.ReceiveTimestampMode);
+        Assert.HasCount(2, factory.Created);
+        Assert.IsTrue(factory.Created[0].Socket.IsDisposed);
+        Assert.IsFalse(factory.Created[1].Socket.IsDisposed);
+        Assert.AreEqual(wifi, service.Selection);
+        Assert.IsTrue(service.IsReady);
+    }
+
+    [TestMethod]
     public async Task SendsAllThreeCommandCopiesThroughSelectedSocketAndExistingPort()
     {
         var factory = new FakeUdpSocketFactory();
@@ -304,8 +323,9 @@ public sealed class NetworkInterfaceTests
         bool EnableBroadcast,
         FakeUdpSocket Socket);
 
-    private sealed class FakeUdpSocket : IControllerUdpSocket
+    private sealed class FakeUdpSocket : IControllerUdpSocket, ITimestampedBlockingControllerUdpSocket
     {
+        private readonly ManualResetEventSlim disposedSignal = new(false);
         public bool IsDisposed { get; private set; }
         public List<IPEndPoint> Destinations { get; } = [];
 
@@ -324,6 +344,16 @@ public sealed class NetworkInterfaceTests
             throw new InvalidOperationException("The infinite receive should only end by cancellation.");
         }
 
-        public void Dispose() => IsDisposed = true;
+        public TimestampedUdpReceiveResult ReceiveTimestampedBlocking()
+        {
+            disposedSignal.Wait();
+            throw new ObjectDisposedException(nameof(FakeUdpSocket));
+        }
+
+        public void Dispose()
+        {
+            IsDisposed = true;
+            disposedSignal.Set();
+        }
     }
 }
