@@ -41,8 +41,13 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private string benchmarkProgress = "Not run";
     private string benchmarkCsvPath = "—";
     private string benchmarkDiagnosticsCsvPath = "—";
+    private string analyzerCsvPath = "—";
+    private string analyzerStatus = "Disabled";
+    private string analyzerComPort = string.Empty;
+    private bool analyzerEnabled;
     private double benchmarkTrialsInput = 10;
     private int syncPathDelayModeIndex;
+    private int syncPathDelayTargetIndex = 1; // ESP02 remains the default experiment target.
     private int syncSamplingModeIndex;
     private int receiveTimestampModeIndex = (int)UdpReceiveTimestampMode.DedicatedBlockingThread;
     private bool canSend;
@@ -122,6 +127,22 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     public string BenchmarkProgress { get => benchmarkProgress; private set => SetProperty(ref benchmarkProgress, value); }
     public string BenchmarkCsvPath { get => benchmarkCsvPath; private set => SetProperty(ref benchmarkCsvPath, value); }
     public string BenchmarkDiagnosticsCsvPath { get => benchmarkDiagnosticsCsvPath; private set => SetProperty(ref benchmarkDiagnosticsCsvPath, value); }
+    public string AnalyzerCsvPath { get => analyzerCsvPath; private set => SetProperty(ref analyzerCsvPath, value); }
+    public string AnalyzerStatus { get => analyzerStatus; private set => SetProperty(ref analyzerStatus, value); }
+    public string AnalyzerComPort { get => analyzerComPort; set => SetProperty(ref analyzerComPort, value); }
+    public bool AnalyzerEnabled
+    {
+        get => analyzerEnabled;
+        set
+        {
+            if (SetProperty(ref analyzerEnabled, value))
+            {
+                AnalyzerStatus = value
+                    ? "Enabled; analyzer will connect when RUN BENCHMARK starts."
+                    : "Disabled";
+            }
+        }
+    }
     public double BenchmarkTrialsInput { get => benchmarkTrialsInput; set => SetProperty(ref benchmarkTrialsInput, value); }
     public bool CanSend { get => canSend; private set => SetProperty(ref canSend, value); }
     public bool IsBenchmarkRunning
@@ -136,12 +157,38 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
     public bool CanCancelBenchmark => IsBenchmarkRunning;
+
+    public int SyncPathDelayTargetIndex
+    {
+        get => syncPathDelayTargetIndex;
+        set
+        {
+            int clamped = Math.Clamp(value, 0, 4);
+            if (SetProperty(ref syncPathDelayTargetIndex, clamped))
+            {
+                OnPropertyChanged(nameof(SyncPathDelayDescription));
+                foreach (DeviceViewModel device in Devices)
+                {
+                    device.ClearSynchronization();
+                    device.ClearStartMeasurement();
+                }
+                string target = BuildSyncPathDelayTargetLabel(clamped);
+                SynchronizationResolution =
+                    "SYNC injection target changed; press SYNC CLOCKS again.";
+                StartSynchronizationResult =
+                    "START_AT requires a fresh synchronization after changing the injection target.";
+                StatusMessage =
+                    $"SYNC path-delay target changed to {target}. Press SYNC CLOCKS before START_AT.";
+            }
+        }
+    }
+
     public int SyncPathDelayModeIndex
     {
         get => syncPathDelayModeIndex;
         set
         {
-            int clamped = Math.Clamp(value, 0, 2);
+            int clamped = Math.Clamp(value, 0, 5);
             if (SetProperty(ref syncPathDelayModeIndex, clamped))
             {
                 OnPropertyChanged(nameof(SyncPathDelayDescription));
@@ -286,17 +333,20 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
 
             SyncPathDelayProfile noDelay =
                 SyncPathDelayExperiment.GetProfile(SyncPathDelayMode.None);
-            SyncPathDelayProfile esp02CalibrationDelay =
+            SyncPathDelayProfile injectedCalibrationDelay =
                 SyncPathDelayExperiment.GetProfile((SyncPathDelayMode)SyncPathDelayModeIndex);
+            string injectionTargetDeviceId =
+                BuildSyncPathDelayTargetLabel(SyncPathDelayTargetIndex);
             SyncSamplingProfile samplingProfile =
                 SyncSamplingExperiment.GetProfile((SyncSamplingMode)SyncSamplingModeIndex);
 
             for (int index = 0; index < readyDevices.Count; index++)
             {
                 (DeviceViewModel device, IPAddress address) = readyDevices[index];
-                SyncPathDelayProfile calibrationDelay = ReferenceEquals(device, Esp02)
-                    ? esp02CalibrationDelay
-                    : noDelay;
+                SyncPathDelayProfile calibrationDelay =
+                    string.Equals(device.DeviceId, injectionTargetDeviceId, StringComparison.Ordinal)
+                        ? injectedCalibrationDelay
+                        : noDelay;
                 StatusMessage =
                     $"Synchronizing {device.DeviceId} ({index + 1}/{readyDevices.Count}): " +
                     $"{samplingProfile.CalibrationSampleCount} calibration + {samplingProfile.VerificationSampleCount} verification samples, " +
@@ -311,8 +361,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             StatusMessage =
                 $"5-device synchronization complete in {fleetSyncDurationUs / 1000d:F1} ms with {totalRetries} quality retries using " +
                 $"{samplingProfile.CalibrationSampleCount}+{samplingProfile.VerificationSampleCount} samples/device. " +
-                $"ESP02 calibration={esp02CalibrationDelay.MasterToDeviceDelayMilliseconds}/{esp02CalibrationDelay.DeviceToMasterDelayMilliseconds} ms; " +
-                $"ESP01/03/04/05 and all verification samples=0/0 ms.";
+                $"{injectionTargetDeviceId} calibration={injectedCalibrationDelay.MasterToDeviceDelayMilliseconds}/{injectedCalibrationDelay.DeviceToMasterDelayMilliseconds} ms; " +
+                $"all non-target devices and all verification samples=0/0 ms.";
         }
         catch (Exception exception)
         {
@@ -340,10 +390,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         string? benchmarkSyncMode = null)
     {
         long? initialResidualMicroseconds = null;
-        long expectedBiasMicroseconds = calibrationDelay.ExpectedOffsetBiasMicroseconds;
 
         for (int attempt = 1; attempt <= MaxSynchronizationAttempts; attempt++)
         {
+            long expectedBiasMicroseconds = calibrationDelay.ExpectedOffsetBiasMicroseconds;
             List<SyncMeasurement> samples = [];
             List<SyncMeasurement> verificationSamples = [];
             ClockSyncConsensus? calibrationConsensus = null;
@@ -379,6 +429,14 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     samplingProfile.LowRttSampleCount);
                 representativeCalibration = samples.First(item =>
                     item.Sample == calibrationConsensus.Value.RepresentativeSample);
+
+                // The quality gate must follow the delay that was actually
+                // injected into the exact low-RTT samples used by the offset
+                // estimator. This avoids Windows/FreeRTOS scheduling overshoot
+                // being misclassified as synchronization error.
+                expectedBiasMicroseconds = CalculateActualExpectedBiasMicroseconds(
+                    samples,
+                    samplingProfile.LowRttSampleCount);
 
                 var syncSet = new SyncSetPacket(
                     representativeCalibration.SyncId,
@@ -585,6 +643,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         {
             throw new InvalidOperationException($"Unexpected SYNC_REPLY while synchronizing {expectedDeviceId}.");
         }
+        if (reverseDelayUs > 0 && reply.ActualArtificialReplyDelayMicroseconds == 0)
+        {
+            throw new InvalidOperationException(
+                $"{expectedDeviceId} did not report the measured reverse-path delay. " +
+                "Flash the logic-validation firmware with microsecond delay reporting before running reverse-path controls.");
+        }
         var sample = new ClockSyncSample(
             t1,
             reply.LocalT2Microseconds,
@@ -594,7 +658,11 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         {
             throw new InvalidOperationException($"Invalid synchronization timing sample from {expectedDeviceId}.");
         }
-        return new SyncMeasurement(syncId, sample);
+        return new SyncMeasurement(
+            syncId,
+            sample,
+            received.ActualMasterToDeviceArtificialDelayMicroseconds,
+            reply.ActualArtificialReplyDelayMicroseconds);
     }
 
     private async Task RunBenchmarkInternalAsync()
@@ -616,19 +684,42 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             "yyyyMMdd_HHmmss",
             System.Globalization.CultureInfo.InvariantCulture);
         bool cancelled = false;
+        AnalyzerSerialClient? analyzer = null;
+        ulong analyzerRunId = ulong.Parse(
+            benchmarkRunId.Replace("_", string.Empty, StringComparison.Ordinal),
+            System.Globalization.CultureInfo.InvariantCulture);
 
         try
         {
             BenchmarkCsvPath = "—";
             BenchmarkDiagnosticsCsvPath = "—";
+            AnalyzerCsvPath = "—";
+
+            if (AnalyzerEnabled)
+            {
+                if (string.IsNullOrWhiteSpace(AnalyzerComPort))
+                {
+                    throw new InvalidOperationException(
+                        "ESP32 analyzer is enabled but no COM port is configured.");
+                }
+
+                AnalyzerStatus = $"Connecting to ESP32 analyzer on {AnalyzerComPort.Trim()}...";
+                analyzer = new AnalyzerSerialClient();
+                await analyzer.ConnectAsync(AnalyzerComPort, cancellationToken);
+                AnalyzerStatus =
+                    $"Connected on {AnalyzerComPort.Trim()}; run ID {analyzerRunId}.";
+            }
             SyncPathDelayProfile noDelay =
                 SyncPathDelayExperiment.GetProfile(SyncPathDelayMode.None);
-            SyncPathDelayProfile esp02CalibrationDelay =
+            SyncPathDelayProfile injectedCalibrationDelay =
                 SyncPathDelayExperiment.GetProfile((SyncPathDelayMode)SyncPathDelayModeIndex);
+            string injectionTargetDeviceId =
+                BuildSyncPathDelayTargetLabel(SyncPathDelayTargetIndex);
             SyncSamplingProfile samplingProfile =
                 SyncSamplingExperiment.GetProfile((SyncSamplingMode)SyncSamplingModeIndex);
             string benchmarkSyncMode =
-                $"{BuildSyncPathDelayModeLabel(SyncPathDelayModeIndex)} | RX={BuildReceiveTimestampModeLabel(ReceiveTimestampModeIndex)} | " +
+                $"{BuildSyncPathDelayModeLabel(SyncPathDelayModeIndex)} | TARGET={injectionTargetDeviceId} | " +
+                $"RX={BuildReceiveTimestampModeLabel(ReceiveTimestampModeIndex)} | " +
                 $"SAMPLES={BuildSyncSamplingModeLabel(SyncSamplingModeIndex)}";
 
             for (int trial = 1; trial <= trialCount; trial++)
@@ -640,9 +731,18 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 long syncDurationUs = 0;
                 long syncStartUs = 0;
                 string failure = string.Empty;
+                bool analyzerTrialBegun = false;
 
                 try
                 {
+                    if (analyzer is not null)
+                    {
+                        BenchmarkProgress =
+                            $"Trial {trial}/{trialCount}: arming ESP32 analyzer...";
+                        await analyzer.BeginTrialAsync(analyzerRunId, trial, cancellationToken);
+                        analyzerTrialBegun = true;
+                    }
+
                     if (!TryGetReadyDevices(out readyDevices))
                     {
                         throw new InvalidOperationException("All five devices must remain discoverable for every benchmark trial.");
@@ -661,9 +761,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     {
                         cancellationToken.ThrowIfCancellationRequested();
                         (DeviceViewModel device, IPAddress address) = readyDevices[index];
-                        SyncPathDelayProfile calibrationDelay = ReferenceEquals(device, Esp02)
-                            ? esp02CalibrationDelay
-                            : noDelay;
+                        SyncPathDelayProfile calibrationDelay =
+                            string.Equals(device.DeviceId, injectionTargetDeviceId, StringComparison.Ordinal)
+                                ? injectedCalibrationDelay
+                                : noDelay;
                         BenchmarkProgress =
                             $"Trial {trial}/{trialCount}: SYNC {device.DeviceId} ({index + 1}/5)...";
                         await SynchronizeDeviceAsync(
@@ -774,6 +875,22 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 }
                 finally
                 {
+                    if (analyzer is not null && analyzerTrialBegun)
+                    {
+                        try
+                        {
+                            await analyzer.EndTrialAsync(
+                                analyzerRunId,
+                                trial,
+                                CancellationToken.None);
+                        }
+                        catch (Exception analyzerException)
+                        {
+                            AnalyzerStatus =
+                                $"Analyzer END/SUMMARY failed on trial {trial}: {analyzerException.Message}";
+                        }
+                    }
+
                     await BestEffortBenchmarkResetAsync(duration);
                     ExitTimingQuietPeriod();
                 }
@@ -788,6 +905,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         {
             cancelled = true;
             BenchmarkProgress = "Benchmark cancellation requested; saving completed trials...";
+        }
+        catch (Exception exception)
+        {
+            cancelled = true;
+            BenchmarkProgress = $"Benchmark stopped before completion: {exception.Message}";
+            StatusMessage = BenchmarkProgress;
         }
         finally
         {
@@ -817,6 +940,24 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             catch (Exception exception)
             {
                 BenchmarkDiagnosticsCsvPath = $"Raw SYNC CSV save failed: {exception.Message}";
+            }
+
+            try
+            {
+                if (analyzer is not null)
+                {
+                    AnalyzerCsvPath = await analyzer.WriteCsvAsync(benchmarkRunId);
+                    AnalyzerStatus = $"Capture saved: {AnalyzerCsvPath}";
+                }
+            }
+            catch (Exception exception)
+            {
+                AnalyzerCsvPath = $"Analyzer CSV save failed: {exception.Message}";
+                AnalyzerStatus = AnalyzerCsvPath;
+            }
+            finally
+            {
+                analyzer?.Dispose();
             }
 
             BenchmarkProgress = BuildBenchmarkSummary(
@@ -962,7 +1103,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             "BestSyncRttUs,VerifyRttUs,AppliedOffsetUs,VerificationOffsetUs,ClockErrorUs," +
             "SyncAttempts,SyncRetries,InitialClockErrorUs,ExpectedSyncBiasUs,SyncQualityDeviationUs,SyncQualityThresholdUs,SyncQualityAccepted," +
             "RssiDbm,WifiChannel,Bssid," +
-            "CommandId,TargetMasterUs,VerifiedStartMasterUs,StartErrorUs,SchedulerLatenessUs," +
+            "CommandId,TargetMasterUs,VerifiedStartMasterUs,StartErrorUs,SchedulerLatenessUs,StartedTelemetryReceived," +
             "FleetSyncDurationUs,WorstClockErrorUs,FleetClockSpreadUs,WorstStartErrorUs,FleetStartSpreadUs");
         foreach (BenchmarkCsvRow row in rows)
         {
@@ -1096,6 +1237,13 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         string failureKind = ClassifySyncFailure(exception);
         string outcome = exception is OperationCanceledException ? "CANCELLED" : "ERROR";
         string failureMessage = exception.Message;
+        long expectedBiasForDiagnostics = calibrationDelay.ExpectedOffsetBiasMicroseconds;
+        if (calibrationSamples.Count >= ConsensusLowRttSampleCount)
+        {
+            expectedBiasForDiagnostics = CalculateActualExpectedBiasMicroseconds(
+                calibrationSamples,
+                ConsensusLowRttSampleCount);
+        }
 
         if (calibrationSamples.Count > 0)
         {
@@ -1119,7 +1267,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 representativeCalibrationId,
                 calibrationConsensus,
                 null,
-                calibrationDelay.ExpectedOffsetBiasMicroseconds,
+                expectedBiasForDiagnostics,
                 null,
                 SyncQualityThresholdMicroseconds,
                 null,
@@ -1150,7 +1298,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 representativeVerificationId,
                 verificationConsensus,
                 null,
-                calibrationDelay.ExpectedOffsetBiasMicroseconds,
+                expectedBiasForDiagnostics,
                 null,
                 SyncQualityThresholdMicroseconds,
                 null,
@@ -1229,6 +1377,52 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             .ToHashSet();
     }
 
+    private static long CalculateActualExpectedBiasMicroseconds(
+        IReadOnlyList<SyncMeasurement> samples,
+        int lowRttSampleCount)
+    {
+        SyncMeasurement[] selected = samples
+            .Where(item => item.Sample.IsValid)
+            .OrderBy(item => item.Sample.NetworkRttMicroseconds)
+            .ThenBy(item => item.Sample.MasterMinusLocalOffsetMicroseconds)
+            .Take(lowRttSampleCount)
+            .ToArray();
+
+        if (selected.Length < lowRttSampleCount)
+        {
+            throw new InvalidOperationException(
+                $"At least {lowRttSampleCount} valid synchronization samples are required to calculate actual injected bias.");
+        }
+
+        static double SampleBiasUs(SyncMeasurement measurement) =>
+            (measurement.ActualReverseDelayUs - measurement.ActualForwardDelayUs) / 2d;
+
+        long bestRttUs = selected[0].Sample.NetworkRttMicroseconds;
+        if (bestRttUs == 0)
+        {
+            SyncMeasurement[] zeroRtt = selected
+                .Where(item => item.Sample.NetworkRttMicroseconds == 0)
+                .ToArray();
+            return checked((long)Math.Round(
+                zeroRtt.Average(SampleBiasUs),
+                MidpointRounding.AwayFromZero));
+        }
+
+        double weightedBiasSum = 0d;
+        double weightSum = 0d;
+        foreach (SyncMeasurement measurement in selected)
+        {
+            double ratio = (double)bestRttUs / measurement.Sample.NetworkRttMicroseconds;
+            double weight = ratio * ratio;
+            weightedBiasSum += weight * SampleBiasUs(measurement);
+            weightSum += weight;
+        }
+
+        return checked((long)Math.Round(
+            weightedBiasSum / weightSum,
+            MidpointRounding.AwayFromZero));
+    }
+
     private static void AppendSyncPhaseDiagnostics(
         ICollection<SyncSampleDiagnosticCsvRow> rows,
         int trial,
@@ -1268,6 +1462,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 measurement.SyncId,
                 pathDelay.MasterToDeviceDelayMilliseconds,
                 pathDelay.DeviceToMasterDelayMilliseconds,
+                measurement.ActualForwardDelayUs,
+                measurement.ActualReverseDelayUs,
                 sample.MasterT1Microseconds,
                 sample.DeviceT2Microseconds,
                 sample.DeviceT3Microseconds,
@@ -1469,17 +1665,30 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         _ => "UNKNOWN",
     };
 
+    private static string BuildSyncPathDelayTargetLabel(int targetIndex) => targetIndex switch
+    {
+        0 => "ESP01",
+        1 => "ESP02",
+        2 => "ESP03",
+        3 => "ESP04",
+        4 => "ESP05",
+        _ => "ESP02",
+    };
+
     private static string BuildSyncPathDelayModeLabel(int modeIndex) => modeIndex switch
     {
         0 => "NONE (0/0 ms)",
         1 => "SYMMETRIC (250/250 ms)",
-        2 => "ASYMMETRIC (250/0 ms)",
+        2 => "ASYMMETRIC FORWARD (250/0 ms)",
+        3 => "ASYMMETRIC REVERSE (0/1 ms)",
+        4 => "ASYMMETRIC REVERSE (0/4 ms)",
+        5 => "ASYMMETRIC FORWARD (40/0 ms)",
         _ => "UNKNOWN",
     };
 
     private string BuildSyncPathDelayDescription()
     {
-        SyncPathDelayMode mode = (SyncPathDelayMode)Math.Clamp(SyncPathDelayModeIndex, 0, 2);
+        SyncPathDelayMode mode = (SyncPathDelayMode)Math.Clamp(SyncPathDelayModeIndex, 0, 5);
         SyncPathDelayProfile profile = SyncPathDelayExperiment.GetProfile(mode);
         string expectedBias = mode switch
         {
@@ -1487,10 +1696,17 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             SyncPathDelayMode.Symmetric250Milliseconds =>
                 "Expected artificial offset bias: ~0 ms; calibration RTT increases by ~500 ms.",
             SyncPathDelayMode.AsymmetricForward250Milliseconds =>
-                "Expected applied-offset bias: ~-125 ms; ESP02 physical START should appear ~125 ms late when checked with delay-free verification.",
+                "Expected applied-offset bias: ~-125 ms; use only as a gross diagnostic.",
+            SyncPathDelayMode.AsymmetricReverse1Millisecond =>
+                "Expected applied-offset bias: ~+0.5 ms; precise reverse-path positive control.",
+            SyncPathDelayMode.AsymmetricReverse4Milliseconds =>
+                "Expected applied-offset bias: ~+2.0 ms; precise reverse-path positive control.",
+            SyncPathDelayMode.AsymmetricForward40Milliseconds =>
+                "Expected applied-offset bias: ~-20 ms; opposite-polarity transfer-function control.",
             _ => string.Empty,
         };
-        return $"ESP01/ESP03/ESP04/ESP05 are 0/0 ms controls. ESP02 calibration is {profile.MasterToDeviceDelayMilliseconds}/{profile.DeviceToMasterDelayMilliseconds} ms (Master→ESP / ESP→Master). Verification is always 0/0 ms for all five devices. {expectedBias}";
+        string target = BuildSyncPathDelayTargetLabel(SyncPathDelayTargetIndex);
+        return $"{target} calibration is {profile.MasterToDeviceDelayMilliseconds}/{profile.DeviceToMasterDelayMilliseconds} ms (Master→ESP / ESP→Master). All non-target devices and all verification samples are 0/0 ms. {expectedBias}";
     }
 
     private bool TryDuration(out uint duration)
@@ -1797,6 +2013,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         long? VerifiedStartMasterUs,
         long? StartErrorUs,
         long? SchedulerLatenessUs,
+        bool StartedTelemetryReceived,
         long SyncDurationUs,
         long? WorstClockErrorUs,
         long? FleetClockSpreadUs,
@@ -1844,6 +2061,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 device.LastActualStartMasterMicroseconds,
                 device.LastStartErrorMicroseconds,
                 device.LastSchedulerLatenessMicroseconds,
+                true,
                 syncDurationUs,
                 worstClockErrorUs,
                 fleetClockSpreadUs,
@@ -1888,6 +2106,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 device.LastActualStartMasterMicroseconds,
                 device.LastStartErrorMicroseconds,
                 device.LastSchedulerLatenessMicroseconds,
+                commandId != 0 && device.LastStartedCommandId == commandId,
                 syncDurationUs,
                 null,
                 null,
@@ -1924,6 +2143,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             Number(VerifiedStartMasterUs),
             Number(StartErrorUs),
             Number(SchedulerLatenessUs),
+            StartedTelemetryReceived ? "1" : "0",
             SyncDurationUs.ToString(System.Globalization.CultureInfo.InvariantCulture),
             Number(WorstClockErrorUs),
             Number(FleetClockSpreadUs),
@@ -1959,6 +2179,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         ulong? SyncId,
         int PathForwardDelayMs,
         int PathReverseDelayMs,
+        long? ActualForwardDelayUs,
+        long? ActualReverseDelayUs,
         long? MasterT1Us,
         long? DeviceT2Us,
         long? DeviceT3Us,
@@ -1982,7 +2204,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
 
         public const string Header =
             "Trial,TimestampUtc,SyncMode,Device,Hardware,IpAddress,Attempt,Phase,SampleIndex,SyncId," +
-            "PathForwardDelayMs,PathReverseDelayMs,MasterT1Us,DeviceT2Us,DeviceT3Us,MasterT4Us," +
+            "PathForwardDelayMs,PathReverseDelayMs,ActualForwardDelayUs,ActualReverseDelayUs,MasterT1Us,DeviceT2Us,DeviceT3Us,MasterT4Us," +
             "RttUs,OffsetUs,SelectedLowRtt,ConsensusRepresentative,Estimator,ConsensusOffsetUs,BestRttUs," +
             "ResidualErrorUs,ExpectedBiasUs,DeviationUs,ThresholdUs,AttemptAccepted,AttemptOutcome," +
             "FailureKind,FailureMessage";
@@ -2022,6 +2244,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 null,
                 null,
                 null,
+                null,
+                null,
                 false,
                 false,
                 null,
@@ -2051,6 +2275,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             SyncId.HasValue ? FactoryProtocol.FormatCommandId(SyncId.Value) : string.Empty,
             PathForwardDelayMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
             PathReverseDelayMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Number(ActualForwardDelayUs),
+            Number(ActualReverseDelayUs),
             Number(MasterT1Us),
             Number(DeviceT2Us),
             Number(DeviceT3Us),
@@ -2084,5 +2310,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private sealed record SyncMeasurement(ulong SyncId, ClockSyncSample Sample);
+    private sealed record SyncMeasurement(
+        ulong SyncId,
+        ClockSyncSample Sample,
+        long ActualForwardDelayUs,
+        uint ActualReverseDelayUs);
 }

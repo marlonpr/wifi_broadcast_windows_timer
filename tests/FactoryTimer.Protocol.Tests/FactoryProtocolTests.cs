@@ -65,6 +65,14 @@ public sealed class FactoryProtocolTests
             reply);
 
         Assert.IsTrue(FactoryProtocol.TryParseInbound(
+            "FCT2|SYNC_REPLY|ESP02|0123456789ABCDEF|100000|40004|40006|4012",
+            out InboundPacket? delayedReply,
+            out _));
+        Assert.AreEqual(
+            new SyncReplyPacket("ESP02", 0x0123456789abcdef, 100_000, 40_004, 40_006, 4012),
+            delayedReply);
+
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(
             "FCT2|SYNC_APPLIED|ESP01|0123456789ABCDEF|60001|10000",
             out InboundPacket? applied,
             out _));

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
@@ -17,7 +18,10 @@ public sealed class PacketReceivedEventArgs(
     public long MasterReceiveMicroseconds { get; } = masterReceiveMicroseconds;
 }
 
-public sealed record ReceivedSyncReply(SyncReplyPacket Packet, long MasterT4Microseconds);
+public sealed record ReceivedSyncReply(
+    SyncReplyPacket Packet,
+    long MasterT4Microseconds,
+    long ActualMasterToDeviceArtificialDelayMicroseconds = 0);
 
 public enum UdpReceiveTimestampMode
 {
@@ -240,6 +244,45 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         CancellationToken token = default) =>
         SendRepeatedAsync(FactoryProtocol.SerializeCommandBytes(command), destination, token);
 
+    private static async Task<long> WaitArtificialForwardDelayAsync(
+        TimeSpan requestedDelay,
+        CancellationToken cancellationToken)
+    {
+        if (requestedDelay <= TimeSpan.Zero) return 0;
+
+        long requestedUs = checked((long)Math.Round(
+            requestedDelay.TotalMilliseconds * 1000d,
+            MidpointRounding.AwayFromZero));
+        if (requestedUs <= 0) return 0;
+
+        long startTicks = Stopwatch.GetTimestamp();
+        long requestedTicks = checked((long)Math.Ceiling(
+            requestedUs * (double)Stopwatch.Frequency / 1_000_000d));
+
+        // For the metrology controls (1/4/40 ms), spin for the complete
+        // interval so Windows timer quantization cannot change the injected
+        // path delay. The legacy 250 ms diagnostic profiles may sleep most
+        // of the interval to avoid burning a core, then finish against QPC.
+        if (requestedUs > 50_000)
+        {
+            long coarseUs = requestedUs - 10_000;
+            await Task.Delay(
+                TimeSpan.FromMilliseconds(coarseUs / 1000d),
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        while ((Stopwatch.GetTimestamp() - startTicks) < requestedTicks)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Thread.SpinWait(32);
+        }
+
+        long elapsedTicks = Stopwatch.GetTimestamp() - startTicks;
+        return checked((long)Math.Round(
+            elapsedTicks * (1_000_000d / Stopwatch.Frequency),
+            MidpointRounding.AwayFromZero));
+    }
+
     public async Task<ReceivedSyncReply> ExchangeSyncAsync(
         ulong syncId,
         long masterT1Microseconds,
@@ -261,10 +304,8 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
             // t1 is captured by the caller BEFORE this optional delay. This is
             // intentional: the delay must appear as Master->ESP path latency.
             TimeSpan forwardDelay = masterToDeviceArtificialDelay ?? TimeSpan.Zero;
-            if (forwardDelay > TimeSpan.Zero)
-            {
-                await Task.Delay(forwardDelay, cancellationToken).ConfigureAwait(false);
-            }
+            long actualForwardDelayUs = await WaitArtificialForwardDelayAsync(
+                forwardDelay, cancellationToken).ConfigureAwait(false);
 
             byte[] packet = FactoryProtocol.SerializeSyncRequestBytes(
                 new SyncRequestPacket(
@@ -282,7 +323,11 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
                 timeoutSource.Token);
             try
             {
-                return await waiter.Task.WaitAsync(linked.Token);
+                ReceivedSyncReply result = await waiter.Task.WaitAsync(linked.Token);
+                return result with
+                {
+                    ActualMasterToDeviceArtificialDelayMicroseconds = actualForwardDelayUs,
+                };
             }
             catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {

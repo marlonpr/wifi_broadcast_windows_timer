@@ -1,26 +1,57 @@
-# SYNC path-delay test guide
+# SYNC path-delay / physical asymmetry control guide (V9)
 
-This build replaces the old "delay ESP02 session/START delivery" test with a controlled NTP-path experiment.
+This build supports controlled calibration-path asymmetry on any one of ESP01...ESP05 while verification and START_AT remain delay-free.
 
-## Test setup
+## Fixed metrology configuration
 
-ESP01, ESP03, ESP04, and ESP05 are always no-delay controls. ESP02 receives the selected artificial delay only during the 8 calibration exchanges. The 8 verification exchanges are always delay-free, and START_AT uses the normal three-copy broadcast with no artificial delay.
+Use:
 
-## Mode 1: NONE
+- `BLOCKING_THREAD_T4`
+- `8 + 8 — baseline`
+- best-3 inverse-RTT^2 estimator
+- normal ±3 ms `SyncQualityDeviationUs` gate
+- frozen 1 kOhm analyzer fixture
 
-Select `NONE — 0 / 0 ms`, press **SYNC CLOCKS**, then **START_AT**. Record all five devices' best sync RTT, verify RTT, clock error, verification-corrected START error and fleet spread. This is the baseline.
+The UI now exposes both an **Injection target device** and a **Calibration path profile**. Changing either invalidates the previous synchronization.
 
-## Mode 2: SYMMETRIC
+## Precision and measured intervals
 
-Select `SYMMETRIC — 250 / 250 ms`. ESP02 calibration low-RTT consensus should rise by roughly 500 ms relative to normal Wi-Fi RTT, but its delay-free verification residual should remain close to the normal few-millisecond range. START should remain close to the baseline.
+Reverse-path artificial delay is carried in the SYNC packet in microseconds. Firmware captures T3 first, then waits using `esp_timer_get_time()` precision, then replies. The achieved interval is returned to Windows as `ActualReverseDelayUs`.
 
-## Mode 3: ASYMMETRIC
+Forward-path artificial delay is timed against QPC (`Stopwatch.GetTimestamp`). The 1/4/40 ms metrology range does not rely on Windows `Task.Delay`; the achieved interval is recorded as `ActualForwardDelayUs`.
 
-Select `ASYMMETRIC — 250 / 0 ms`. ESP02 calibration RTT should rise by roughly 250 ms and its applied offset should be biased by approximately -125 ms. Because verification is delay-free, ESP02 clock error should expose roughly -125 ms residual. The verification-corrected START estimate should show ESP02 starting roughly +125 ms late relative to the requested Master target.
+The quality gate uses **actual measured delay**, not the nominal profile. For every selected calibration sample:
 
-Exact values will include Windows scheduling and Wi-Fi jitter; the experiment is intended to demonstrate the direction and scale of the NTP asymmetry effect, not synthesize an exact laboratory delay.
+`sample expected bias = (ActualReverseDelayUs - ActualForwardDelayUs) / 2`
 
+The attempt's `ExpectedSyncBiasUs` is the same inverse-RTT^2 weighted combination of those biases over the same best-3 samples used by the offset estimator. Therefore timer/scheduler overshoot does not create a false ±3 ms quality rejection.
 
-## Mode-change safety
+## Positive controls
 
-Changing the SYNC path-delay selector now clears all five devices' synchronization state. This prevents a START_AT test from reusing an offset measured under a previous delay mode. After selecting NONE, SYMMETRIC, or ASYMMETRIC, press **SYNC CLOCKS** before START_AT.
+Run about 30 trials each:
+
+| Control | Target | Profile | Predicted physical START |
+|---|---|---|---|
+| A | ESP02 / ESP32 | reverse 0 / 1 ms | about 0.5 ms early |
+| B | ESP02 / ESP32 | reverse 0 / 4 ms | about 2.0 ms early |
+| C | ESP03 / ESP32-S3 | reverse 0 / 4 ms | about 2.0 ms early |
+| D | ESP02 / ESP32 | forward 40 / 0 ms | about 20 ms late |
+
+For a one-device injected control, do not use the target's fleet-centered value to estimate gain because centering attenuates the displacement by 4/5. Use:
+
+`C_i = target analyzer timestamp - mean(other four analyzer timestamps)`
+
+For the small controls compare injected `C_i` with a nearby no-delay baseline (`Delta C_i`).
+
+## Preregistered sign
+
+The codebase sign convention and prior delay decomposition imply:
+
+- reverse-biased path -> applied offset positive -> physical START early;
+- forward-biased path -> applied offset negative -> physical START late.
+
+The controls must confirm this independently.
+
+The subsequent 600-trial clean run is a replication test of the hypothesis-generating 30-trial observation: fleet-centered natural `B_i` should correlate **negatively** with contemporaneous fleet-centered attempt-1 P5 RTT floor.
+
+Because silicon family and clean-path RTT floor are collinear in the current five-device fleet, the later loaded-channel within-device experiment remains required for causal attribution.

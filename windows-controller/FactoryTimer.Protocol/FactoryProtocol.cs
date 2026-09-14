@@ -93,7 +93,8 @@ public sealed record SyncReplyPacket(
     ulong SyncId,
     long MasterT1Microseconds,
     long LocalT2Microseconds,
-    long LocalT3Microseconds) : InboundPacket(DeviceId);
+    long LocalT3Microseconds,
+    uint ActualArtificialReplyDelayMicroseconds = 0) : InboundPacket(DeviceId);
 
 public sealed record SyncAppliedPacket(
     string DeviceId,
@@ -282,7 +283,10 @@ public static class FactoryProtocol
 
         if (fields.Length >= 2 && fields[0] == Version2 && fields[1] == "SYNC_REPLY")
         {
-            if (fields.Length != 7)
+            // Seven fields are the original v2 reply. The optional eighth field
+            // reports the reverse-path diagnostic delay actually achieved by
+            // the device, measured with esp_timer_get_time().
+            if (fields.Length is not (7 or 8))
             {
                 error = ProtocolParseError.FieldCount;
                 return false;
@@ -304,7 +308,16 @@ public static class FactoryProtocol
                 error = ProtocolParseError.Timestamp;
                 return false;
             }
-            packet = new SyncReplyPacket(fields[2], syncId, t1, t2, t3);
+
+            uint actualReplyDelayUs = 0;
+            if (fields.Length == 8 &&
+                !uint.TryParse(fields[7], NumberStyles.None, CultureInfo.InvariantCulture, out actualReplyDelayUs))
+            {
+                error = ProtocolParseError.Timestamp;
+                return false;
+            }
+
+            packet = new SyncReplyPacket(fields[2], syncId, t1, t2, t3, actualReplyDelayUs);
             return true;
         }
 

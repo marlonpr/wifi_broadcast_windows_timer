@@ -32,6 +32,9 @@ public enum SyncPathDelayMode
     None = 0,
     Symmetric250Milliseconds = 1,
     AsymmetricForward250Milliseconds = 2,
+    AsymmetricReverse1Millisecond = 3,
+    AsymmetricReverse4Milliseconds = 4,
+    AsymmetricForward40Milliseconds = 5,
 }
 
 public readonly record struct SyncPathDelayProfile(
@@ -57,6 +60,9 @@ public static class SyncPathDelayExperiment
             new(ExperimentDelayMilliseconds, ExperimentDelayMilliseconds),
         SyncPathDelayMode.AsymmetricForward250Milliseconds =>
             new(ExperimentDelayMilliseconds, 0),
+        SyncPathDelayMode.AsymmetricReverse1Millisecond => new(0, 1),
+        SyncPathDelayMode.AsymmetricReverse4Milliseconds => new(0, 4),
+        SyncPathDelayMode.AsymmetricForward40Milliseconds => new(40, 0),
         _ => throw new ArgumentOutOfRangeException(nameof(mode)),
     };
 }

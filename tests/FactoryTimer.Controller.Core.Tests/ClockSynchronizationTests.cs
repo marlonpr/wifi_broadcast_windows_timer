@@ -89,19 +89,31 @@ public sealed class ClockSynchronizationTests
     }
 
     [TestMethod]
-    public void ExperimentProfilesMatchRequestedThreeModes()
+    public void ExperimentProfilesMatchRequestedModes()
     {
         SyncPathDelayProfile none = SyncPathDelayExperiment.GetProfile(SyncPathDelayMode.None);
         SyncPathDelayProfile symmetric = SyncPathDelayExperiment.GetProfile(
             SyncPathDelayMode.Symmetric250Milliseconds);
         SyncPathDelayProfile asymmetric = SyncPathDelayExperiment.GetProfile(
             SyncPathDelayMode.AsymmetricForward250Milliseconds);
+        SyncPathDelayProfile reverse1 = SyncPathDelayExperiment.GetProfile(
+            SyncPathDelayMode.AsymmetricReverse1Millisecond);
+        SyncPathDelayProfile reverse4 = SyncPathDelayExperiment.GetProfile(
+            SyncPathDelayMode.AsymmetricReverse4Milliseconds);
+        SyncPathDelayProfile forward40 = SyncPathDelayExperiment.GetProfile(
+            SyncPathDelayMode.AsymmetricForward40Milliseconds);
 
         Assert.AreEqual(new SyncPathDelayProfile(0, 0), none);
         Assert.AreEqual(new SyncPathDelayProfile(250, 250), symmetric);
         Assert.AreEqual(new SyncPathDelayProfile(250, 0), asymmetric);
+        Assert.AreEqual(new SyncPathDelayProfile(0, 1), reverse1);
+        Assert.AreEqual(new SyncPathDelayProfile(0, 4), reverse4);
+        Assert.AreEqual(new SyncPathDelayProfile(40, 0), forward40);
         Assert.AreEqual(0L, symmetric.ExpectedOffsetBiasMicroseconds);
         Assert.AreEqual(-125_000L, asymmetric.ExpectedOffsetBiasMicroseconds);
+        Assert.AreEqual(500L, reverse1.ExpectedOffsetBiasMicroseconds);
+        Assert.AreEqual(2_000L, reverse4.ExpectedOffsetBiasMicroseconds);
+        Assert.AreEqual(-20_000L, forward40.ExpectedOffsetBiasMicroseconds);
     }
     [TestMethod]
     public void SyncQualityPolicyUsesExpectedExperimentBias()
