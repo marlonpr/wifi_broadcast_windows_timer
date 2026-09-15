@@ -289,6 +289,7 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         IPAddress destination,
         TimeSpan? masterToDeviceArtificialDelay = null,
         uint deviceToMasterArtificialDelayMicroseconds = 0,
+        bool requestDieTemperature = false,
         TimeSpan? timeout = null,
         CancellationToken cancellationToken = default)
     {
@@ -311,7 +312,8 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
                 new SyncRequestPacket(
                     syncId,
                     masterT1Microseconds,
-                    deviceToMasterArtificialDelayMicroseconds));
+                    deviceToMasterArtificialDelayMicroseconds,
+                    requestDieTemperature));
             await activeSession.Socket.SendAsync(
                 packet,
                 new IPEndPoint(destination, CommandPort),
@@ -324,6 +326,10 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
             try
             {
                 ReceivedSyncReply result = await waiter.Task.WaitAsync(linked.Token);
+                // If a foreground preemption raced with a late reply, cancellation
+                // wins. The finally below then removes the waiter before the caller
+                // can accept this exchange into a background observation.
+                cancellationToken.ThrowIfCancellationRequested();
                 return result with
                 {
                     ActualMasterToDeviceArtificialDelayMicroseconds = actualForwardDelayUs,

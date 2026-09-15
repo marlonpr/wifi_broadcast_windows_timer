@@ -52,6 +52,11 @@ public sealed class FactoryProtocolTests
                 new SyncRequestPacket(0x0123456789abcdef, 100_000, 250_000)));
 
         Assert.AreEqual(
+            "FCT2|SYNC|0123456789ABCDEF|100000|0|TEMP",
+            FactoryProtocol.SerializeSyncRequest(
+                new SyncRequestPacket(0x0123456789abcdef, 100_000, 0, RequestDieTemperature: true)));
+
+        Assert.AreEqual(
             "FCT2|SYNC_SET|0123456789ABCDEF|60001|10000",
             FactoryProtocol.SerializeSyncSet(
                 new SyncSetPacket(0x0123456789abcdef, 60_001, 10_000)));
@@ -71,6 +76,14 @@ public sealed class FactoryProtocolTests
         Assert.AreEqual(
             new SyncReplyPacket("ESP02", 0x0123456789abcdef, 100_000, 40_004, 40_006, 4012),
             delayedReply);
+
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(
+            "FCT2|SYNC_REPLY|ESP03|0123456789ABCDEF|100000|40004|40006|0|41250",
+            out InboundPacket? temperatureReply,
+            out _));
+        Assert.AreEqual(
+            new SyncReplyPacket("ESP03", 0x0123456789abcdef, 100_000, 40_004, 40_006, 0, 41_250),
+            temperatureReply);
 
         Assert.IsTrue(FactoryProtocol.TryParseInbound(
             "FCT2|SYNC_APPLIED|ESP01|0123456789ABCDEF|60001|10000",
@@ -157,6 +170,7 @@ public sealed class FactoryProtocolTests
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-200|6|AA:BB:CC:DD:EE:FF", ProtocolParseError.Rssi)]
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|999|AA:BB:CC:DD:EE:FF", ProtocolParseError.Channel)]
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|NOT-A-BSSID", ProtocolParseError.Bssid)]
+    [DataRow("FCT2|SYNC_REPLY|ESP03|0123456789ABCDEF|100000|40004|40006|0|HOT", ProtocolParseError.Temperature)]
     public void RejectsMalformedOrUnsupportedInbound(string text, ProtocolParseError expected)
     {
         Assert.IsFalse(FactoryProtocol.TryParseInbound(text, out _, out ProtocolParseError actual));

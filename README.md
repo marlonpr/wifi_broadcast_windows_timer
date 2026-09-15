@@ -235,3 +235,8 @@ This package adds an A/B-selectable Windows UDP receive timestamp path without c
 
 The Windows controller now exposes `8 + 8 — baseline` and `4 + 4 — candidate` sample-count profiles. `BLOCKING_THREAD_T4` is the production default; `ASYNC_AWAIT` remains available as a diagnostic/reference mode. Changing the sample-count profile invalidates the prior synchronization. No ESP32 firmware change is required. See `SYNC_SAMPLE_COUNT_AB_V8.md` for the counterbalanced benchmark procedure and acceptance criteria.
 
+
+
+## BG-1 background clock shadow
+
+The controller can now collect a 60 s/device background clock model in measurement-only shadow mode without changing `START_AT`. See `BACKGROUND_SYNC_SHADOW_BG1.md` for the acquisition, offline replay, and physical regression procedure. Foreground SYNC/START/RESET/benchmark work preempts and cancels any in-flight shadow sample, so a background timeout cannot hold the operator path.

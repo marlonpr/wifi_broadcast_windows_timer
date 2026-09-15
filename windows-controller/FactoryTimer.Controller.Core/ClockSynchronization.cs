@@ -93,7 +93,8 @@ public readonly record struct ClockSyncConsensus(
     ClockSyncSample RepresentativeSample,
     long MasterMinusLocalOffsetMicroseconds,
     long BestRttMicroseconds,
-    int LowRttSampleCount);
+    int LowRttSampleCount,
+    long EffectiveMasterEpochMicroseconds);
 
 public static class ClockSyncEstimator
 {
@@ -143,7 +144,8 @@ public static class ClockSyncEstimator
             representative,
             representative.MasterMinusLocalOffsetMicroseconds,
             lowRttSamples.Min(sample => sample.NetworkRttMicroseconds),
-            lowRttSampleCount);
+            lowRttSampleCount,
+            MasterMidpointMicroseconds(representative));
     }
 
     // Production estimator used by v5: retain the N valid samples with the
@@ -181,6 +183,7 @@ public static class ClockSyncEstimator
         ClockSyncSample representative = lowRttSamples[0];
 
         double weightedOffsetSum = 0.0;
+        double weightedEpochSum = 0.0;
         double weightSum = 0.0;
 
         if (bestRtt == 0)
@@ -194,12 +197,16 @@ public static class ClockSyncEstimator
             long zeroRttOffset = checked((long)Math.Round(
                 zeroRttSamples.Average(sample => (double)sample.MasterMinusLocalOffsetMicroseconds),
                 MidpointRounding.AwayFromZero));
+            long zeroRttEpoch = checked((long)Math.Round(
+                zeroRttSamples.Average(sample => (double)MasterMidpointMicroseconds(sample)),
+                MidpointRounding.AwayFromZero));
 
             return new ClockSyncConsensus(
                 representative,
                 zeroRttOffset,
                 bestRtt,
-                lowRttSampleCount);
+                lowRttSampleCount,
+                zeroRttEpoch);
         }
 
         foreach (ClockSyncSample sample in lowRttSamples)
@@ -207,19 +214,28 @@ public static class ClockSyncEstimator
             double ratio = (double)bestRtt / sample.NetworkRttMicroseconds;
             double weight = ratio * ratio;
             weightedOffsetSum += weight * sample.MasterMinusLocalOffsetMicroseconds;
+            weightedEpochSum += weight * MasterMidpointMicroseconds(sample);
             weightSum += weight;
         }
 
         long weightedOffset = checked((long)Math.Round(
             weightedOffsetSum / weightSum,
             MidpointRounding.AwayFromZero));
+        long weightedEpoch = checked((long)Math.Round(
+            weightedEpochSum / weightSum,
+            MidpointRounding.AwayFromZero));
 
         return new ClockSyncConsensus(
             representative,
             weightedOffset,
             bestRtt,
-            lowRttSampleCount);
+            lowRttSampleCount,
+            weightedEpoch);
     }
+
+    private static long MasterMidpointMicroseconds(ClockSyncSample sample) =>
+        sample.MasterT1Microseconds +
+        (sample.MasterT4Microseconds - sample.MasterT1Microseconds) / 2;
 
     // Positive means the device's reconstructed Master clock is ahead of Master.
     public static long CalculateResidualErrorMicroseconds(

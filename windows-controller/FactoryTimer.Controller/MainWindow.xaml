@@ -80,6 +80,20 @@
                         <TextBlock Text="{Binding StartSynchronizationResult}" TextWrapping="Wrap" FontWeight="SemiBold" />
                         <Button Content="SYNC CLOCKS" Click="Sync_Click" IsEnabled="{Binding CanSend}"
                                 HorizontalAlignment="Left" Style="{StaticResource AccentButtonStyle}" />
+                        <TextBlock Margin="0,10,0,0" Text="BG-1 background clock shadow"
+                                   Style="{ThemeResource SubtitleTextBlockStyle}" />
+                        <ToggleSwitch Header="60 s/device maintenance model (shadow only)"
+                                      IsOn="{Binding BackgroundClockShadowEnabled, Mode=TwoWay}" />
+                        <TextBlock Text="{Binding BackgroundClockStatus}" TextWrapping="Wrap"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="Observation CSV"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="{Binding BackgroundClockCsvPath}" TextWrapping="Wrap" FontFamily="Consolas" />
+                        <TextBlock Text="Raw background SYNC CSV"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="{Binding BackgroundClockSamplesCsvPath}" TextWrapping="Wrap" FontFamily="Consolas" />
+                        <TextBlock Text="BG-1 never sends SYNC_SET and never changes START_AT behavior. It uses 8 delay-free samples, best-3 1/RTT² consensus, weighted effective epoch, and pauses automatically for foreground timing operations."
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                     </StackPanel>
                     <StackPanel Grid.Column="1" Spacing="10">
                         <TextBlock Text="SYNC path-delay experiment" Style="{ThemeResource SubtitleTextBlockStyle}" />

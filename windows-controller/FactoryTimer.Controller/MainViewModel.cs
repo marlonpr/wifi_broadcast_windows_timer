@@ -16,6 +16,11 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private const int MaxSynchronizationAttempts = 5;
     private const int SynchronizationRetryQuietMilliseconds = 150;
     private const int StatusDiscoveryDrainMilliseconds = 100;
+    private const int BackgroundShadowSampleCount = 8;
+    private const int BackgroundShadowLowRttSampleCount = 3;
+    private const int BackgroundHistoryLimitPerDevice = 1_800;
+    private static readonly TimeSpan BackgroundMaintenanceCadence = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan BackgroundInitialDelay = TimeSpan.FromSeconds(5);
     private readonly DispatcherQueue dispatcherQueue;
     private readonly DispatcherQueueTimer uiTimer;
     private readonly UdpControllerService udpService;
@@ -23,6 +28,20 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private readonly NetworkInterfaceSelectionManager networkSelectionManager;
     private readonly ControllerClock clock = new();
     private readonly SemaphoreSlim sendLock = new(1, 1);
+    private readonly CancellationTokenSource backgroundClockCancellation = new();
+    private readonly object backgroundClockSampleGate = new();
+    private CancellationTokenSource? activeBackgroundSampleCancellation;
+    private bool activeBackgroundSamplePreemptedByForeground;
+    private int foregroundSendRequests;
+    private readonly Dictionary<string, List<BackgroundClockObservation>> backgroundClockHistory =
+        new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> backgroundClockSequence =
+        new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> backgroundClockPreemptionsTotal =
+        new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> backgroundClockPreemptionsSinceObservation =
+        new(StringComparer.Ordinal);
+    private Task? backgroundClockTask;
     private IReadOnlyList<ControllerNetworkInterface> networkInterfaces = [];
     private ControllerNetworkInterface? selectedNetworkInterface;
     private double durationInput = 20;
@@ -45,6 +64,11 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private string analyzerStatus = "Disabled";
     private string analyzerComPort = string.Empty;
     private bool analyzerEnabled;
+    private string backgroundClockStatus = "BG-1 shadow: waiting to start";
+    private string backgroundClockCsvPath = "—";
+    private string backgroundClockSamplesCsvPath = "—";
+    private bool backgroundClockShadowEnabled = true;
+    private string? backgroundClockRunId;
     private double benchmarkTrialsInput = 10;
     private int syncPathDelayModeIndex;
     private int syncPathDelayTargetIndex = 1; // ESP02 remains the default experiment target.
@@ -130,6 +154,36 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     public string AnalyzerCsvPath { get => analyzerCsvPath; private set => SetProperty(ref analyzerCsvPath, value); }
     public string AnalyzerStatus { get => analyzerStatus; private set => SetProperty(ref analyzerStatus, value); }
     public string AnalyzerComPort { get => analyzerComPort; set => SetProperty(ref analyzerComPort, value); }
+    public string BackgroundClockStatus
+    {
+        get => backgroundClockStatus;
+        private set => SetProperty(ref backgroundClockStatus, value);
+    }
+    public string BackgroundClockCsvPath
+    {
+        get => backgroundClockCsvPath;
+        private set => SetProperty(ref backgroundClockCsvPath, value);
+    }
+    public string BackgroundClockSamplesCsvPath
+    {
+        get => backgroundClockSamplesCsvPath;
+        private set => SetProperty(ref backgroundClockSamplesCsvPath, value);
+    }
+    public bool BackgroundClockShadowEnabled
+    {
+        get => backgroundClockShadowEnabled;
+        set
+        {
+            if (!SetProperty(ref backgroundClockShadowEnabled, value)) return;
+            if (!value)
+            {
+                CancelActiveBackgroundSample();
+            }
+            BackgroundClockStatus = value
+                ? "BG-1 shadow enabled; waiting for next maintenance slot."
+                : "BG-1 shadow disabled; foreground START/SYNC behavior is unchanged.";
+        }
+    }
     public bool AnalyzerEnabled
     {
         get => analyzerEnabled;
@@ -304,6 +358,496 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         initialized = true;
         networkSelectionManager.Initialize();
         uiTimer.Start();
+        backgroundClockRunId = DateTime.Now.ToString(
+            "yyyyMMdd_HHmmss",
+            System.Globalization.CultureInfo.InvariantCulture);
+        backgroundClockTask = RunBackgroundClockLoopAsync(backgroundClockCancellation.Token);
+    }
+
+    private async Task RunBackgroundClockLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            TimeSpan slotInterval = TimeSpan.FromTicks(
+                BackgroundMaintenanceCadence.Ticks / Devices.Length);
+            DateTimeOffset nextSlotUtc = DateTimeOffset.UtcNow + BackgroundInitialDelay;
+            int deviceIndex = 0;
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                TimeSpan delay = nextSlotUtc - DateTimeOffset.UtcNow;
+                if (delay > TimeSpan.Zero)
+                {
+                    await Task.Delay(delay, cancellationToken);
+                }
+
+                if (BackgroundClockShadowEnabled && !disposed)
+                {
+                    await TryCollectBackgroundClockObservationAsync(
+                        Devices[deviceIndex],
+                        cancellationToken);
+                }
+
+                deviceIndex = (deviceIndex + 1) % Devices.Length;
+                nextSlotUtc += slotInterval;
+
+                // Never burst through missed slots after a long foreground benchmark,
+                // suspend/resume, or debugger stop. Shadow maintenance yields to all
+                // operator/timing-critical work and resumes at one normal slot cadence.
+                if (nextSlotUtc < DateTimeOffset.UtcNow - slotInterval)
+                {
+                    nextSlotUtc = DateTimeOffset.UtcNow + slotInterval;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Normal application shutdown.
+        }
+        catch (Exception exception)
+        {
+            BackgroundClockStatus = $"BG-1 shadow loop stopped: {exception.Message}";
+        }
+    }
+
+    private async Task TryCollectBackgroundClockObservationAsync(
+        DeviceViewModel device,
+        CancellationToken cancellationToken)
+    {
+        // BG-1 is deliberately subordinate to every existing product action.
+        // It does not pause discovery, does not enter the timing quiet period,
+        // does not send SYNC_SET, and never changes the foreground START path.
+        if (disposed ||
+            isSending ||
+            IsBenchmarkRunning ||
+            timingQuietPeriodActive ||
+            Volatile.Read(ref foregroundSendRequests) > 0 ||
+            SelectedNetworkInterface is null ||
+            !udpService.IsReady ||
+            !string.Equals(device.OnlineText, "ONLINE", StringComparison.Ordinal) ||
+            !device.TryGetIpAddress(out IPAddress? address) ||
+            address is null)
+        {
+            return;
+        }
+
+        if (!await sendLock.WaitAsync(0, cancellationToken))
+        {
+            return;
+        }
+
+        // A foreground action that arrived between the eligibility check and
+        // lock acquisition always wins. Never start a new shadow capture while
+        // an operator/timing-critical send is waiting for the shared transport.
+        if (Volatile.Read(ref foregroundSendRequests) > 0 || isSending || timingQuietPeriodActive)
+        {
+            sendLock.Release();
+            return;
+        }
+
+        using var sampleCancellation =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        lock (backgroundClockSampleGate)
+        {
+            activeBackgroundSampleCancellation = sampleCancellation;
+            activeBackgroundSamplePreemptedByForeground = false;
+        }
+
+        try
+        {
+            BackgroundClockCapture capture = await MeasureBackgroundClockObservationAsync(
+                device,
+                address,
+                sampleCancellation.Token);
+
+            if (!backgroundClockHistory.TryGetValue(device.DeviceId, out List<BackgroundClockObservation>? history))
+            {
+                history = [];
+                backgroundClockHistory[device.DeviceId] = history;
+            }
+
+            bool discontinuityReset = false;
+            if (history.Count > 0 &&
+                Math.Abs(capture.Observation.MasterMinusLocalOffsetMicroseconds -
+                         history[^1].MasterMinusLocalOffsetMicroseconds) > 100_000)
+            {
+                // A device reboot resets esp_timer and therefore produces a huge
+                // master-minus-local offset step. Never fit a rate across that epoch.
+                history.Clear();
+                discontinuityReset = true;
+            }
+
+            history.Add(capture.Observation);
+            if (history.Count > BackgroundHistoryLimitPerDevice)
+            {
+                history.RemoveRange(0, history.Count - BackgroundHistoryLimitPerDevice);
+            }
+
+            int sequence = backgroundClockSequence.TryGetValue(device.DeviceId, out int previous)
+                ? previous + 1
+                : 1;
+            backgroundClockSequence[device.DeviceId] = sequence;
+
+            BackgroundClockFit fit = BackgroundClockModel.Fit(
+                history,
+                capture.Observation.EffectiveMasterEpochMicroseconds,
+                BackgroundClockModelPolicy.ShadowDefault,
+                predictiveBenefitConfirmed: false);
+
+            int preemptionsTotal = backgroundClockPreemptionsTotal.TryGetValue(device.DeviceId, out int totalPreemptions)
+                ? totalPreemptions
+                : 0;
+            int preemptionsSincePrevious = backgroundClockPreemptionsSinceObservation.TryGetValue(device.DeviceId, out int recentPreemptions)
+                ? recentPreemptions
+                : 0;
+
+            await AppendBackgroundClockObservationAsync(
+                device,
+                address,
+                sequence,
+                capture,
+                fit,
+                discontinuityReset,
+                preemptionsTotal,
+                preemptionsSincePrevious,
+                sampleCancellation.Token);
+            backgroundClockPreemptionsSinceObservation[device.DeviceId] = 0;
+
+            string rate = double.IsFinite(fit.RatePpm)
+                ? $"{fit.RatePpm:+0.00;-0.00;0.00} ppm"
+                : "rate unavailable";
+            string qualification = fit.RateStatisticallyQualified
+                ? $"SNR {fit.RateSnr:F1}, statistical gate PASS; predictive-benefit gate pending offline replay"
+                : $"SNR {(double.IsFinite(fit.RateSnr) ? fit.RateSnr.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) : "—")}, warming";
+            BackgroundClockStatus =
+                $"BG-1 {device.DeviceId}: obs {sequence}, best RTT {capture.Observation.BestRttMicroseconds / 1000d:F3} ms, " +
+                $"{rate}, span {fit.ObservationSpanSeconds / 60d:F1} min, {qualification}. " +
+                "Shadow only: no SYNC_SET and START behavior unchanged.";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (sampleCancellation.IsCancellationRequested)
+        {
+            bool foregroundPreemption;
+            lock (backgroundClockSampleGate)
+            {
+                foregroundPreemption = activeBackgroundSamplePreemptedByForeground;
+            }
+
+            if (foregroundPreemption)
+            {
+                int total = backgroundClockPreemptionsTotal.TryGetValue(device.DeviceId, out int previousTotal)
+                    ? previousTotal + 1
+                    : 1;
+                int recent = backgroundClockPreemptionsSinceObservation.TryGetValue(device.DeviceId, out int previousRecent)
+                    ? previousRecent + 1
+                    : 1;
+                backgroundClockPreemptionsTotal[device.DeviceId] = total;
+                backgroundClockPreemptionsSinceObservation[device.DeviceId] = recent;
+                BackgroundClockStatus =
+                    $"BG-1 {device.DeviceId}: shadow sample preempted by foreground work (total {total}).";
+            }
+            else
+            {
+                BackgroundClockStatus =
+                    $"BG-1 {device.DeviceId}: shadow sample cancelled; partial observation discarded.";
+            }
+        }
+        catch (Exception exception)
+        {
+            BackgroundClockStatus =
+                $"BG-1 {device.DeviceId} sample skipped: {exception.Message}";
+        }
+        finally
+        {
+            lock (backgroundClockSampleGate)
+            {
+                if (ReferenceEquals(activeBackgroundSampleCancellation, sampleCancellation))
+                {
+                    activeBackgroundSampleCancellation = null;
+                    activeBackgroundSamplePreemptedByForeground = false;
+                }
+            }
+            sendLock.Release();
+        }
+    }
+
+    private async Task<BackgroundClockCapture> MeasureBackgroundClockObservationAsync(
+        DeviceViewModel device,
+        IPAddress address,
+        CancellationToken cancellationToken)
+    {
+        List<SyncMeasurement> samples = new(BackgroundShadowSampleCount);
+        SyncPathDelayProfile noDelay =
+            SyncPathDelayExperiment.GetProfile(SyncPathDelayMode.None);
+
+        for (int index = 0; index < BackgroundShadowSampleCount; index++)
+        {
+            ulong syncId = CreateCommandId();
+            samples.Add(await MeasureSyncAsync(
+                device.DeviceId,
+                address,
+                noDelay,
+                syncId,
+                cancellationToken,
+                requestDieTemperature: true));
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (index + 1 < BackgroundShadowSampleCount)
+            {
+                await Task.Delay(15, cancellationToken);
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        ClockSyncConsensus consensus =
+            ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
+                samples.Select(sample => sample.Sample),
+                BackgroundShadowLowRttSampleCount);
+
+        SyncMeasurement[] selected = samples
+            .OrderBy(sample => sample.Sample.NetworkRttMicroseconds)
+            .ThenBy(sample => sample.Sample.MasterMinusLocalOffsetMicroseconds)
+            .Take(BackgroundShadowLowRttSampleCount)
+            .ToArray();
+
+        double[] selectedTemperatures = selected
+            .Where(sample => sample.DieTemperatureCelsius.HasValue)
+            .Select(sample => sample.DieTemperatureCelsius!.Value)
+            .ToArray();
+        double? dieTemperatureCelsius = selectedTemperatures.Length > 0
+            ? selectedTemperatures.Average()
+            : null;
+
+        double rttP5Us = Percentile(
+            samples.Select(sample => sample.Sample.NetworkRttMicroseconds),
+            0.05);
+
+        var observation = new BackgroundClockObservation(
+            DateTimeOffset.UtcNow,
+            consensus.EffectiveMasterEpochMicroseconds,
+            consensus.MasterMinusLocalOffsetMicroseconds,
+            consensus.BestRttMicroseconds,
+            dieTemperatureCelsius);
+
+        return new BackgroundClockCapture(
+            observation,
+            consensus,
+            samples,
+            selected,
+            rttP5Us);
+    }
+
+    private async Task AppendBackgroundClockObservationAsync(
+        DeviceViewModel device,
+        IPAddress address,
+        int sequence,
+        BackgroundClockCapture capture,
+        BackgroundClockFit fit,
+        bool discontinuityReset,
+        int preemptionsTotal,
+        int preemptionsSincePreviousObservation,
+        CancellationToken cancellationToken)
+    {
+        await EnsureBackgroundClockCsvFilesAsync(cancellationToken);
+
+        long predictionEpochUs = MasterClock.NowMicroseconds;
+        double predictedOffsetUs = fit.PredictOffsetMicroseconds(predictionEpochUs);
+        double predictionMeanSeUs = fit.PredictMeanStandardErrorMicroseconds(predictionEpochUs);
+        double estimateAgeSec = fit.EstimateAgeSeconds(predictionEpochUs);
+
+        string summary = string.Join(",",
+            CsvField(capture.Observation.CapturedUtc.ToString("O", System.Globalization.CultureInfo.InvariantCulture)),
+            CsvField(backgroundClockRunId ?? string.Empty),
+            sequence.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            CsvField(device.DeviceId),
+            CsvField(GetHardwareFamily(device.DeviceId)),
+            CsvField(address.ToString()),
+            BackgroundShadowSampleCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            capture.Observation.EffectiveMasterEpochMicroseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            capture.Observation.MasterMinusLocalOffsetMicroseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            capture.Observation.BestRttMicroseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            DoubleField(capture.RttP5Microseconds),
+            NullableDoubleField(capture.Observation.DieTemperatureCelsius),
+            CsvField(fit.State.ToString().ToUpperInvariant()),
+            fit.ObservationCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            DoubleField(fit.ObservationSpanSeconds),
+            fit.ReferenceEpochMicroseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            DoubleField(fit.OffsetAtReferenceMicroseconds),
+            DoubleField(fit.RatePpm),
+            DoubleField(fit.RateStandardErrorPpm),
+            DoubleField(fit.RateSnr),
+            DoubleField(fit.ResidualStandardDeviationMicroseconds),
+            DoubleField(fit.FitMeanStandardErrorAtReferenceMicroseconds),
+            predictionEpochUs.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            DoubleField(estimateAgeSec),
+            DoubleField(predictedOffsetUs),
+            DoubleField(predictionMeanSeUs),
+            fit.RateStatisticallyQualified ? "1" : "0",
+            fit.PredictiveBenefitConfirmed ? "1" : "0",
+            discontinuityReset ? "1" : "0",
+            preemptionsTotal.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            preemptionsSincePreviousObservation.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+        await File.AppendAllTextAsync(
+            BackgroundClockCsvPath,
+            summary + Environment.NewLine,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            cancellationToken);
+
+        var rawBuilder = new StringBuilder();
+        for (int index = 0; index < capture.Samples.Count; index++)
+        {
+            SyncMeasurement sample = capture.Samples[index];
+            bool selected = capture.SelectedSamples.Contains(sample);
+            rawBuilder.AppendLine(string.Join(",",
+                CsvField(capture.Observation.CapturedUtc.ToString("O", System.Globalization.CultureInfo.InvariantCulture)),
+                CsvField(backgroundClockRunId ?? string.Empty),
+                sequence.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                CsvField(device.DeviceId),
+                CsvField(GetHardwareFamily(device.DeviceId)),
+                CsvField(address.ToString()),
+                (index + 1).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                FactoryProtocol.FormatCommandId(sample.SyncId),
+                sample.Sample.MasterT1Microseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                sample.Sample.DeviceT2Microseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                sample.Sample.DeviceT3Microseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                sample.Sample.MasterT4Microseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                sample.Sample.NetworkRttMicroseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                sample.Sample.MasterMinusLocalOffsetMicroseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                selected ? "1" : "0",
+                NullableDoubleField(sample.DieTemperatureCelsius)));
+        }
+
+        await File.AppendAllTextAsync(
+            BackgroundClockSamplesCsvPath,
+            rawBuilder.ToString(),
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            cancellationToken);
+    }
+
+    private async Task EnsureBackgroundClockCsvFilesAsync(CancellationToken cancellationToken)
+    {
+        if (BackgroundClockCsvPath != "—" && BackgroundClockSamplesCsvPath != "—") return;
+
+        string documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        string root = string.IsNullOrWhiteSpace(documents)
+            ? AppContext.BaseDirectory
+            : documents;
+        string directory = Path.Combine(root, "FactoryTimerBackgroundClock");
+        Directory.CreateDirectory(directory);
+        string runId = backgroundClockRunId ?? DateTime.Now.ToString(
+            "yyyyMMdd_HHmmss",
+            System.Globalization.CultureInfo.InvariantCulture);
+        backgroundClockRunId = runId;
+
+        BackgroundClockCsvPath = Path.Combine(
+            directory,
+            $"factory_timer_background_clock_{runId}.csv");
+        BackgroundClockSamplesCsvPath = Path.Combine(
+            directory,
+            $"factory_timer_background_clock_samples_{runId}.csv");
+
+        const string summaryHeader =
+            "TimestampUtc,RunId,Sequence,Device,Hardware,IpAddress,SampleCount," +
+            "EffectiveMasterEpochUs,OffsetUs,BestRttUs,RttP5Us,DieTemperatureC," +
+            "ModelState,FitObservationCount,FitSpanSec,FitReferenceEpochUs,FitOffsetAtReferenceUs," +
+            "RatePpm,RateSePpm,RateSnr,ResidualSdUs,FitMeanSeAtReferenceUs," +
+            "PredictionEpochUs,EstimateAgeSec,PredictedOffsetUs,PredictionMeanSeUs," +
+            "RateStatisticallyQualified,PredictiveBenefitConfirmed,DiscontinuityReset," +
+            "PreemptionsTotal,PreemptionsSincePreviousObservation";
+        const string samplesHeader =
+            "TimestampUtc,RunId,Sequence,Device,Hardware,IpAddress,SampleIndex,SyncId," +
+            "MasterT1Us,DeviceT2Us,DeviceT3Us,MasterT4Us,RttUs,OffsetUs,SelectedLowRtt,DieTemperatureC";
+
+        await File.WriteAllTextAsync(
+            BackgroundClockCsvPath,
+            summaryHeader + Environment.NewLine,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: true),
+            cancellationToken);
+        await File.WriteAllTextAsync(
+            BackgroundClockSamplesCsvPath,
+            samplesHeader + Environment.NewLine,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: true),
+            cancellationToken);
+    }
+
+    private static double Percentile(IEnumerable<long> values, double probability)
+    {
+        long[] sorted = values.OrderBy(value => value).ToArray();
+        if (sorted.Length == 0) return double.NaN;
+        if (probability <= 0) return sorted[0];
+        if (probability >= 1) return sorted[^1];
+
+        double position = (sorted.Length - 1) * probability;
+        int lower = (int)Math.Floor(position);
+        int upper = (int)Math.Ceiling(position);
+        if (lower == upper) return sorted[lower];
+        double fraction = position - lower;
+        return sorted[lower] + fraction * (sorted[upper] - sorted[lower]);
+    }
+
+    private static string DoubleField(double value) =>
+        double.IsFinite(value)
+            ? value.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture)
+            : string.Empty;
+
+    private static string NullableDoubleField(double? value) =>
+        value.HasValue && double.IsFinite(value.Value)
+            ? value.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)
+            : string.Empty;
+
+    private static string CsvField(string value)
+    {
+        if (!value.Contains(',') && !value.Contains('"') && !value.Contains('\n') && !value.Contains('\r'))
+        {
+            return value;
+        }
+        return $"\"{value.Replace("\"", "\"\"")}\"";
+    }
+
+    private void CancelActiveBackgroundSample(bool foregroundPreemption = false)
+    {
+        lock (backgroundClockSampleGate)
+        {
+            if (activeBackgroundSampleCancellation is null) return;
+            if (foregroundPreemption)
+            {
+                activeBackgroundSamplePreemptedByForeground = true;
+            }
+            activeBackgroundSampleCancellation.Cancel();
+        }
+    }
+
+    private async Task<bool> TryAcquireForegroundSendLockAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (isSending) return false;
+
+        Interlocked.Increment(ref foregroundSendRequests);
+        try
+        {
+            // Foreground work has strict priority over BG-1. Cancelling the
+            // active shadow waiter removes its SyncId from UdpControllerService
+            // and releases the send lock without waiting for its timeout.
+            CancelActiveBackgroundSample(foregroundPreemption: true);
+
+            bool acquired = await sendLock.WaitAsync(
+                TimeSpan.FromSeconds(2),
+                cancellationToken);
+            if (!acquired)
+            {
+                StatusMessage = "Timing transport is busy; retry the command.";
+            }
+            return acquired;
+        }
+        finally
+        {
+            Interlocked.Decrement(ref foregroundSendRequests);
+        }
     }
 
     public Task SendStartAsync() => SendStartAtAsync();
@@ -317,7 +861,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     public async Task SynchronizeAsync()
     {
         if (!TryGetReadyDevices(out List<(DeviceViewModel Device, IPAddress Address)> readyDevices)) return;
-        if (!await sendLock.WaitAsync(0)) return;
+        if (!await TryAcquireForegroundSendLockAsync()) return;
 
         isSending = true;
         UpdateCanSend();
@@ -621,7 +1165,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         IPAddress address,
         SyncPathDelayProfile pathDelay,
         ulong syncId,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool requestDieTemperature = false)
     {
         // t1 MUST be captured before the optional forward delay. Otherwise the
         // injected Master->ESP delay would disappear from the NTP-style sample.
@@ -635,6 +1180,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             masterToDeviceArtificialDelay: TimeSpan.FromMilliseconds(
                 pathDelay.MasterToDeviceDelayMilliseconds),
             deviceToMasterArtificialDelayMicroseconds: reverseDelayUs,
+            requestDieTemperature: requestDieTemperature,
             timeout: TimeSpan.FromMilliseconds(1500),
             cancellationToken: cancellationToken);
         SyncReplyPacket reply = received.Packet;
@@ -662,7 +1208,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             syncId,
             sample,
             received.ActualMasterToDeviceArtificialDelayMicroseconds,
-            reply.ActualArtificialReplyDelayMicroseconds);
+            reply.ActualArtificialReplyDelayMicroseconds,
+            reply.DieTemperatureMilliCelsius.HasValue
+                ? reply.DieTemperatureMilliCelsius.Value / 1000d
+                : null);
     }
 
     private async Task RunBenchmarkInternalAsync()
@@ -670,7 +1219,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         if (!TryBenchmarkTrialCount(out int trialCount)) return;
         if (!TryDuration(out uint duration)) return;
         if (!TryGetReadyDevices(out List<(DeviceViewModel Device, IPAddress Address)> readyDevices)) return;
-        if (!await sendLock.WaitAsync(0)) return;
+        if (!await TryAcquireForegroundSendLockAsync()) return;
 
         isSending = true;
         IsBenchmarkRunning = true;
@@ -1530,7 +2079,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
         if (!TryDuration(out uint duration)) return;
-        if (!await sendLock.WaitAsync(0)) return;
+        if (!await TryAcquireForegroundSendLockAsync()) return;
 
         isSending = true;
         UpdateCanSend();
@@ -1597,7 +2146,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             StatusMessage = resolution.Error!;
             return;
         }
-        if (!await sendLock.WaitAsync(0)) return;
+        if (!await TryAcquireForegroundSendLockAsync()) return;
 
         isSending = true;
         UpdateCanSend();
@@ -1875,7 +2424,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     private void UpdateCanSend() =>
-        CanSend = !isSending && SelectedNetworkInterface is not null && udpService.IsReady;
+        CanSend = !isSending &&
+            SelectedNetworkInterface is not null && udpService.IsReady;
 
     private void UdpService_PacketReceived(object? sender, PacketReceivedEventArgs e)
     {
@@ -1961,6 +2511,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     {
         if (disposed) return;
         disposed = true;
+        CancelActiveBackgroundSample();
+        backgroundClockCancellation.Cancel();
         benchmarkCancellation?.Cancel();
         benchmarkCancellation?.Dispose();
         benchmarkCancellation = null;
@@ -1970,7 +2522,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         networkSelectionManager.StateChanged -= NetworkSelectionManager_StateChanged;
         networkSelectionManager.Dispose();
         udpService.Dispose();
-        sendLock.Dispose();
+        backgroundClockCancellation.Dispose();
+        // sendLock may still be unwinding a cancelled BG-1 await during window
+        // teardown; leaving SemaphoreSlim for process shutdown avoids a disposal
+        // race without retaining external resources.
         GC.SuppressFinalize(this);
     }
 
@@ -2314,5 +2869,13 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         ulong SyncId,
         ClockSyncSample Sample,
         long ActualForwardDelayUs,
-        uint ActualReverseDelayUs);
+        uint ActualReverseDelayUs,
+        double? DieTemperatureCelsius);
+
+    private sealed record BackgroundClockCapture(
+        BackgroundClockObservation Observation,
+        ClockSyncConsensus Consensus,
+        IReadOnlyList<SyncMeasurement> Samples,
+        IReadOnlyList<SyncMeasurement> SelectedSamples,
+        double RttP5Microseconds);
 }

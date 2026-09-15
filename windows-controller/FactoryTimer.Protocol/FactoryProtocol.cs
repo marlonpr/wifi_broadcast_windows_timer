@@ -52,6 +52,7 @@ public enum ProtocolParseError
     Rssi,
     Channel,
     Bssid,
+    Temperature,
 }
 
 public sealed record CommandPacket(
@@ -64,7 +65,8 @@ public sealed record CommandPacket(
 public sealed record SyncRequestPacket(
     ulong SyncId,
     long MasterT1Microseconds,
-    uint ArtificialReplyDelayMicroseconds = 0);
+    uint ArtificialReplyDelayMicroseconds = 0,
+    bool RequestDieTemperature = false);
 
 public sealed record SyncSetPacket(
     ulong SyncId,
@@ -94,7 +96,8 @@ public sealed record SyncReplyPacket(
     long MasterT1Microseconds,
     long LocalT2Microseconds,
     long LocalT3Microseconds,
-    uint ActualArtificialReplyDelayMicroseconds = 0) : InboundPacket(DeviceId);
+    uint ActualArtificialReplyDelayMicroseconds = 0,
+    int? DieTemperatureMilliCelsius = null) : InboundPacket(DeviceId);
 
 public sealed record SyncAppliedPacket(
     string DeviceId,
@@ -149,8 +152,16 @@ public static class FactoryProtocol
             throw new ArgumentOutOfRangeException(nameof(packet));
         }
 
-        // Preserve the original four-field packet when no reverse-path delay is
-        // requested. The new firmware accepts both four- and five-field forms.
+        // Preserve the original four/five-field forms for all production and
+        // synthetic-control traffic. BG-1 shadow sampling opts into die-temperature
+        // telemetry explicitly with a sixth TEMP field so existing foreground SYNC
+        // packets and older controllers keep their byte-for-byte behavior.
+        if (packet.RequestDieTemperature)
+        {
+            return FormattableString.Invariant(
+                $"{Version2}|SYNC|{packet.SyncId:X16}|{packet.MasterT1Microseconds}|{packet.ArtificialReplyDelayMicroseconds}|TEMP");
+        }
+
         return packet.ArtificialReplyDelayMicroseconds == 0
             ? FormattableString.Invariant(
                 $"{Version2}|SYNC|{packet.SyncId:X16}|{packet.MasterT1Microseconds}")
@@ -284,9 +295,11 @@ public static class FactoryProtocol
         if (fields.Length >= 2 && fields[0] == Version2 && fields[1] == "SYNC_REPLY")
         {
             // Seven fields are the original v2 reply. The optional eighth field
-            // reports the reverse-path diagnostic delay actually achieved by
-            // the device, measured with esp_timer_get_time().
-            if (fields.Length is not (7 or 8))
+            // reports reverse-path diagnostic delay. BG-1 permits a ninth field
+            // carrying die temperature in milli-Celsius; when present, field 8
+            // remains the measured reverse-path hold so v9.2 metrology semantics
+            // are unchanged.
+            if (fields.Length is not (7 or 8 or 9))
             {
                 error = ProtocolParseError.FieldCount;
                 return false;
@@ -310,14 +323,27 @@ public static class FactoryProtocol
             }
 
             uint actualReplyDelayUs = 0;
-            if (fields.Length == 8 &&
+            if (fields.Length >= 8 &&
                 !uint.TryParse(fields[7], NumberStyles.None, CultureInfo.InvariantCulture, out actualReplyDelayUs))
             {
                 error = ProtocolParseError.Timestamp;
                 return false;
             }
 
-            packet = new SyncReplyPacket(fields[2], syncId, t1, t2, t3, actualReplyDelayUs);
+            int? dieTemperatureMilliCelsius = null;
+            if (fields.Length == 9)
+            {
+                if (!int.TryParse(fields[8], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out int parsedTemperature) ||
+                    parsedTemperature < -100_000 || parsedTemperature > 200_000)
+                {
+                    error = ProtocolParseError.Temperature;
+                    return false;
+                }
+                dieTemperatureMilliCelsius = parsedTemperature;
+            }
+
+            packet = new SyncReplyPacket(
+                fields[2], syncId, t1, t2, t3, actualReplyDelayUs, dieTemperatureMilliCelsius);
             return true;
         }
 
