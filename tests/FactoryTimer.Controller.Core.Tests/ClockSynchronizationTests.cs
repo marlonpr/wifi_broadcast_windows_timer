@@ -240,20 +240,6 @@ public sealed class ClockSynchronizationTests
     }
 
     [TestMethod]
-    public void InverseSquareWeightedConsensusUsesWeightedMasterMidpointAsEffectiveEpoch()
-    {
-        ClockSyncSample a = new(1_000_000, 940_000, 940_000, 1_010_000);
-        ClockSyncSample b = new(2_000_000, 1_940_000, 1_940_000, 2_010_000);
-        ClockSyncSample c = new(3_000_000, 2_940_000, 2_940_000, 3_010_000);
-
-        ClockSyncConsensus consensus = ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
-            [a, b, c],
-            lowRttSampleCount: 3);
-
-        Assert.AreEqual(2_005_000L, consensus.EffectiveMasterEpochMicroseconds);
-    }
-
-    [TestMethod]
     public void InverseSquareWeightedConsensusPreservesPersistentAsymmetricDelayBias()
     {
         ClockSyncConsensus consensus = ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
@@ -351,6 +337,20 @@ public sealed class ClockSynchronizationTests
 
         Assert.AreEqual(60_000L, consensus.MasterMinusLocalOffsetMicroseconds);
         Assert.AreEqual(0L, consensus.BestRttMicroseconds);
+    }
+
+
+    [TestMethod]
+    public void InverseSquareWeightedConsensusCarriesWeightedEffectiveMasterEpoch()
+    {
+        static ClockSyncSample At(long t1) =>
+            new(t1, t1 - 60_000 + 5_000, t1 - 60_000 + 5_000, t1 + 10_000);
+
+        ClockSyncConsensus consensus = ClockSyncEstimator.SelectLowRttInverseSquareWeightedOffset(
+            [At(1_000_000), At(2_000_000), At(3_000_000)],
+            lowRttSampleCount: 3);
+
+        Assert.AreEqual(2_005_000L, consensus.EffectiveMasterEpochMicroseconds);
     }
 
 

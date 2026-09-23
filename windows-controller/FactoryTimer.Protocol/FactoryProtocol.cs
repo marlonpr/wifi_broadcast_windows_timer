@@ -9,6 +9,7 @@ public enum CommandType
     StartAt,
     Reset,
     StatusRequest,
+    Brightness,
 }
 
 public enum TimerState
@@ -52,7 +53,7 @@ public enum ProtocolParseError
     Rssi,
     Channel,
     Bssid,
-    Temperature,
+    Brightness,
 }
 
 public sealed record CommandPacket(
@@ -60,13 +61,13 @@ public sealed record CommandPacket(
     ulong CommandId,
     uint DurationSeconds,
     uint StartDelayMilliseconds,
-    long StartAtMasterMicroseconds = 0);
+    long StartAtMasterMicroseconds = 0,
+    byte BrightnessPercent = 0);
 
 public sealed record SyncRequestPacket(
     ulong SyncId,
     long MasterT1Microseconds,
-    uint ArtificialReplyDelayMicroseconds = 0,
-    bool RequestDieTemperature = false);
+    uint ArtificialReplyDelayMicroseconds = 0);
 
 public sealed record SyncSetPacket(
     ulong SyncId,
@@ -96,8 +97,7 @@ public sealed record SyncReplyPacket(
     long MasterT1Microseconds,
     long LocalT2Microseconds,
     long LocalT3Microseconds,
-    uint ActualArtificialReplyDelayMicroseconds = 0,
-    int? DieTemperatureMilliCelsius = null) : InboundPacket(DeviceId);
+    uint ActualArtificialReplyDelayMicroseconds = 0) : InboundPacket(DeviceId);
 
 public sealed record SyncAppliedPacket(
     string DeviceId,
@@ -122,6 +122,7 @@ public static class FactoryProtocol
     public const uint MinimumStartDelayMilliseconds = 100;
     public const uint MaximumStartDelayMilliseconds = 10_000;
     public const uint MaximumArtificialSyncReplyDelayMicroseconds = 1_500_000;
+    public const byte MaximumBrightnessPercent = 100;
 
     public static string SerializeCommand(CommandPacket packet)
     {
@@ -136,6 +137,8 @@ public static class FactoryProtocol
                 $"{Version1}|CMD|RESET|{packet.CommandId:X16}|{packet.DurationSeconds}|0"),
             CommandType.StatusRequest => FormattableString.Invariant(
                 $"{Version1}|CMD|STATUS_REQUEST|{packet.CommandId:X16}|0|0"),
+            CommandType.Brightness => FormattableString.Invariant(
+                $"{Version2}|CMD|BRIGHTNESS|{packet.CommandId:X16}|{packet.BrightnessPercent}|0"),
             _ => throw new ArgumentOutOfRangeException(nameof(packet)),
         };
     }
@@ -152,16 +155,8 @@ public static class FactoryProtocol
             throw new ArgumentOutOfRangeException(nameof(packet));
         }
 
-        // Preserve the original four/five-field forms for all production and
-        // synthetic-control traffic. BG-1 shadow sampling opts into die-temperature
-        // telemetry explicitly with a sixth TEMP field so existing foreground SYNC
-        // packets and older controllers keep their byte-for-byte behavior.
-        if (packet.RequestDieTemperature)
-        {
-            return FormattableString.Invariant(
-                $"{Version2}|SYNC|{packet.SyncId:X16}|{packet.MasterT1Microseconds}|{packet.ArtificialReplyDelayMicroseconds}|TEMP");
-        }
-
+        // Preserve the original four-field packet when no reverse-path delay is
+        // requested. The new firmware accepts both four- and five-field forms.
         return packet.ArtificialReplyDelayMicroseconds == 0
             ? FormattableString.Invariant(
                 $"{Version2}|SYNC|{packet.SyncId:X16}|{packet.MasterT1Microseconds}")
@@ -208,7 +203,7 @@ public static class FactoryProtocol
         }
         bool validVersion = commandType switch
         {
-            CommandType.StartAt => fields[0] == Version2,
+            CommandType.StartAt or CommandType.Brightness => fields[0] == Version2,
             _ => fields[0] == Version1,
         };
         if (!validVersion)
@@ -220,6 +215,19 @@ public static class FactoryProtocol
         {
             error = ProtocolParseError.CommandId;
             return false;
+        }
+
+        if (commandType == CommandType.Brightness)
+        {
+            if (!TryUInt(fields[4], 0, MaximumBrightnessPercent, out uint brightness) ||
+                !TryUInt(fields[5], 0, 0, out _))
+            {
+                error = ProtocolParseError.Brightness;
+                return false;
+            }
+            packet = new CommandPacket(
+                commandType, commandId, 0, 0, 0, checked((byte)brightness));
+            return true;
         }
 
         uint minimumDuration = commandType == CommandType.StatusRequest ? 0 : MinimumDurationSeconds;
@@ -295,11 +303,9 @@ public static class FactoryProtocol
         if (fields.Length >= 2 && fields[0] == Version2 && fields[1] == "SYNC_REPLY")
         {
             // Seven fields are the original v2 reply. The optional eighth field
-            // reports reverse-path diagnostic delay. BG-1 permits a ninth field
-            // carrying die temperature in milli-Celsius; when present, field 8
-            // remains the measured reverse-path hold so v9.2 metrology semantics
-            // are unchanged.
-            if (fields.Length is not (7 or 8 or 9))
+            // reports the reverse-path diagnostic delay actually achieved by
+            // the device, measured with esp_timer_get_time().
+            if (fields.Length is not (7 or 8))
             {
                 error = ProtocolParseError.FieldCount;
                 return false;
@@ -323,27 +329,14 @@ public static class FactoryProtocol
             }
 
             uint actualReplyDelayUs = 0;
-            if (fields.Length >= 8 &&
+            if (fields.Length == 8 &&
                 !uint.TryParse(fields[7], NumberStyles.None, CultureInfo.InvariantCulture, out actualReplyDelayUs))
             {
                 error = ProtocolParseError.Timestamp;
                 return false;
             }
 
-            int? dieTemperatureMilliCelsius = null;
-            if (fields.Length == 9)
-            {
-                if (!int.TryParse(fields[8], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out int parsedTemperature) ||
-                    parsedTemperature < -100_000 || parsedTemperature > 200_000)
-                {
-                    error = ProtocolParseError.Temperature;
-                    return false;
-                }
-                dieTemperatureMilliCelsius = parsedTemperature;
-            }
-
-            packet = new SyncReplyPacket(
-                fields[2], syncId, t1, t2, t3, actualReplyDelayUs, dieTemperatureMilliCelsius);
+            packet = new SyncReplyPacket(fields[2], syncId, t1, t2, t3, actualReplyDelayUs);
             return true;
         }
 
@@ -517,6 +510,17 @@ public static class FactoryProtocol
         {
             throw new ArgumentOutOfRangeException(nameof(packet), "Command ID cannot be zero.");
         }
+        if (packet.CommandType == CommandType.Brightness)
+        {
+            if (packet.DurationSeconds != 0 || packet.StartDelayMilliseconds != 0 ||
+                packet.StartAtMasterMicroseconds != 0 ||
+                packet.BrightnessPercent > MaximumBrightnessPercent)
+            {
+                throw new ArgumentOutOfRangeException(nameof(packet),
+                    "BRIGHTNESS requires only a 0..100 percent value.");
+            }
+            return;
+        }
         if (packet.CommandType == CommandType.StatusRequest)
         {
             if (packet.DurationSeconds != 0 || packet.StartDelayMilliseconds != 0 ||
@@ -526,6 +530,11 @@ public static class FactoryProtocol
                     "STATUS_REQUEST timing and duration fields must be zero.");
             }
             return;
+        }
+        if (packet.BrightnessPercent != 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(packet),
+                "BrightnessPercent must be zero for non-BRIGHTNESS commands.");
         }
         if (packet.DurationSeconds is < MinimumDurationSeconds or > MaximumDurationSeconds)
         {
@@ -627,9 +636,10 @@ public static class FactoryProtocol
             "START_AT" => CommandType.StartAt,
             "RESET" => CommandType.Reset,
             "STATUS_REQUEST" => CommandType.StatusRequest,
+            "BRIGHTNESS" => CommandType.Brightness,
             _ => default,
         };
-        return value is "START" or "START_AT" or "RESET" or "STATUS_REQUEST";
+        return value is "START" or "START_AT" or "RESET" or "STATUS_REQUEST" or "BRIGHTNESS";
     }
 
     private static bool TryAckResult(string value, out AckResult result)

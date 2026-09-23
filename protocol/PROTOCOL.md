@@ -23,10 +23,9 @@ A positive offset therefore means the Master clock's numeric value is ahead of t
 ```text
 FCT2|SYNC|0123456789ABCDEF|100000
 FCT2|SYNC|0123456789ABCDEF|100000|250000
-FCT2|SYNC|0123456789ABCDEF|100000|0|TEMP
 ```
 
-Fields: version, packet type, sync ID, Master transmit timestamp `t1` in microseconds, and optional artificial ESP→Master reply delay in microseconds. The original four-field form remains valid and means zero artificial reply delay. BG-1 shadow sampling may append `TEMP` as a sixth field; this opt-in requests die-temperature telemetry without changing ordinary foreground/control packet formats.
+Fields: version, packet type, sync ID, Master transmit timestamp `t1` in microseconds, and optional artificial ESP→Master reply delay in microseconds. The original four-field form remains valid and means zero artificial reply delay.
 
 The ESP captures `t2` immediately after `recvfrom()` returns and captures `t3` before the optional artificial reply delay. This is deliberate: the injected reverse delay must appear in `(t4-t3)` rather than being hidden as endpoint processing time.
 
@@ -34,10 +33,10 @@ The ESP captures `t2` immediately after `recvfrom()` returns and captures `t3` b
 
 ```text
 FCT2|SYNC_REPLY|ESP01|0123456789ABCDEF|100000|40004|40006
-FCT2|SYNC_REPLY|ESP03|0123456789ABCDEF|100000|40004|40006|0|41250
 ```
 
-Fields: version, packet type, device ID, sync ID, echoed Master `t1`, ESP receive `t2`, ESP transmit `t3`. Existing synthetic-delay firmware may append the measured reverse hold as field 8. When `TEMP` was requested and the target supports die-temperature telemetry, field 9 is temperature in milli-Celsius; the example above is 41.250 °C. The Master captures `t4` as soon as the reply is received. Temperature acquisition occurs before `t3`, so its conversion time remains endpoint processing time and cancels from the NTP-style network RTT.
+Fields: version, packet type, device ID, sync ID, echoed Master `t1`, ESP receive `t2`, ESP transmit `t3`.
+The Master captures `t4` as soon as the reply is received.
 
 The Master estimates:
 
@@ -172,6 +171,12 @@ For NONE and SYMMETRIC modes, expected experiment bias is 0 us. For ASYMMETRIC 2
 A failed quality check discards the calibration for START_AT purposes and recalibrates that device. If all five attempts miss the threshold, that device is left unsynchronized and the benchmark trial fails instead of starting with a known poor clock estimate.
 
 
-## BG-1 shadow synchronization
+## Runtime panel brightness
 
-BG-1 uses eight delay-free SYNC exchanges per device at a fixed 60 s/device maintenance cadence, retains the same best-3 `1/RTT²` estimator, and records the weighted Master midpoint of those selected samples as the effective observation epoch. BG-1 does **not** send `SYNC_SET`; its fitted offset/rate model is measurement-only and cannot affect `START_AT`. See `BACKGROUND_SYNC_SHADOW_BG1.md`.
+The controller may unicast a runtime panel-brightness command to any selected device:
+
+```text
+FCT2|CMD|BRIGHTNESS|<CommandId>|<percent>|0
+```
+
+`percent` is an integer from `0` through `100`. `0` blanks LED output; `100` is maximum output brightness. The device replies with the ordinary ACK form using command type `BRIGHTNESS`. This setting does not alter timer state, synchronization state, START_AT scheduling, or the idle-logo framebuffer. It is runtime-only: after reboot the firmware returns to its build-time `CONFIG_FACTORY_DISPLAY_BRIGHTNESS` default.

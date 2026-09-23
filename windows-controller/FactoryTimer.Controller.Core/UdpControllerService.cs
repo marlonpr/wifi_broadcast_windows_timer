@@ -244,6 +244,19 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         CancellationToken token = default) =>
         SendRepeatedAsync(FactoryProtocol.SerializeCommandBytes(command), destination, token);
 
+    public async Task SendCommandUnicastOnceAsync(
+        CommandPacket command,
+        IPAddress destination,
+        CancellationToken token = default)
+    {
+        SocketSession activeSession = GetActiveSession();
+        byte[] packet = FactoryProtocol.SerializeCommandBytes(command);
+        await activeSession.Socket.SendAsync(
+            packet,
+            new IPEndPoint(destination, CommandPort),
+            token);
+    }
+
     private static async Task<long> WaitArtificialForwardDelayAsync(
         TimeSpan requestedDelay,
         CancellationToken cancellationToken)
@@ -289,7 +302,6 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         IPAddress destination,
         TimeSpan? masterToDeviceArtificialDelay = null,
         uint deviceToMasterArtificialDelayMicroseconds = 0,
-        bool requestDieTemperature = false,
         TimeSpan? timeout = null,
         CancellationToken cancellationToken = default)
     {
@@ -312,8 +324,7 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
                 new SyncRequestPacket(
                     syncId,
                     masterT1Microseconds,
-                    deviceToMasterArtificialDelayMicroseconds,
-                    requestDieTemperature));
+                    deviceToMasterArtificialDelayMicroseconds));
             await activeSession.Socket.SendAsync(
                 packet,
                 new IPEndPoint(destination, CommandPort),
@@ -326,10 +337,6 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
             try
             {
                 ReceivedSyncReply result = await waiter.Task.WaitAsync(linked.Token);
-                // If a foreground preemption raced with a late reply, cancellation
-                // wins. The finally below then removes the waiter before the caller
-                // can accept this exchange into a background observation.
-                cancellationToken.ThrowIfCancellationRequested();
                 return result with
                 {
                     ActualMasterToDeviceArtificialDelayMicroseconds = actualForwardDelayUs,

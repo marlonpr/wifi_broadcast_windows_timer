@@ -7,7 +7,7 @@ using Microsoft.UI.Xaml.Media;
 
 namespace FactoryTimer.Controller;
 
-internal sealed class DeviceViewModel(string deviceId) : ObservableObject
+internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = true) : ObservableObject
 {
     private static readonly Brush OnlineColor = new SolidColorBrush(Colors.LimeGreen);
     private static readonly Brush OfflineColor = new SolidColorBrush(Colors.Gray);
@@ -51,8 +51,14 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
     private int? rssiDbm;
     private int? wifiChannel;
     private string? bssidValue;
+    private bool isSelected = initiallySelected;
+    private readonly ParticipantSessionTracker sessionTracker = new();
+    private long? effectiveSyncEpochMasterMicroseconds;
+    private long? synchronizationSessionGeneration;
 
     public string DeviceId { get; } = deviceId;
+    public string DisplayName { get; } = BuildDisplayName(deviceId);
+    public bool IsSelected { get => isSelected; set => SetProperty(ref isSelected, value); }
     public string OnlineText { get => onlineText; private set => SetProperty(ref onlineText, value); }
     public Brush OnlineBrush { get => onlineBrush; private set => SetProperty(ref onlineBrush, value); }
     public string IpAddress { get => ipAddress; private set => SetProperty(ref ipAddress, value); }
@@ -92,6 +98,44 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
     public int? WifiChannel => wifiChannel;
     public string? BssidValue => bssidValue;
     public bool IsSynchronized => synchronizationAccepted;
+    public long? EffectiveSyncEpochMasterMicroseconds => effectiveSyncEpochMasterMicroseconds;
+    public long? SynchronizationSessionGeneration => synchronizationSessionGeneration;
+    public ParticipantSessionSnapshot SessionSnapshot => sessionTracker.Snapshot;
+
+
+    private static string BuildDisplayName(string deviceId)
+    {
+        if (deviceId.StartsWith("ESP", StringComparison.Ordinal) &&
+            int.TryParse(deviceId.AsSpan(3), out int number) &&
+            number is >= 1 and <= 99)
+        {
+            return $"TIMER{number:00}";
+        }
+
+        return deviceId;
+    }
+
+    public bool IsOnlineAt(DateTimeOffset now) =>
+        statusTracker.GetAvailability(now) == DeviceAvailability.Online;
+
+    public StartParticipantGateInput BuildStartGateInput(DateTimeOffset now)
+    {
+        ParticipantSessionSnapshot session = sessionTracker.Snapshot;
+        return new StartParticipantGateInput(
+            DeviceId,
+            InRoster: true,
+            Online: IsOnlineAt(now),
+            session.LastStatusAtUtc,
+            synchronizationAccepted && residualErrorMicroseconds.HasValue &&
+                effectiveSyncEpochMasterMicroseconds.HasValue && synchronizationSessionGeneration.HasValue,
+            residualErrorMicroseconds ?? 0,
+            effectiveSyncEpochMasterMicroseconds ?? 0,
+            synchronizationSessionGeneration ?? -1,
+            session.Generation,
+            session.IpAddress,
+            session.TimerState,
+            session.CommandId);
+    }
 
     public bool TryGetIpAddress(out IPAddress? address) =>
         IPAddress.TryParse(IpAddress, out address);
@@ -163,9 +207,12 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
     {
         DateTimeOffset now = DateTimeOffset.UtcNow;
         statusTracker.RecordValidStatus(now);
+        sessionTracker.ObserveStatus(status, endpoint.Address, now);
         IpAddress = endpoint.Address.ToString();
         LastCommandId = FactoryProtocol.FormatCommandId(status.CommandId);
-        RemainingSeconds = status.RemainingSeconds.ToString(CultureInfo.InvariantCulture);
+        uint remainingMinutes = status.RemainingSeconds / 60u;
+        uint remainingSecondsPart = status.RemainingSeconds % 60u;
+        RemainingSeconds = $"{remainingMinutes:00}:{remainingSecondsPart:00}";
         State = status.State.ToString().ToUpperInvariant();
 
         if (status.RssiDbm.HasValue)
@@ -187,6 +234,12 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
         RefreshOnlineStatus(now);
     }
 
+    public void ObserveSyncLocalTimestamp(long localTimestampMicroseconds) =>
+        sessionTracker.ObserveLocalTimestamp(localTimestampMicroseconds);
+
+    public void BeginIntentionalStatusPause() =>
+        sessionTracker.BeginIntentionalStatusPause();
+
     public void MarkSynchronizing()
     {
         synchronizationAccepted = false;
@@ -199,6 +252,8 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
         SynchronizationState = "SYNCHRONIZING";
         SynchronizationQuality = "—";
         verificationOffsetMicroseconds = null;
+        effectiveSyncEpochMasterMicroseconds = null;
+        synchronizationSessionGeneration = null;
         ClockError = "—";
         BestRtt = "—";
         VerificationRtt = "—";
@@ -228,6 +283,7 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
         long expectedBiasMicroseconds,
         long qualityDeviationMicroseconds,
         long qualityThresholdMicroseconds,
+        long effectiveSyncEpochMicroseconds,
         int attempt,
         int maxAttempts,
         bool accepted)
@@ -241,6 +297,8 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
         expectedSyncBiasMicroseconds = expectedBiasMicroseconds;
         syncQualityDeviationMicroseconds = qualityDeviationMicroseconds;
         syncQualityThresholdMicroseconds = qualityThresholdMicroseconds;
+        effectiveSyncEpochMasterMicroseconds = effectiveSyncEpochMicroseconds;
+        synchronizationSessionGeneration = sessionTracker.Snapshot.Generation;
         syncAttemptCount = attempt;
         syncQualityAccepted = accepted;
         synchronizationAccepted = accepted;
@@ -284,6 +342,8 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
         syncQualityAccepted = false;
         residualErrorMicroseconds = null;
         verificationOffsetMicroseconds = null;
+        effectiveSyncEpochMasterMicroseconds = null;
+        synchronizationSessionGeneration = null;
         appliedOffsetMicroseconds = null;
         bestRttMicroseconds = null;
         verificationRttMicroseconds = null;
@@ -315,6 +375,7 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
 
     public void RefreshOnlineStatus(DateTimeOffset now)
     {
+        sessionTracker.ObserveConnectivity(now, DeviceStatusTracker.OfflineTimeout, monitoringEnabled: true);
         DeviceAvailability availability = statusTracker.GetAvailability(now);
         OnlineText = availability switch
         {
@@ -327,6 +388,7 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
 
     public void BeginSearching()
     {
+        sessionTracker.InvalidateControllerSession();
         DateTimeOffset now = DateTimeOffset.UtcNow;
         statusTracker.BeginSearching(now);
         RefreshOnlineStatus(now);
@@ -334,6 +396,7 @@ internal sealed class DeviceViewModel(string deviceId) : ObservableObject
 
     public void MarkOffline()
     {
+        sessionTracker.InvalidateControllerSession();
         statusTracker.MarkOffline();
         OnlineText = "OFFLINE";
         OnlineBrush = OfflineColor;

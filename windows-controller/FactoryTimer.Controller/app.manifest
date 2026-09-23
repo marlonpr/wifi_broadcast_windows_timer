@@ -1,10 +1,30 @@
 <?xml version="1.0" encoding="utf-8"?>
-<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+<assembly manifestVersion="1.0"
+          xmlns="urn:schemas-microsoft-com:asm.v1"
+          xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
   <assemblyIdentity version="1.0.0.0" name="FactoryTimer.Controller" />
+
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
       <maxversiontested Id="10.0.26100.0" />
       <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
     </application>
   </compatibility>
+
+  <!--
+    The controller is a WinUI 3 desktop app and must use per-monitor DPI
+    awareness. Without this declaration, mixed-scale multi-monitor systems
+    can produce inconsistent Win32/XAML pointer coordinates. In the captured
+    diagnostic run, DISPLAY2 at 100% behaved correctly while the primary
+    display showed an exact ~1.25 coordinate multiplier, matching a 125%
+    scaling mismatch.
+  -->
+  <asmv3:application>
+    <asmv3:windowsSettings>
+      <!-- Fallback for older Windows DPI-awareness parsing. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <!-- Windows 10/11: use true per-monitor-v2 DPI handling. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </asmv3:windowsSettings>
+  </asmv3:application>
 </assembly>

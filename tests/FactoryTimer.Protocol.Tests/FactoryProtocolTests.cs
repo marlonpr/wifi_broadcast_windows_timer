@@ -38,6 +38,28 @@ public sealed class FactoryProtocolTests
         Assert.AreEqual(original, parsed);
     }
 
+
+    [TestMethod]
+    public void BrightnessSerializationIsExactAndRoundTrips()
+    {
+        var original = new CommandPacket(
+            CommandType.Brightness,
+            0x0B0B0B0B0B0B0B0B,
+            0,
+            0,
+            0,
+            37);
+
+        string serialized = FactoryProtocol.SerializeCommand(original);
+
+        Assert.AreEqual(
+            "FCT2|CMD|BRIGHTNESS|0B0B0B0B0B0B0B0B|37|0",
+            serialized);
+        Assert.IsTrue(FactoryProtocol.TryParseCommand(
+            serialized, out CommandPacket? parsed, out _));
+        Assert.AreEqual(original, parsed);
+    }
+
     [TestMethod]
     public void SynchronizationPacketsSerializeAndParse()
     {
@@ -50,11 +72,6 @@ public sealed class FactoryProtocolTests
             "FCT2|SYNC|0123456789ABCDEF|100000|250000",
             FactoryProtocol.SerializeSyncRequest(
                 new SyncRequestPacket(0x0123456789abcdef, 100_000, 250_000)));
-
-        Assert.AreEqual(
-            "FCT2|SYNC|0123456789ABCDEF|100000|0|TEMP",
-            FactoryProtocol.SerializeSyncRequest(
-                new SyncRequestPacket(0x0123456789abcdef, 100_000, 0, RequestDieTemperature: true)));
 
         Assert.AreEqual(
             "FCT2|SYNC_SET|0123456789ABCDEF|60001|10000",
@@ -76,14 +93,6 @@ public sealed class FactoryProtocolTests
         Assert.AreEqual(
             new SyncReplyPacket("ESP02", 0x0123456789abcdef, 100_000, 40_004, 40_006, 4012),
             delayedReply);
-
-        Assert.IsTrue(FactoryProtocol.TryParseInbound(
-            "FCT2|SYNC_REPLY|ESP03|0123456789ABCDEF|100000|40004|40006|0|41250",
-            out InboundPacket? temperatureReply,
-            out _));
-        Assert.AreEqual(
-            new SyncReplyPacket("ESP03", 0x0123456789abcdef, 100_000, 40_004, 40_006, 0, 41_250),
-            temperatureReply);
 
         Assert.IsTrue(FactoryProtocol.TryParseInbound(
             "FCT2|SYNC_APPLIED|ESP01|0123456789ABCDEF|60001|10000",
@@ -170,7 +179,6 @@ public sealed class FactoryProtocolTests
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-200|6|AA:BB:CC:DD:EE:FF", ProtocolParseError.Rssi)]
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|999|AA:BB:CC:DD:EE:FF", ProtocolParseError.Channel)]
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|NOT-A-BSSID", ProtocolParseError.Bssid)]
-    [DataRow("FCT2|SYNC_REPLY|ESP03|0123456789ABCDEF|100000|40004|40006|0|HOT", ProtocolParseError.Temperature)]
     public void RejectsMalformedOrUnsupportedInbound(string text, ProtocolParseError expected)
     {
         Assert.IsFalse(FactoryProtocol.TryParseInbound(text, out _, out ProtocolParseError actual));
@@ -194,6 +202,8 @@ public sealed class FactoryProtocolTests
     [DataRow("FCT1|CMD|STATUS_REQUEST|0123456789ABCDEF|0|1", ProtocolParseError.StartDelay)]
     [DataRow("FCT1|CMD|START|0000000000000000|20|1000", ProtocolParseError.CommandId)]
     [DataRow("FCT1|CMD|PAUSE|0123456789ABCDEF|20|1000", ProtocolParseError.CommandType)]
+    [DataRow("FCT2|CMD|BRIGHTNESS|0123456789ABCDEF|101|0", ProtocolParseError.Brightness)]
+    [DataRow("FCT2|CMD|BRIGHTNESS|0123456789ABCDEF|50|1", ProtocolParseError.Brightness)]
     public void RejectsInvalidCommands(string text, ProtocolParseError expected)
     {
         Assert.IsFalse(FactoryProtocol.TryParseCommand(text, out _, out ProtocolParseError actual));
