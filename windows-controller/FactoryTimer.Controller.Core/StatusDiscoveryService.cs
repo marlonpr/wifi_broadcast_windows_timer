@@ -86,7 +86,8 @@ public sealed class StatusDiscoveryService : IDisposable
 
     public void StartOrRestart(
         ControllerNetworkInterface selectedInterface,
-        Func<string?> manualBroadcastOverrideProvider)
+        Func<string?> manualBroadcastOverrideProvider,
+        Func<IReadOnlyList<IPAddress>?>? unicastTargetsProvider = null)
     {
         ArgumentNullException.ThrowIfNull(selectedInterface);
         ArgumentNullException.ThrowIfNull(manualBroadcastOverrideProvider);
@@ -105,6 +106,7 @@ public sealed class StatusDiscoveryService : IDisposable
                 activeGeneration,
                 selectedInterface,
                 manualBroadcastOverrideProvider,
+                unicastTargetsProvider,
                 replacement.Token));
         }
 
@@ -151,6 +153,7 @@ public sealed class StatusDiscoveryService : IDisposable
         long activeGeneration,
         ControllerNetworkInterface selectedInterface,
         Func<string?> manualBroadcastOverrideProvider,
+        Func<IReadOnlyList<IPAddress>?>? unicastTargetsProvider,
         CancellationToken token)
     {
         try
@@ -167,24 +170,50 @@ public sealed class StatusDiscoveryService : IDisposable
         {
             try
             {
-                BroadcastAddressResolution resolution = BroadcastAddressResolver.Resolve(
-                    selectedInterface,
-                    manualBroadcastOverrideProvider());
-                if (!resolution.IsValid)
+                IReadOnlyList<IPAddress>? runTargets = unicastTargetsProvider?.Invoke();
+                IPAddress[] unicastTargets = runTargets is null
+                    ? []
+                    : runTargets
+                        .Where(address => address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                        .Distinct()
+                        .ToArray();
+
+                if (unicastTargets.Length != 0)
                 {
-                    DiscoveryError?.Invoke(this, resolution.Error!);
+                    foreach (IPAddress target in unicastTargets)
+                    {
+                        ulong commandId = commandIdGenerator.NextCommandId();
+                        if (commandId == 0)
+                        {
+                            throw new InvalidOperationException("The discovery command ID generator returned zero.");
+                        }
+                        await transport.SendStatusRequestAsync(
+                            commandId,
+                            target,
+                            token).ConfigureAwait(false);
+                    }
                 }
                 else
                 {
-                    ulong commandId = commandIdGenerator.NextCommandId();
-                    if (commandId == 0)
+                    BroadcastAddressResolution resolution = BroadcastAddressResolver.Resolve(
+                        selectedInterface,
+                        manualBroadcastOverrideProvider());
+                    if (!resolution.IsValid)
                     {
-                        throw new InvalidOperationException("The discovery command ID generator returned zero.");
+                        DiscoveryError?.Invoke(this, resolution.Error!);
                     }
-                    await transport.SendStatusRequestAsync(
-                        commandId,
-                        resolution.Address!,
-                        token).ConfigureAwait(false);
+                    else
+                    {
+                        ulong commandId = commandIdGenerator.NextCommandId();
+                        if (commandId == 0)
+                        {
+                            throw new InvalidOperationException("The discovery command ID generator returned zero.");
+                        }
+                        await transport.SendStatusRequestAsync(
+                            commandId,
+                            resolution.Address!,
+                            token).ConfigureAwait(false);
+                    }
                 }
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)

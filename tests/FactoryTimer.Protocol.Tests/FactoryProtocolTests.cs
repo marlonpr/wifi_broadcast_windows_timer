@@ -209,4 +209,16 @@ public sealed class FactoryProtocolTests
         Assert.IsFalse(FactoryProtocol.TryParseCommand(text, out _, out ProtocolParseError actual));
         Assert.AreEqual(expected, actual);
     }
+
+    [TestMethod]
+    public void ParsesRtcDisciplineStateFromExtendedStatus()
+    {
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(
+            "FCT2|STATUS|ESP02|0000000000000000|READY|20|-45|9|AA:BB:CC:DD:EE:FF|LOCKED",
+            out InboundPacket? packet,
+            out ProtocolParseError error));
+        Assert.AreEqual(ProtocolParseError.None, error);
+        StatusPacket status = (StatusPacket)packet!;
+        Assert.AreEqual(RtcDisciplineState.Locked, status.RtcState);
+    }
 }

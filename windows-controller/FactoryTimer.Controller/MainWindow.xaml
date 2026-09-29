@@ -173,6 +173,9 @@
                     <TextBlock Text="{Binding NetworkSummary}" TextWrapping="Wrap"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                     <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding ControllerTxTracePath}"
+                               TextWrapping="Wrap"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                 </StackPanel>
             </Border>
         </Grid>

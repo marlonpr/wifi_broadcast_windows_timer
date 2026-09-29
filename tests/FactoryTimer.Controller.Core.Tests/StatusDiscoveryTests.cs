@@ -315,4 +315,31 @@ public sealed class StatusDiscoveryTests
     }
 
     private sealed record SentDatagram(byte[] Bytes, IPEndPoint Destination);
+
+    [TestMethod]
+    public async Task ActiveRunTargetsUseUnicastInsteadOfBroadcast()
+    {
+        var transport = new RecordingStatusTransport();
+        var delay = new ControlledDiscoveryDelay();
+        using var discovery = new StatusDiscoveryService(
+            transport,
+            new SequenceCommandIdGenerator(901, 902),
+            delay);
+        ControllerNetworkInterface wifi = Interface(
+            "wifi", ControllerInterfaceType.Wifi, "Intel Wi-Fi", "192.168.0.50", 24);
+        IPAddress[] runTargets =
+        [
+            IPAddress.Parse("192.168.0.100"),
+            IPAddress.Parse("192.168.0.101"),
+        ];
+
+        discovery.StartOrRestart(wifi, () => null, () => runTargets);
+        await WaitUntilAsync(() => transport.Requests.Count == 2);
+
+        CollectionAssert.AreEqual(
+            runTargets,
+            transport.Requests.Select(request => request.Destination).ToArray());
+        Assert.IsFalse(transport.Requests.Any(request =>
+            request.Destination.Equals(IPAddress.Parse("192.168.0.255"))));
+    }
 }

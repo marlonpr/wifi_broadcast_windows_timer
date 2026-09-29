@@ -28,6 +28,16 @@ public enum AckResult
     Late,
 }
 
+public enum RtcDisciplineState
+{
+    Unknown,
+    Disabled,
+    Uninitialized,
+    Acquiring,
+    Locked,
+    Holdover,
+}
+
 public enum ProtocolParseError
 {
     None,
@@ -53,6 +63,7 @@ public enum ProtocolParseError
     Rssi,
     Channel,
     Bssid,
+    RtcDiscipline,
     Brightness,
 }
 
@@ -89,7 +100,8 @@ public sealed record StatusPacket(
     uint RemainingSeconds,
     int? RssiDbm = null,
     int? WifiChannel = null,
-    string? Bssid = null) : InboundPacket(DeviceId);
+    string? Bssid = null,
+    RtcDisciplineState RtcState = RtcDisciplineState.Unknown) : InboundPacket(DeviceId);
 
 public sealed record SyncReplyPacket(
     string DeviceId,
@@ -400,9 +412,11 @@ public static class FactoryProtocol
             return true;
         }
 
-        // Extended FCT2 STATUS adds Wi-Fi diagnostics while the legacy FCT1
-        // six-field packet remains accepted for backward compatibility.
-        if (fields.Length == 9 && fields[0] == Version2 && fields[1] == "STATUS")
+        // Extended FCT2 STATUS adds Wi-Fi diagnostics and, in current firmware,
+        // the RTC discipline state. The nine-field Wi-Fi-only form and legacy
+        // FCT1 packet remain accepted for backward compatibility.
+        if ((fields.Length == 9 || fields.Length == 10) &&
+            fields[0] == Version2 && fields[1] == "STATUS")
         {
             if (!ValidDeviceId(fields[2]))
             {
@@ -441,7 +455,14 @@ public static class FactoryProtocol
                 error = ProtocolParseError.Bssid;
                 return false;
             }
-            packet = new StatusPacket(fields[2], commandId, state, remaining, rssi, channel, fields[8]);
+            RtcDisciplineState rtcState = RtcDisciplineState.Unknown;
+            if (fields.Length == 10 && !TryRtcDisciplineState(fields[9], out rtcState))
+            {
+                error = ProtocolParseError.RtcDiscipline;
+                return false;
+            }
+            packet = new StatusPacket(
+                fields[2], commandId, state, remaining, rssi, channel, fields[8], rtcState);
             return true;
         }
 
@@ -610,6 +631,20 @@ public static class FactoryProtocol
     private static bool ValidDeviceId(string value) =>
         value is { Length: >= 1 and <= 16 } &&
         value.All(character => character is >= 'A' and <= 'Z' or >= '0' and <= '9' or '_' or '-');
+
+    private static bool TryRtcDisciplineState(string value, out RtcDisciplineState state)
+    {
+        state = value switch
+        {
+            "DISABLED" => RtcDisciplineState.Disabled,
+            "UNINITIALIZED" => RtcDisciplineState.Uninitialized,
+            "ACQUIRING" => RtcDisciplineState.Acquiring,
+            "LOCKED" => RtcDisciplineState.Locked,
+            "HOLDOVER" => RtcDisciplineState.Holdover,
+            _ => RtcDisciplineState.Unknown,
+        };
+        return state != RtcDisciplineState.Unknown;
+    }
 
     private static bool ValidBssid(string value)
     {

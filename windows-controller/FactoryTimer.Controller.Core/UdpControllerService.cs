@@ -18,6 +18,22 @@ public sealed class PacketReceivedEventArgs(
     public long MasterReceiveMicroseconds { get; } = masterReceiveMicroseconds;
 }
 
+public sealed class PacketSentEventArgs(
+    string packetType,
+    IPEndPoint destination,
+    long masterSendMicroseconds,
+    int datagramBytes,
+    int attempt,
+    ulong correlationId = 0) : EventArgs
+{
+    public string PacketType { get; } = packetType;
+    public IPEndPoint Destination { get; } = destination;
+    public long MasterSendMicroseconds { get; } = masterSendMicroseconds;
+    public int DatagramBytes { get; } = datagramBytes;
+    public int Attempt { get; } = attempt;
+    public ulong CorrelationId { get; } = correlationId;
+}
+
 public sealed record ReceivedSyncReply(
     SyncReplyPacket Packet,
     long MasterT4Microseconds,
@@ -129,6 +145,7 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
     }
 
     public event EventHandler<PacketReceivedEventArgs>? PacketReceived;
+    public event EventHandler<PacketSentEventArgs>? PacketSent;
     public event EventHandler<string>? ReceiveError;
 
     public ControllerNetworkInterface? Selection
@@ -236,13 +253,23 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         CommandPacket command,
         IPAddress broadcast,
         CancellationToken token = default) =>
-        SendRepeatedAsync(FactoryProtocol.SerializeCommandBytes(command), broadcast, token);
+        SendRepeatedAsync(
+            FactoryProtocol.SerializeCommandBytes(command),
+            broadcast,
+            command.CommandType.ToString().ToUpperInvariant(),
+            command.CommandId,
+            token);
 
     public Task SendCommandUnicastAsync(
         CommandPacket command,
         IPAddress destination,
         CancellationToken token = default) =>
-        SendRepeatedAsync(FactoryProtocol.SerializeCommandBytes(command), destination, token);
+        SendRepeatedAsync(
+            FactoryProtocol.SerializeCommandBytes(command),
+            destination,
+            command.CommandType.ToString().ToUpperInvariant(),
+            command.CommandId,
+            token);
 
     public async Task SendCommandUnicastOnceAsync(
         CommandPacket command,
@@ -251,10 +278,14 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
     {
         SocketSession activeSession = GetActiveSession();
         byte[] packet = FactoryProtocol.SerializeCommandBytes(command);
-        await activeSession.Socket.SendAsync(
+        await SendTracedAsync(
+            activeSession,
             packet,
             new IPEndPoint(destination, CommandPort),
-            token);
+            command.CommandType.ToString().ToUpperInvariant(),
+            command.CommandId,
+            attempt: 1,
+            cancellationToken: token);
     }
 
     private static async Task<long> WaitArtificialForwardDelayAsync(
@@ -325,10 +356,14 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
                     syncId,
                     masterT1Microseconds,
                     deviceToMasterArtificialDelayMicroseconds));
-            await activeSession.Socket.SendAsync(
+            await SendTracedAsync(
+                activeSession,
                 packet,
                 new IPEndPoint(destination, CommandPort),
-                cancellationToken);
+                "SYNC",
+                syncId,
+                attempt: 1,
+                cancellationToken: cancellationToken);
 
             using var timeoutSource = new CancellationTokenSource(timeout ?? DefaultSyncTimeout);
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
@@ -369,10 +404,14 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         try
         {
             byte[] packet = FactoryProtocol.SerializeSyncSetBytes(syncSet);
-            await activeSession.Socket.SendAsync(
+            await SendTracedAsync(
+                activeSession,
                 packet,
                 new IPEndPoint(destination, CommandPort),
-                cancellationToken);
+                "SYNC_SET",
+                syncSet.SyncId,
+                attempt: 1,
+                cancellationToken: cancellationToken);
 
             using var timeoutSource = new CancellationTokenSource(timeout ?? DefaultSyncTimeout);
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
@@ -401,27 +440,71 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         SocketSession activeSession = GetActiveSession();
         var command = new CommandPacket(CommandType.StatusRequest, commandId, 0, 0);
         byte[] packet = FactoryProtocol.SerializeCommandBytes(command);
-        await activeSession.Socket.SendAsync(
+        await SendTracedAsync(
+            activeSession,
             packet,
             new IPEndPoint(destination, CommandPort),
-            cancellationToken);
+            "STATUS_REQUEST",
+            commandId,
+            attempt: 1,
+            cancellationToken: cancellationToken);
     }
 
     private async Task SendRepeatedAsync(
         byte[] packet,
         IPAddress destinationAddress,
+        string packetType,
+        ulong correlationId,
         CancellationToken token)
     {
         SocketSession activeSession = GetActiveSession();
         var destination = new IPEndPoint(destinationAddress, CommandPort);
         for (int attempt = 0; attempt < 3; attempt++)
         {
-            await activeSession.Socket.SendAsync(packet, destination, token);
+            await SendTracedAsync(
+                activeSession,
+                packet,
+                destination,
+                packetType,
+                correlationId,
+                attempt + 1,
+                token);
             if (attempt < 2)
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(40), token);
             }
         }
+    }
+
+    private async ValueTask<int> SendTracedAsync(
+        SocketSession activeSession,
+        ReadOnlyMemory<byte> datagram,
+        IPEndPoint destination,
+        string packetType,
+        ulong correlationId,
+        int attempt,
+        CancellationToken cancellationToken)
+    {
+        // Timestamp immediately before handing the datagram to the socket. The
+        // trace handler runs only after SendAsync completes, so trace processing
+        // cannot move the timestamp itself. MainViewModel only enqueues this
+        // event in memory during a qualification run; file I/O is deferred.
+        long masterSendMicroseconds = MasterClock.NowMicroseconds;
+        int sent = await activeSession.Socket.SendAsync(
+            datagram,
+            destination,
+            cancellationToken);
+
+        PacketSent?.Invoke(
+            this,
+            new PacketSentEventArgs(
+                packetType,
+                destination,
+                masterSendMicroseconds,
+                sent,
+                attempt,
+                correlationId));
+        return sent;
     }
 
     private SocketSession GetActiveSession()

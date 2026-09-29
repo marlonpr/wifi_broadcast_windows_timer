@@ -524,4 +524,19 @@ public sealed class StartPreparationTests
             ReportedIpAddress: IPAddress.Parse("192.168.5.101"),
             ReportedState: TimerState.Ready,
             ReportedCommandId: 0);
+
+    [TestMethod]
+    public void GateRejectsParticipantWhoseRtcDisciplineIsNotLocked()
+    {
+        StartParticipantGateInput acquiring = Participant(
+            "ESP01", residualUs: 0, effectiveEpochUs: 10_000_000) with
+        {
+            ReportedRtcState = RtcDisciplineState.Acquiring,
+        };
+
+        StartGateResult result = StartReadinessGate.Evaluate([acquiring], Now, 20_000_000);
+
+        Assert.IsFalse(result.Accepted);
+        Assert.AreEqual(StartBlockReason.RtcNotLocked, result.Blocks.Single().Reason);
+    }
 }

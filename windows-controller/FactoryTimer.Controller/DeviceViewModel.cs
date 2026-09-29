@@ -134,7 +134,8 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
             session.Generation,
             session.IpAddress,
             session.TimerState,
-            session.CommandId);
+            session.CommandId,
+            session.RtcState);
     }
 
     public bool TryGetIpAddress(out IPAddress? address) =>

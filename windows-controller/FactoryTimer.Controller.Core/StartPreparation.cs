@@ -9,6 +9,7 @@ public enum StartBlockReason
     Offline,
     StatusStale,
     ParticipantBusy,
+    RtcNotLocked,
     SyncFailed,
     SyncInvalidated,
     TimingBudgetExceeded,
@@ -36,7 +37,8 @@ public sealed record StartParticipantGateInput(
     long CurrentSessionGeneration,
     IPAddress? ReportedIpAddress,
     TimerState? ReportedState,
-    ulong? ReportedCommandId);
+    ulong? ReportedCommandId,
+    RtcDisciplineState ReportedRtcState = RtcDisciplineState.Locked);
 
 public sealed record StartGateResult(
     bool Accepted,
@@ -110,6 +112,15 @@ public static class StartReadinessGate
                     StartBlockReason.ParticipantBusy,
                     participant.DeviceId,
                     "Wait for completion or use the normal manual RESET action."));
+                continue;
+            }
+
+            if (participant.ReportedRtcState != RtcDisciplineState.Locked)
+            {
+                blocks.Add(new StartBlock(
+                    StartBlockReason.RtcNotLocked,
+                    participant.DeviceId,
+                    $"RTC discipline is {participant.ReportedRtcState.ToString().ToUpperInvariant()}; wait for LOCKED before START."));
                 continue;
             }
 
@@ -241,6 +252,14 @@ public static class StartArmSessionGuard
                 "Device session changed during ARMING. Press START again.");
         }
 
+        if (current.RtcState != RtcDisciplineState.Locked)
+        {
+            return new StartBlock(
+                StartBlockReason.RtcNotLocked,
+                deviceId,
+                $"RTC discipline changed to {current.RtcState.ToString().ToUpperInvariant()} during ARMING; abort and wait for LOCKED.");
+        }
+
         if (current.TimerState is TimerState.Armed or TimerState.Running &&
             current.CommandId.HasValue &&
             current.CommandId.Value != preparedCommandId)
@@ -323,6 +342,14 @@ public static class StartFinalBarrier
                 StartBlockReason.SyncInvalidated,
                 deviceId,
                 "Device session changed before final ARM verification; press START again.");
+        }
+
+        if (current.RtcState != RtcDisciplineState.Locked)
+        {
+            return new StartBlock(
+                StartBlockReason.RtcNotLocked,
+                deviceId,
+                $"Final STATUS reports RTC discipline {current.RtcState.ToString().ToUpperInvariant()}; abort and wait for LOCKED.");
         }
 
         if (current.TimerState is TimerState.Armed &&
@@ -458,7 +485,8 @@ public sealed record ParticipantSessionSnapshot(
     TimerState? TimerState,
     ulong? CommandId,
     long? LastLocalTimestampMicroseconds,
-    bool DisconnectObserved);
+    bool DisconnectObserved,
+    RtcDisciplineState RtcState = RtcDisciplineState.Locked);
 
 public sealed class ParticipantSessionTracker
 {
@@ -471,6 +499,7 @@ public sealed class ParticipantSessionTracker
     private long? lastLocalTimestampMicroseconds;
     private bool disconnectObserved;
     private bool disconnectInferenceSuppressed;
+    private RtcDisciplineState rtcDisciplineState = RtcDisciplineState.Unknown;
 
     public ParticipantSessionSnapshot Snapshot
     {
@@ -485,7 +514,8 @@ public sealed class ParticipantSessionTracker
                     timerState,
                     commandId,
                     lastLocalTimestampMicroseconds,
-                    disconnectObserved);
+                    disconnectObserved,
+                    rtcDisciplineState);
             }
         }
     }
@@ -508,6 +538,7 @@ public sealed class ParticipantSessionTracker
             lastStatusAtUtc = observedAtUtc;
             timerState = status.State;
             commandId = status.CommandId;
+            rtcDisciplineState = status.RtcState;
         }
     }
 
@@ -567,6 +598,7 @@ public sealed class ParticipantSessionTracker
             timerState = null;
             commandId = null;
             lastLocalTimestampMicroseconds = null;
+            rtcDisciplineState = RtcDisciplineState.Unknown;
         }
     }
 }

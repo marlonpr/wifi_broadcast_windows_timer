@@ -35,6 +35,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private readonly ControllerClock clock = new();
     private readonly SemaphoreSlim sendLock = new(1, 1);
     private readonly ParticipantReservationManager reservationManager = new();
+    private readonly object controllerTxTraceGate = new();
+    private ControllerTxTraceSession? controllerTxTraceSession;
     private ArmAcknowledgementTracker? activeArmAcknowledgementTracker;
     private ResetAcknowledgementTracker? activeAbortResetAcknowledgementTracker;
     private IReadOnlyList<ControllerNetworkInterface> networkInterfaces = [];
@@ -65,6 +67,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private string benchmarkDiagnosticsCsvPath = "—";
     private string analyzerCsvPath = "—";
     private string analyzerStatus = "Disabled";
+    private string controllerTxTracePath = "TX trace: —";
     private string analyzerComPort = string.Empty;
     private bool analyzerEnabled;
     private double benchmarkTrialsInput = 10;
@@ -101,6 +104,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         uiTimer.Interval = TimeSpan.FromMilliseconds(100);
         uiTimer.Tick += UiTimer_Tick;
         udpService.PacketReceived += UdpService_PacketReceived;
+        udpService.PacketSent += UdpService_PacketSent;
         udpService.ReceiveError += UdpService_ReceiveError;
         statusDiscovery.DiscoveryError += StatusDiscovery_DiscoveryError;
         networkSelectionManager.StateChanged += NetworkSelectionManager_StateChanged;
@@ -211,6 +215,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     public string BenchmarkDiagnosticsCsvPath { get => benchmarkDiagnosticsCsvPath; private set => SetProperty(ref benchmarkDiagnosticsCsvPath, value); }
     public string AnalyzerCsvPath { get => analyzerCsvPath; private set => SetProperty(ref analyzerCsvPath, value); }
     public string AnalyzerStatus { get => analyzerStatus; private set => SetProperty(ref analyzerStatus, value); }
+    public string ControllerTxTracePath { get => controllerTxTracePath; private set => SetProperty(ref controllerTxTracePath, value); }
     public string AnalyzerComPort { get => analyzerComPort; set => SetProperty(ref analyzerComPort, value); }
     public bool AnalyzerEnabled
     {
@@ -347,7 +352,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 {
                     statusDiscovery.StartOrRestart(
                         SelectedNetworkInterface,
-                        () => Volatile.Read(ref manualBroadcastOverride));
+                        () => Volatile.Read(ref manualBroadcastOverride),
+                        GetRunStatusUnicastTargets);
                 }
 
                 StatusMessage =
@@ -2467,6 +2473,17 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     frozenParticipants);
                 preparedForAbort = prepared;
 
+                // Start a low-overhead in-memory TX trace before any START_AT
+                // arm traffic is sent. Every application UDP send is timestamped
+                // in the same QPC-derived master domain as T*. File I/O is
+                // deferred until after the countdown, so tracing does not move
+                // the packet timestamp or add disk latency to the send path.
+                BeginControllerTxTrace(
+                    prepared.CommandId,
+                    prepared.TargetMasterMicroseconds,
+                    prepared.DurationSeconds,
+                    prepared.Participants.Select(participant => participant.Address).ToArray());
+
                 var command = new CommandPacket(
                     CommandType.StartAt,
                     prepared.CommandId,
@@ -2595,6 +2612,14 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     StartBlockReason.ParticipantBusy,
                     device.DeviceId,
                     "Wait for completion or use the normal manual RESET action."));
+                continue;
+            }
+            if (session.RtcState != RtcDisciplineState.Locked)
+            {
+                blocks.Add(new StartBlock(
+                    StartBlockReason.RtcNotLocked,
+                    device.DeviceId,
+                    $"RTC discipline is {session.RtcState.ToString().ToUpperInvariant()}; wait for LOCKED before START."));
             }
         }
         return blocks;
@@ -2637,6 +2662,14 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     StartBlockReason.ParticipantBusy,
                     device.DeviceId,
                     "Wait for completion or use the normal manual RESET action."));
+                continue;
+            }
+            if (session.RtcState != RtcDisciplineState.Locked)
+            {
+                blocks.Add(new StartBlock(
+                    StartBlockReason.RtcNotLocked,
+                    device.DeviceId,
+                    $"RTC discipline is {session.RtcState.ToString().ToUpperInvariant()}; wait for LOCKED before START."));
                 continue;
             }
             if (!device.SynchronizationSessionGeneration.HasValue ||
@@ -3478,7 +3511,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     {
                         statusDiscovery.StartOrRestart(
                             selectedNetworkInterface,
-                            () => Volatile.Read(ref manualBroadcastOverride));
+                            () => Volatile.Read(ref manualBroadcastOverride),
+                            GetRunStatusUnicastTargets);
                     }
                 }
                 StatusMessage = state.Message;
@@ -3523,7 +3557,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             {
                 statusDiscovery.StartOrRestart(
                     selection,
-                    () => Volatile.Read(ref manualBroadcastOverride));
+                    () => Volatile.Read(ref manualBroadcastOverride),
+                    GetRunStatusUnicastTargets);
             }
         }
         finally
@@ -3552,6 +3587,148 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         CanSend = !isSending && manualStartAtSession is null &&
             SelectedNetworkInterface is not null && udpService.IsReady;
         RefreshManualStartAtButtonStates();
+    }
+
+    private IReadOnlyList<IPAddress>? GetRunStatusUnicastTargets()
+    {
+        lock (controllerTxTraceGate)
+        {
+            ControllerTxTraceSession? session = controllerTxTraceSession;
+            if (session is null || session.StatusUnicastTargets.Count == 0) return null;
+            return session.StatusUnicastTargets.ToArray();
+        }
+    }
+
+    private void BeginControllerTxTrace(
+        ulong commandId,
+        long targetMasterMicroseconds,
+        uint durationSeconds,
+        IReadOnlyList<IPAddress> statusUnicastTargets)
+    {
+        var session = new ControllerTxTraceSession(
+            commandId,
+            targetMasterMicroseconds,
+            durationSeconds,
+            statusUnicastTargets);
+
+        lock (controllerTxTraceGate)
+        {
+            controllerTxTraceSession = session;
+        }
+
+        ControllerTxTracePath = "TX trace: Capturing...";
+        _ = CompleteControllerTxTraceAfterRunAsync(session);
+    }
+
+    private void UdpService_PacketSent(object? sender, PacketSentEventArgs e)
+    {
+        lock (controllerTxTraceGate)
+        {
+            ControllerTxTraceSession? session = controllerTxTraceSession;
+            if (session is null) return;
+
+            long deltaUs = e.MasterSendMicroseconds - session.TargetMasterMicroseconds;
+            long phaseUs = PositiveModulo(deltaUs, 1_000_000L);
+            long leadToNextBoundaryUs = phaseUs == 0 ? 0 : 1_000_000L - phaseUs;
+
+            session.Rows.Add(new ControllerTxTraceRow(
+                e.MasterSendMicroseconds,
+                deltaUs,
+                phaseUs,
+                leadToNextBoundaryUs,
+                e.PacketType,
+                e.Destination.ToString(),
+                e.Attempt,
+                e.DatagramBytes,
+                e.CorrelationId));
+        }
+    }
+
+    private async Task CompleteControllerTxTraceAfterRunAsync(
+        ControllerTxTraceSession session)
+    {
+        try
+        {
+            long captureEndUs = checked(
+                session.TargetMasterMicroseconds +
+                (long)session.DurationSeconds * 1_000_000L +
+                2_000_000L);
+            await WaitUntilMasterTimeAsync(captureEndUs, CancellationToken.None)
+                .ConfigureAwait(false);
+
+            ControllerTxTraceRow[] rows;
+            lock (controllerTxTraceGate)
+            {
+                if (!ReferenceEquals(controllerTxTraceSession, session)) return;
+                controllerTxTraceSession = null;
+                rows = session.Rows.ToArray();
+            }
+
+            string path = await WriteControllerTxTraceCsvAsync(session, rows)
+                .ConfigureAwait(false);
+            dispatcherQueue.TryEnqueue(() =>
+            {
+                ControllerTxTracePath = $"TX trace: {path}";
+                StatusMessage = $"Controller TX timing trace saved: {path}";
+            });
+        }
+        catch (Exception exception)
+        {
+            dispatcherQueue.TryEnqueue(() =>
+            {
+                ControllerTxTracePath = $"TX trace save failed: {exception.Message}";
+            });
+        }
+    }
+
+    private static async Task<string> WriteControllerTxTraceCsvAsync(
+        ControllerTxTraceSession session,
+        IReadOnlyList<ControllerTxTraceRow> rows)
+    {
+        string documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        if (string.IsNullOrWhiteSpace(documents))
+        {
+            documents = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        }
+
+        string directory = Path.Combine(documents, "FactoryTimer", "TimingQualification");
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(
+            directory,
+            $"controller_tx_{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}_{session.CommandId:X16}.csv");
+
+        var builder = new StringBuilder();
+        builder.AppendLine(
+            "RunCommandId,TStarMasterUs,DurationSeconds,PacketMasterUs,DeltaFromTStarUs,PhaseUs,LeadToNextBoundaryUs,PacketType,Destination,Attempt,Bytes,CorrelationId");
+
+        foreach (ControllerTxTraceRow row in rows)
+        {
+            builder.Append(session.CommandId.ToString("X16")).Append(',')
+                .Append(session.TargetMasterMicroseconds).Append(',')
+                .Append(session.DurationSeconds).Append(',')
+                .Append(row.MasterSendMicroseconds).Append(',')
+                .Append(row.DeltaFromTStarMicroseconds).Append(',')
+                .Append(row.PhaseMicroseconds).Append(',')
+                .Append(row.LeadToNextBoundaryMicroseconds).Append(',')
+                .Append(row.PacketType).Append(',')
+                .Append(row.Destination).Append(',')
+                .Append(row.Attempt).Append(',')
+                .Append(row.DatagramBytes).Append(',')
+                .Append(row.CorrelationId.ToString("X16"))
+                .AppendLine();
+        }
+
+        await File.WriteAllTextAsync(
+            path,
+            builder.ToString(),
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)).ConfigureAwait(false);
+        return path;
+    }
+
+    private static long PositiveModulo(long value, long modulus)
+    {
+        long remainder = value % modulus;
+        return remainder < 0 ? remainder + modulus : remainder;
     }
 
     private void UdpService_PacketReceived(object? sender, PacketReceivedEventArgs e)
@@ -3687,6 +3864,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         statusDiscovery.Dispose();
         networkSelectionManager.StateChanged -= NetworkSelectionManager_StateChanged;
         networkSelectionManager.Dispose();
+        udpService.PacketSent -= UdpService_PacketSent;
         udpService.Dispose();
         sendLock.Dispose();
         GC.SuppressFinalize(this);
@@ -3706,6 +3884,31 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private sealed record StartTelemetryContext(
         ulong CommandId,
         IReadOnlyList<DeviceViewModel> Participants);
+
+    private sealed class ControllerTxTraceSession(
+        ulong commandId,
+        long targetMasterMicroseconds,
+        uint durationSeconds,
+        IReadOnlyList<IPAddress> statusUnicastTargets)
+    {
+        public ulong CommandId { get; } = commandId;
+        public long TargetMasterMicroseconds { get; } = targetMasterMicroseconds;
+        public uint DurationSeconds { get; } = durationSeconds;
+        public IReadOnlyList<IPAddress> StatusUnicastTargets { get; } =
+            statusUnicastTargets.Distinct().ToArray();
+        public List<ControllerTxTraceRow> Rows { get; } = [];
+    }
+
+    private sealed record ControllerTxTraceRow(
+        long MasterSendMicroseconds,
+        long DeltaFromTStarMicroseconds,
+        long PhaseMicroseconds,
+        long LeadToNextBoundaryMicroseconds,
+        string PacketType,
+        string Destination,
+        int Attempt,
+        int DatagramBytes,
+        ulong CorrelationId);
 
     private sealed class ManualStartAtSession : IDisposable
     {
