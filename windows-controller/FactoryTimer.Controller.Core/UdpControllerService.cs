@@ -450,6 +450,26 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
             cancellationToken: cancellationToken);
     }
 
+    public async Task SendTaggedStatusRequestAsync(
+        ulong commandId,
+        IPAddress destination,
+        string tracePacketType,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tracePacketType);
+        SocketSession activeSession = GetActiveSession();
+        var command = new CommandPacket(CommandType.StatusRequest, commandId, 0, 0);
+        byte[] packet = FactoryProtocol.SerializeCommandBytes(command);
+        await SendTracedAsync(
+            activeSession,
+            packet,
+            new IPEndPoint(destination, CommandPort),
+            tracePacketType,
+            commandId,
+            attempt: 1,
+            cancellationToken: cancellationToken);
+    }
+
     private async Task SendRepeatedAsync(
         byte[] packet,
         IPAddress destinationAddress,

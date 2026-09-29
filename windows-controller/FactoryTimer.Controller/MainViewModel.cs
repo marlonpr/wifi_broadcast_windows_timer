@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 using System.Text;
 using FactoryTimer.Controller.Core;
 using FactoryTimer.Protocol;
@@ -10,6 +11,12 @@ namespace FactoryTimer.Controller;
 
 internal sealed class MainViewModel : ObservableObject, IDisposable
 {
+    [DllImport("winmm.dll", ExactSpelling = true)]
+    private static extern uint timeBeginPeriod(uint uPeriod);
+
+    [DllImport("winmm.dll", ExactSpelling = true)]
+    private static extern uint timeEndPeriod(uint uPeriod);
+
     private const int StartLeadTimeMilliseconds = 2000; // benchmark only
     private const long ProductionStartLeadMicroseconds = 5_000_000;
     private const int ArmRetryIntervalMilliseconds = 80;
@@ -27,6 +34,15 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private const int MaxSynchronizationAttempts = 5;
     private const int SynchronizationRetryQuietMilliseconds = 150;
     private const int StatusDiscoveryDrainMilliseconds = 100;
+    // Bench-only STATUS lead sweep. Desired leads are arrival leads at the ESP32,
+    // not controller-send leads. Negative values target arrivals just after the boundary.
+    private static readonly long[] StatusSweepTargetRxLeadMicroseconds =
+        [6_000, 5_500, 5_000, 4_500, 4_000, 3_500, 3_000, 2_500, 2_000, 1_500,
+         1_000, 500, 200, 0, -200, -500, -800, -1_000, -1_500, -2_000];
+    private const long StatusSweepDefaultTransitMicroseconds = 2_500;
+    private const long StatusSweepEsp01TransitMicroseconds = 2_558;
+    private const long StatusSweepEsp02TransitMicroseconds = 2_344;
+    private const long StatusSweepSpinWindowMicroseconds = 20_000;
     private readonly DispatcherQueue dispatcherQueue;
     private readonly DispatcherQueueTimer uiTimer;
     private readonly UdpControllerService udpService;
@@ -37,6 +53,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private readonly ParticipantReservationManager reservationManager = new();
     private readonly object controllerTxTraceGate = new();
     private ControllerTxTraceSession? controllerTxTraceSession;
+    private CancellationTokenSource? statusLeadSweepCancellation;
+    private Task statusLeadSweepTask = Task.CompletedTask;
     private ArmAcknowledgementTracker? activeArmAcknowledgementTracker;
     private ResetAcknowledgementTracker? activeAbortResetAcknowledgementTracker;
     private IReadOnlyList<ControllerNetworkInterface> networkInterfaces = [];
@@ -2518,6 +2536,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     return;
                 }
 
+                await StartStatusLeadSweepAsync(prepared, CancellationToken.None);
+
                 preparedForAbort = null;
                 productionStartTelemetryContext = new StartTelemetryContext(
                     prepared.CommandId,
@@ -3567,6 +3587,150 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    private static long EstimatedStatusTransitMicroseconds(string deviceId) =>
+        deviceId switch
+        {
+            "ESP01" => StatusSweepEsp01TransitMicroseconds,
+            "ESP02" => StatusSweepEsp02TransitMicroseconds,
+            _ => StatusSweepDefaultTransitMicroseconds,
+        };
+
+    private async Task StartStatusLeadSweepAsync(
+        PreparedStartRun prepared,
+        CancellationToken cancellationToken)
+    {
+        statusLeadSweepCancellation?.Cancel();
+        statusLeadSweepCancellation?.Dispose();
+        statusLeadSweepCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        CancellationToken token = statusLeadSweepCancellation.Token;
+
+        // Final ARM verification has completed by the time this is called. Stop
+        // ordinary discovery so the only application STATUS_REQUEST traffic during
+        // the diagnostic run is the explicitly scheduled lead sweep.
+        await statusDiscovery.StopAndWaitAsync();
+        await Task.Delay(StatusDiscoveryDrainMilliseconds, token);
+
+        statusLeadSweepTask = RunStatusLeadSweepAsync(prepared, token);
+        _ = statusLeadSweepTask;
+    }
+
+    private async Task RunStatusLeadSweepAsync(
+        PreparedStartRun prepared,
+        CancellationToken cancellationToken)
+    {
+        bool oneMillisecondTimerPeriod = timeBeginPeriod(1) == 0;
+        try
+        {
+            var events = new List<StatusSweepEvent>();
+            int boundaries = Math.Min(
+                (int)prepared.DurationSeconds,
+                StatusSweepTargetRxLeadMicroseconds.Length);
+
+            foreach (PreparedParticipant participant in prepared.Participants)
+            {
+                long transitUs = EstimatedStatusTransitMicroseconds(participant.Device.DeviceId);
+                for (int index = 0; index < boundaries; ++index)
+                {
+                    int boundary = index + 1;
+                    long targetRxLeadUs = StatusSweepTargetRxLeadMicroseconds[index];
+                    long boundaryMasterUs = checked(
+                        prepared.TargetMasterMicroseconds + boundary * 1_000_000L);
+                    long sendMasterUs = checked(
+                        boundaryMasterUs - targetRxLeadUs - transitUs);
+                    events.Add(new StatusSweepEvent(
+                        sendMasterUs,
+                        boundary,
+                        targetRxLeadUs,
+                        participant));
+                }
+            }
+
+            foreach (StatusSweepEvent sweepEvent in events.OrderBy(e => e.SendMasterMicroseconds))
+            {
+                await WaitUntilMasterTimePreciselyAsync(
+                    sweepEvent.SendMasterMicroseconds,
+                    cancellationToken).ConfigureAwait(false);
+
+                string tag = FormattableString.Invariant(
+                    $"STATUS_SWEEP_B{sweepEvent.Boundary:00}_TARGET_RX_LEAD_{sweepEvent.TargetRxLeadMicroseconds}");
+                await udpService.SendTaggedStatusRequestAsync(
+                    CreateCommandId(),
+                    sweepEvent.Participant.Address,
+                    tag,
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            long runEndUs = checked(
+                prepared.TargetMasterMicroseconds +
+                (long)prepared.DurationSeconds * 1_000_000L +
+                500_000L);
+            await WaitUntilMasterTimePreciselyAsync(runEndUs, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            dispatcherQueue.TryEnqueue(() =>
+            {
+                StatusMessage = $"STATUS lead sweep failed: {exception.Message}";
+            });
+        }
+        finally
+        {
+            if (oneMillisecondTimerPeriod)
+            {
+                _ = timeEndPeriod(1);
+            }
+            ControllerNetworkInterface? selection = SelectedNetworkInterface;
+            if (!disposed && selection is not null && udpService.IsReady)
+            {
+                statusDiscovery.StartOrRestart(
+                    selection,
+                    () => Volatile.Read(ref manualBroadcastOverride),
+                    GetRunStatusUnicastTargets);
+            }
+        }
+    }
+
+    private static async Task WaitUntilMasterTimePreciselyAsync(
+        long targetMasterMicroseconds,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            long remainingUs = targetMasterMicroseconds - MasterClock.NowMicroseconds;
+            if (remainingUs <= 0) return;
+
+            if (remainingUs > StatusSweepSpinWindowMicroseconds)
+            {
+                int delayMs = (int)Math.Max(
+                    1L,
+                    (remainingUs - StatusSweepSpinWindowMicroseconds) / 1000L);
+                await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            // QPC-backed MasterClock spin for the final <=20 ms. This deliberately absorbs
+            // the default Windows scheduler/timer granularity seen in the first sweep. No file I/O or UI
+            // work occurs here; SendTracedAsync timestamps immediately before SendAsync.
+            while (MasterClock.NowMicroseconds < targetMasterMicroseconds)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Thread.SpinWait(32);
+            }
+            return;
+        }
+    }
+
+    private sealed record StatusSweepEvent(
+        long SendMasterMicroseconds,
+        int Boundary,
+        long TargetRxLeadMicroseconds,
+        PreparedParticipant Participant);
+
     private void RefreshNetworkDetails()
     {
         ControllerNetworkInterface? selection = SelectedNetworkInterface;
@@ -3854,6 +4018,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         benchmarkCancellation?.Cancel();
         benchmarkCancellation?.Dispose();
         benchmarkCancellation = null;
+        statusLeadSweepCancellation?.Cancel();
+        statusLeadSweepCancellation?.Dispose();
+        statusLeadSweepCancellation = null;
         ManualStartAtSession? manualSession = manualStartAtSession;
         manualStartAtSession = null;
         Volatile.Write(ref activeArmAcknowledgementTracker, null);
