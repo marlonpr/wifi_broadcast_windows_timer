@@ -78,6 +78,11 @@ public sealed class FactoryProtocolTests
             FactoryProtocol.SerializeSyncSet(
                 new SyncSetPacket(0x0123456789abcdef, 60_001, 10_000)));
 
+        Assert.AreEqual(
+            "FCT2|SYNC_SET|0123456789ABCDEF|60001|10000|7654321",
+            FactoryProtocol.SerializeSyncSet(
+                new SyncSetPacket(0x0123456789abcdef, 60_001, 10_000, 7_654_321)));
+
         Assert.IsTrue(FactoryProtocol.TryParseInbound(
             "FCT2|SYNC_REPLY|ESP01|0123456789ABCDEF|100000|40004|40006",
             out InboundPacket? reply,
@@ -95,12 +100,28 @@ public sealed class FactoryProtocolTests
             delayedReply);
 
         Assert.IsTrue(FactoryProtocol.TryParseInbound(
+            "FCT2|SYNC_REPLY|ESP02|0123456789ABCDEF|100000|40004|40006|0|39950",
+            out InboundPacket? ingressReply,
+            out _));
+        Assert.AreEqual(
+            new SyncReplyPacket("ESP02", 0x0123456789abcdef, 100_000, 40_004, 40_006, 0, 39_950),
+            ingressReply);
+
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(
             "FCT2|SYNC_APPLIED|ESP01|0123456789ABCDEF|60001|10000",
             out InboundPacket? applied,
             out _));
         Assert.AreEqual(
             new SyncAppliedPacket("ESP01", 0x0123456789abcdef, 60_001, 10_000),
             applied);
+
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(
+            "FCT2|SYNC_APPLIED|ESP01|0123456789ABCDEF|60001|10000|7654321",
+            out InboundPacket? appliedWithEpoch,
+            out _));
+        Assert.AreEqual(
+            new SyncAppliedPacket("ESP01", 0x0123456789abcdef, 60_001, 10_000, 7_654_321),
+            appliedWithEpoch);
 
         Assert.IsTrue(FactoryProtocol.TryParseInbound(
             "FCT2|STARTED|ESP01|1111222233334444|2000000|5000002|5000000",

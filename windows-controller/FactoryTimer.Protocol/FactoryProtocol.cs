@@ -87,7 +87,8 @@ public sealed record SyncRequestPacket(
 public sealed record SyncSetPacket(
     ulong SyncId,
     long MasterMinusLocalOffsetMicroseconds,
-    long BestRttMicroseconds);
+    long BestRttMicroseconds,
+    long OffsetEpochLocalMicroseconds = 0);
 
 public abstract record InboundPacket(string DeviceId);
 
@@ -117,13 +118,15 @@ public sealed record SyncReplyPacket(
     long MasterT1Microseconds,
     long LocalT2Microseconds,
     long LocalT3Microseconds,
-    uint ActualArtificialReplyDelayMicroseconds = 0) : InboundPacket(DeviceId);
+    uint ActualArtificialReplyDelayMicroseconds = 0,
+    long IngressLocalMicroseconds = 0) : InboundPacket(DeviceId);
 
 public sealed record SyncAppliedPacket(
     string DeviceId,
     ulong SyncId,
     long MasterMinusLocalOffsetMicroseconds,
-    long BestRttMicroseconds) : InboundPacket(DeviceId);
+    long BestRttMicroseconds,
+    long OffsetEpochLocalMicroseconds = 0) : InboundPacket(DeviceId);
 public sealed record StartedPacket(
     string DeviceId,
     ulong CommandId,
@@ -191,8 +194,12 @@ public static class FactoryProtocol
     {
         if (packet.SyncId == 0) throw new ArgumentOutOfRangeException(nameof(packet));
         if (packet.BestRttMicroseconds < 0) throw new ArgumentOutOfRangeException(nameof(packet));
-        return FormattableString.Invariant(
-            $"{Version2}|SYNC_SET|{packet.SyncId:X16}|{packet.MasterMinusLocalOffsetMicroseconds}|{packet.BestRttMicroseconds}");
+        if (packet.OffsetEpochLocalMicroseconds < 0) throw new ArgumentOutOfRangeException(nameof(packet));
+        return packet.OffsetEpochLocalMicroseconds > 0
+            ? FormattableString.Invariant(
+                $"{Version2}|SYNC_SET|{packet.SyncId:X16}|{packet.MasterMinusLocalOffsetMicroseconds}|{packet.BestRttMicroseconds}|{packet.OffsetEpochLocalMicroseconds}")
+            : FormattableString.Invariant(
+                $"{Version2}|SYNC_SET|{packet.SyncId:X16}|{packet.MasterMinusLocalOffsetMicroseconds}|{packet.BestRttMicroseconds}");
     }
 
     public static byte[] SerializeSyncSetBytes(SyncSetPacket packet) =>
@@ -322,10 +329,10 @@ public static class FactoryProtocol
 
         if (fields.Length >= 2 && fields[0] == Version2 && fields[1] == "SYNC_REPLY")
         {
-            // Seven fields are the original v2 reply. The optional eighth field
-            // reports the reverse-path diagnostic delay actually achieved by
-            // the device, measured with esp_timer_get_time().
-            if (fields.Length is not (7 or 8))
+            // Legacy forms have 7 fields (no reverse-hold diagnostic) or 8 fields
+            // (reverse-hold only). v6.22 appends the earliest matched device ingress
+            // timestamp as field 9; an optional S3 die-temperature field may follow.
+            if (fields.Length is not (7 or 8 or 9 or 10))
             {
                 error = ProtocolParseError.FieldCount;
                 return false;
@@ -349,14 +356,23 @@ public static class FactoryProtocol
             }
 
             uint actualReplyDelayUs = 0;
-            if (fields.Length == 8 &&
+            if (fields.Length >= 8 &&
                 !uint.TryParse(fields[7], NumberStyles.None, CultureInfo.InvariantCulture, out actualReplyDelayUs))
             {
                 error = ProtocolParseError.Timestamp;
                 return false;
             }
 
-            packet = new SyncReplyPacket(fields[2], syncId, t1, t2, t3, actualReplyDelayUs);
+            long ingressLocalUs = 0;
+            if (fields.Length >= 9 &&
+                !TryLong(fields[8], nonnegative: true, out ingressLocalUs))
+            {
+                error = ProtocolParseError.Timestamp;
+                return false;
+            }
+
+            packet = new SyncReplyPacket(
+                fields[2], syncId, t1, t2, t3, actualReplyDelayUs, ingressLocalUs);
             return true;
         }
 
@@ -391,7 +407,7 @@ public static class FactoryProtocol
 
         if (fields.Length >= 2 && fields[0] == Version2 && fields[1] == "SYNC_APPLIED")
         {
-            if (fields.Length != 6)
+            if (fields.Length is not (6 or 7))
             {
                 error = ProtocolParseError.FieldCount;
                 return false;
@@ -416,7 +432,15 @@ public static class FactoryProtocol
                 error = ProtocolParseError.Rtt;
                 return false;
             }
-            packet = new SyncAppliedPacket(fields[2], syncId, offset, rtt);
+            long offsetEpochLocalUs = 0;
+            if (fields.Length == 7 &&
+                !TryLong(fields[6], nonnegative: true, out offsetEpochLocalUs))
+            {
+                error = ProtocolParseError.Timestamp;
+                return false;
+            }
+            packet = new SyncAppliedPacket(
+                fields[2], syncId, offset, rtt, offsetEpochLocalUs);
             return true;
         }
 

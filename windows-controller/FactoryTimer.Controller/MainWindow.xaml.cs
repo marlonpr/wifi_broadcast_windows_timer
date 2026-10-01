@@ -43,6 +43,9 @@ public sealed partial class MainWindow : Window
 
     private async void Start_Click(object sender, RoutedEventArgs e) => await viewModel.SendStartAsync();
 
+    private async void StartDegraded_Click(object sender, RoutedEventArgs e) =>
+        await viewModel.SendDegradedStartAsync();
+
     private async void PrepareManualStartAt_Click(object sender, RoutedEventArgs e) =>
         await viewModel.PrepareManualStartAtTestAsync();
 

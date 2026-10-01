@@ -58,6 +58,9 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
     private readonly ParticipantSessionTracker sessionTracker = new();
     private long? effectiveSyncEpochMasterMicroseconds;
     private long? synchronizationSessionGeneration;
+    private long? synchronizationUncertaintyMicroseconds;
+    private long? forwardTop3SpreadMicroseconds;
+    private bool synchronizationDegraded;
 
     public string DeviceId { get; } = deviceId;
     public string DisplayName { get; } = BuildDisplayName(deviceId);
@@ -104,6 +107,9 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
     public bool IsSynchronized => synchronizationAccepted;
     public long? EffectiveSyncEpochMasterMicroseconds => effectiveSyncEpochMasterMicroseconds;
     public long? SynchronizationSessionGeneration => synchronizationSessionGeneration;
+    public long? SynchronizationUncertaintyMicroseconds => synchronizationUncertaintyMicroseconds;
+    public long? ForwardTop3SpreadMicroseconds => forwardTop3SpreadMicroseconds;
+    public bool SynchronizationDegraded => synchronizationDegraded;
     public ParticipantSessionSnapshot SessionSnapshot => sessionTracker.Snapshot;
 
 
@@ -143,7 +149,8 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
             session.RtcFitPoints,
             session.RtcFitRmsMicroseconds,
             session.RtcQueueDrops,
-            session.RtcTemperatureValid);
+            session.RtcTemperatureValid,
+            synchronizationUncertaintyMicroseconds);
     }
 
     public bool TryGetIpAddress(out IPAddress? address) =>
@@ -293,6 +300,9 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         verificationOffsetMicroseconds = null;
         effectiveSyncEpochMasterMicroseconds = null;
         synchronizationSessionGeneration = null;
+        synchronizationUncertaintyMicroseconds = null;
+        forwardTop3SpreadMicroseconds = null;
+        synchronizationDegraded = false;
         ClockError = "—";
         BestRtt = "—";
         VerificationRtt = "—";
@@ -307,6 +317,7 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         syncAttemptCount = attempt;
         syncQualityAccepted = false;
         synchronizationAccepted = false;
+        synchronizationDegraded = false;
         SynchronizationState = "SYNC ERROR";
         SynchronizationQuality = $"ERROR {attempt}/{maxAttempts}: {failureKind}";
         OnPropertyChanged(nameof(IsSynchronized));
@@ -325,7 +336,10 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         long effectiveSyncEpochMicroseconds,
         int attempt,
         int maxAttempts,
-        bool accepted)
+        bool accepted,
+        long? measuredUncertaintyMicroseconds = null,
+        long? measuredForwardTop3SpreadMicroseconds = null,
+        bool degraded = false)
     {
         residualErrorMicroseconds = residualMicroseconds;
         this.verificationOffsetMicroseconds = verificationOffsetMicroseconds;
@@ -341,10 +355,17 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         syncAttemptCount = attempt;
         syncQualityAccepted = accepted;
         synchronizationAccepted = accepted;
+        synchronizationUncertaintyMicroseconds = measuredUncertaintyMicroseconds ?? Math.Abs(residualMicroseconds);
+        forwardTop3SpreadMicroseconds = measuredForwardTop3SpreadMicroseconds;
+        synchronizationDegraded = accepted && degraded;
 
-        SynchronizationState = accepted ? "SYNCED" : "QUALITY RETRY";
+        SynchronizationState = accepted
+            ? (degraded ? "SYNCED DEGRADED" : "SYNCED")
+            : "QUALITY RETRY";
         SynchronizationQuality = accepted
-            ? $"PASS {attempt}/{maxAttempts}; deviation {FormatSignedMilliseconds(qualityDeviationMicroseconds)}"
+            ? (degraded
+                ? $"DEGRADED {attempt}/{maxAttempts}; uncertainty ±{synchronizationUncertaintyMicroseconds} µs"
+                : $"PASS {attempt}/{maxAttempts}; deviation {FormatSignedMilliseconds(qualityDeviationMicroseconds)}")
             : $"RETRY {attempt}/{maxAttempts}; deviation {FormatSignedMilliseconds(qualityDeviationMicroseconds)}";
         ClockError = FormatSignedMilliseconds(residualMicroseconds);
         BestRtt = FormatMilliseconds(bestRttMicroseconds);
@@ -366,6 +387,9 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
     {
         synchronizationAccepted = false;
         syncQualityAccepted = false;
+        synchronizationDegraded = false;
+        synchronizationUncertaintyMicroseconds = null;
+        forwardTop3SpreadMicroseconds = null;
         SynchronizationState = "QUALITY FAILED";
         SynchronizationQuality =
             syncQualityDeviationMicroseconds.HasValue
@@ -383,6 +407,9 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         verificationOffsetMicroseconds = null;
         effectiveSyncEpochMasterMicroseconds = null;
         synchronizationSessionGeneration = null;
+        synchronizationUncertaintyMicroseconds = null;
+        forwardTop3SpreadMicroseconds = null;
+        synchronizationDegraded = false;
         appliedOffsetMicroseconds = null;
         bestRttMicroseconds = null;
         verificationRttMicroseconds = null;

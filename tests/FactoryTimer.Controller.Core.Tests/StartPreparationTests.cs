@@ -117,6 +117,32 @@ public sealed class StartPreparationTests
     }
 
     [TestMethod]
+    public void ExplicitSynchronizationUncertaintyFeedsTwentyMillisecondGate()
+    {
+        StartParticipantGateInput a = Participant(
+            "ESP01", residualUs: 100, effectiveEpochUs: 20_000_000) with
+        {
+            SynchronizationUncertaintyMicroseconds = 12_000,
+        };
+        StartParticipantGateInput b = Participant(
+            "ESP02", residualUs: 100, effectiveEpochUs: 20_000_000) with
+        {
+            SynchronizationUncertaintyMicroseconds = 8_001,
+        };
+
+        StartGateResult result = StartReadinessGate.Evaluate(
+            [a, b],
+            Now,
+            targetMasterMicroseconds: 20_000_000);
+
+        Assert.IsFalse(result.Accepted);
+        Assert.AreEqual(StartBlockReason.TimingBudgetExceeded, result.Blocks.Single().Reason);
+        Assert.AreEqual(20_001L, result.WorstPairStartUncertaintyMicroseconds);
+        Assert.AreEqual(12_000L, result.StartUncertaintyMicrosecondsByDevice["ESP01"]);
+        Assert.AreEqual(8_001L, result.StartUncertaintyMicrosecondsByDevice["ESP02"]);
+    }
+
+    [TestMethod]
     public void CountdownDurationIsNotPartOfReadinessGate()
     {
         // The readiness API has no duration input. A synchronization that is

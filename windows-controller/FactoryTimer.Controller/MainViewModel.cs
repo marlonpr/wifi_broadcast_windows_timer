@@ -25,7 +25,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private static readonly TimeSpan RtcQualificationWaitTimeout = TimeSpan.FromSeconds(90);
     private static readonly TimeSpan RtcQualificationObservationInterval = TimeSpan.FromMilliseconds(500);
     private const int ConsensusLowRttSampleCount = 3;
-    private const long SyncQualityThresholdMicroseconds = 3_000;
+    private const long SyncQualityThresholdMicroseconds = 3_000; // legacy/manual diagnostics only
+    private const long ForwardTop3SpreadRetryLimitMicroseconds = 150;
+    private const long ForwardCalibrationVerificationDeltaRetryLimitMicroseconds = 500;
+    private const int ForwardRoundRobinInterDeviceDelayMilliseconds = 2;
     private const int MaxSynchronizationAttempts = 5;
     private const int SynchronizationRetryQuietMilliseconds = 150;
     private const int StatusDiscoveryDrainMilliseconds = 100;
@@ -44,6 +47,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private Task productionSilentRunTask = Task.CompletedTask;
     private bool productionSilentRunActive;
     private bool productionSilentRunOwnsExactWindow;
+    private bool degradedStartPending;
+    private string degradedStartParticipantKey = string.Empty;
+    private bool allowDegradedSyncStartOnce;
     private ArmAcknowledgementTracker? activeArmAcknowledgementTracker;
     private ResetAcknowledgementTracker? activeAbortResetAcknowledgementTracker;
     private IReadOnlyList<ControllerNetworkInterface> networkInterfaces = [];
@@ -57,7 +63,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private string controllerState = "READY";
     private string masterTime = "0 µs";
     private string synchronizationResolution = "Not measured";
-    private string startSynchronizationResult = "Not measured";
+    private string startSynchronizationResult = "Ready — press START to check all start requirements.";
     private string staggeredTestResult = "Not prepared";
     private string manualStartAtCountdown = "Not prepared";
     private ManualStartAtSession? manualStartAtSession;
@@ -82,6 +88,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private int syncPathDelayTargetIndex = 1; // ESP02 remains the default experiment target.
     private int syncSamplingModeIndex;
     private int receiveTimestampModeIndex = (int)UdpReceiveTimestampMode.DedicatedBlockingThread;
+    private int productionSyncOrderModeIndex;
+    private int productionSyncSeriesCompletedStarts;
     private bool canSend;
     private bool isSending;
     private bool isBenchmarkRunning;
@@ -239,6 +247,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     }
     public double BenchmarkTrialsInput { get => benchmarkTrialsInput; set => SetProperty(ref benchmarkTrialsInput, value); }
     public bool CanSend { get => canSend; private set => SetProperty(ref canSend, value); }
+    public bool CanStartDegraded => degradedStartPending && CanSend;
     public bool IsBenchmarkRunning
     {
         get => isBenchmarkRunning;
@@ -331,6 +340,35 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    public int ProductionSyncOrderModeIndex
+    {
+        get => productionSyncOrderModeIndex;
+        set
+        {
+            int clamped = Math.Clamp(value, 0, 2);
+            if (!SetProperty(ref productionSyncOrderModeIndex, clamped)) return;
+            productionSyncSeriesCompletedStarts = 0;
+            OnPropertyChanged(nameof(ProductionSyncOrderDescription));
+            StatusMessage = clamped switch
+            {
+                0 => "Round-robin sync base order: normal. The first device rotates every round.",
+                1 => "Round-robin sync base order: reverse. The first device rotates every round.",
+                2 => "Round-robin diagnostic series enabled: successful STARTs alternate the base order; every round still rotates its first device.",
+                _ => "Round-robin sync base order updated.",
+            };
+        }
+    }
+
+    public string ProductionSyncOrderDescription => ProductionSyncOrderModeIndex switch
+    {
+        0 => "Normal base order; each of the 16 production sync rounds rotates the first device.",
+        1 => "Reverse base order; each of the 16 production sync rounds rotates the first device.",
+        2 => $"Alternate diagnostic: next successful run #{productionSyncSeriesCompletedStarts + 1} uses " +
+             (((productionSyncSeriesCompletedStarts + 1) & 1) == 1 ? "NORMAL" : "REVERSE") +
+             " as the base order. Each round rotates the first device; counter advances only after a successful production START.",
+        _ => string.Empty,
+    };
+
     public int ReceiveTimestampModeIndex
     {
         get => receiveTimestampModeIndex;
@@ -402,6 +440,19 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     public Task SendStartAsync() => SendStartAtAsync();
+
+    public Task SendDegradedStartAsync()
+    {
+        if (!degradedStartPending)
+        {
+            SetStartDiagnostic(
+                "START ANYWAY is unavailable: no previously qualified degraded synchronization is waiting for confirmation.");
+            return Task.CompletedTask;
+        }
+
+        allowDegradedSyncStartOnce = true;
+        return SendStartAtAsync();
+    }
 
     public Task PrepareManualStartAtTestAsync() => PrepareManualStartAtTestInternalAsync();
 
@@ -737,6 +788,541 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    private static ForwardSyncConsensus SelectForwardIngressMedianOfThree(
+        IReadOnlyList<SyncMeasurement> samples,
+        int sampleCount)
+    {
+        // Production v6.22.2 keeps the median of the three fastest forward-ingress
+        // samples (the second-fastest sample).  The 10-run post-v6.22 analyzer
+        // series exposed one case where the third-fastest sample was ~200 us
+        // slower than the first two; averaging all three moved b0 by ~60 us.
+        // The median keeps the one-way/reply-path immunity of v6.22 while being
+        // robust to one unusually slow member of the top-three set.
+        if (sampleCount != 3)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(sampleCount),
+                sampleCount,
+                "Forward-only production synchronization requires exactly three floor candidates.");
+        }
+
+        var selected = samples
+            .Where(item => item.Sample.IsValid &&
+                           item.IngressLocalUs > 0 &&
+                           item.IngressLocalUs <= item.Sample.DeviceT2Microseconds &&
+                           item.Sample.DeviceT2Microseconds - item.IngressLocalUs <= 20_000)
+            .Select(item => new
+            {
+                Measurement = item,
+                ForwardOffsetUs = checked(
+                    item.Sample.MasterT1Microseconds - item.IngressLocalUs),
+            })
+            .OrderByDescending(item => item.ForwardOffsetUs)
+            .ThenBy(item => item.Measurement.Sample.NetworkRttMicroseconds)
+            .Take(sampleCount)
+            .ToArray();
+
+        if (selected.Length < sampleCount)
+        {
+            throw new InvalidOperationException(
+                $"Forward-only synchronization requires {sampleCount} valid v6.22 ingress timestamps; " +
+                $"received {selected.Length}. Flash v6.22 firmware on this timer.");
+        }
+
+        // selected[] is ordered fastest-to-slowest, so index 1 is the median
+        // of the three floor candidates.  Keep the estimator epoch tied to the
+        // same physical ingress sample so firmware can propagate it through
+        // the disciplined timebase without an artificial averaging epoch.
+        var representative = selected[1];
+        long offsetUs = representative.ForwardOffsetUs;
+        long epochLocalUs = representative.Measurement.IngressLocalUs;
+        long effectiveMasterEpochUs = checked(epochLocalUs + offsetUs);
+        long spreadUs = checked(selected[0].ForwardOffsetUs - selected[2].ForwardOffsetUs);
+        long bestRttUs = selected.Min(item => item.Measurement.Sample.NetworkRttMicroseconds);
+
+        return new ForwardSyncConsensus(
+            representative.Measurement.SyncId,
+            offsetUs,
+            epochLocalUs,
+            effectiveMasterEpochUs,
+            bestRttUs,
+            spreadUs);
+    }
+
+    private static ForwardSyncAttemptCandidate BuildForwardSyncAttemptCandidate(
+        IReadOnlyList<SyncMeasurement> calibration,
+        IReadOnlyList<SyncMeasurement> verification,
+        SyncSamplingProfile samplingProfile,
+        int attempt,
+        long? initialResidualMicroseconds = null)
+    {
+        ForwardSyncConsensus calibrationConsensus = SelectForwardIngressMedianOfThree(
+            calibration,
+            samplingProfile.LowRttSampleCount);
+        ForwardSyncConsensus verificationConsensus = SelectForwardIngressMedianOfThree(
+            verification,
+            samplingProfile.LowRttSampleCount);
+        ForwardSyncConsensus finalConsensus = SelectForwardIngressMedianOfThree(
+            calibration.Concat(verification).ToArray(),
+            samplingProfile.LowRttSampleCount);
+
+        long residual = checked(
+            calibrationConsensus.MasterMinusLocalOffsetMicroseconds -
+            verificationConsensus.MasterMinusLocalOffsetMicroseconds);
+        long absoluteDelta = residual == long.MinValue ? long.MaxValue : Math.Abs(residual);
+        long uncertainty = checked(
+            absoluteDelta + finalConsensus.TopSampleSpreadMicroseconds);
+
+        return new ForwardSyncAttemptCandidate(
+            calibrationConsensus,
+            verificationConsensus,
+            finalConsensus,
+            residual,
+            uncertainty,
+            attempt,
+            initialResidualMicroseconds ?? residual);
+    }
+
+    private static ForwardSyncAttemptCandidate BetterForwardSyncAttempt(
+        ForwardSyncAttemptCandidate? current,
+        ForwardSyncAttemptCandidate candidate)
+    {
+        if (current is null) return candidate;
+
+        int compare = candidate.UncertaintyMicroseconds.CompareTo(current.UncertaintyMicroseconds);
+        if (compare < 0) return candidate;
+        if (compare > 0) return current;
+
+        compare = candidate.FinalConsensus.TopSampleSpreadMicroseconds.CompareTo(
+            current.FinalConsensus.TopSampleSpreadMicroseconds);
+        if (compare < 0) return candidate;
+        if (compare > 0) return current;
+
+        long candidateDelta = candidate.ResidualMicroseconds == long.MinValue
+            ? long.MaxValue
+            : Math.Abs(candidate.ResidualMicroseconds);
+        long currentDelta = current.ResidualMicroseconds == long.MinValue
+            ? long.MaxValue
+            : Math.Abs(current.ResidualMicroseconds);
+        return candidateDelta < currentDelta ? candidate : current;
+    }
+
+    private static bool ForwardSyncNeedsRetry(ForwardSyncAttemptCandidate candidate)
+    {
+        long absoluteDelta = candidate.ResidualMicroseconds == long.MinValue
+            ? long.MaxValue
+            : Math.Abs(candidate.ResidualMicroseconds);
+        return candidate.FinalConsensus.TopSampleSpreadMicroseconds >
+                   ForwardTop3SpreadRetryLimitMicroseconds ||
+               absoluteDelta > ForwardCalibrationVerificationDeltaRetryLimitMicroseconds;
+    }
+
+    private void RecordForwardSyncCandidate(
+        DeviceViewModel device,
+        ForwardSyncAttemptCandidate candidate,
+        bool accepted,
+        bool degraded)
+    {
+        SyncQualityEvaluation legacyQuality = SyncQualityPolicy.Evaluate(
+            candidate.ResidualMicroseconds,
+            expectedBiasMicroseconds: 0,
+            thresholdMicroseconds: SyncQualityThresholdMicroseconds);
+
+        device.ApplySynchronizationMeasurement(
+            candidate.FinalConsensus.MasterMinusLocalOffsetMicroseconds,
+            candidate.FinalConsensus.BestRttMicroseconds,
+            candidate.ResidualMicroseconds,
+            candidate.VerificationConsensus.BestRttMicroseconds,
+            candidate.VerificationConsensus.MasterMinusLocalOffsetMicroseconds,
+            candidate.InitialResidualMicroseconds,
+            0,
+            legacyQuality.DeviationMicroseconds,
+            SyncQualityThresholdMicroseconds,
+            candidate.FinalConsensus.EffectiveMasterEpochMicroseconds,
+            candidate.Attempt,
+            MaxSynchronizationAttempts,
+            accepted,
+            measuredUncertaintyMicroseconds: candidate.UncertaintyMicroseconds,
+            measuredForwardTop3SpreadMicroseconds:
+                candidate.FinalConsensus.TopSampleSpreadMicroseconds,
+            degraded: degraded);
+    }
+
+    private async Task ApplyForwardSyncCandidateAsync(
+        DeviceViewModel device,
+        IPAddress address,
+        ForwardSyncAttemptCandidate candidate,
+        bool degraded,
+        CancellationToken cancellationToken)
+    {
+        var syncSet = new SyncSetPacket(
+            candidate.FinalConsensus.RepresentativeSyncId,
+            candidate.FinalConsensus.MasterMinusLocalOffsetMicroseconds,
+            candidate.FinalConsensus.BestRttMicroseconds,
+            candidate.FinalConsensus.OffsetEpochLocalMicroseconds);
+
+        SyncAppliedPacket applied = await udpService.ApplySyncAsync(
+            syncSet,
+            address,
+            cancellationToken: cancellationToken);
+        if (!string.Equals(applied.DeviceId, device.DeviceId, StringComparison.Ordinal) ||
+            applied.MasterMinusLocalOffsetMicroseconds != syncSet.MasterMinusLocalOffsetMicroseconds ||
+            applied.OffsetEpochLocalMicroseconds != syncSet.OffsetEpochLocalMicroseconds)
+        {
+            throw new InvalidOperationException(
+                $"{device.DeviceId} returned an inconsistent v6.22 SYNC_APPLIED response.");
+        }
+
+        RecordForwardSyncCandidate(device, candidate, accepted: true, degraded: degraded);
+    }
+
+    private async Task SynchronizeDeviceForwardOnlyAsync(
+        DeviceViewModel device,
+        IPAddress address,
+        SyncSamplingProfile samplingProfile,
+        CancellationToken cancellationToken = default,
+        int firstAttempt = 1,
+        ForwardSyncAttemptCandidate? initialBestCandidate = null)
+    {
+        SyncPathDelayProfile noDelay = SyncPathDelayExperiment.GetProfile(SyncPathDelayMode.None);
+        ForwardSyncAttemptCandidate? bestCandidate = initialBestCandidate;
+        long? initialResidualMicroseconds = initialBestCandidate?.InitialResidualMicroseconds;
+
+        for (int attempt = firstAttempt; attempt <= MaxSynchronizationAttempts; attempt++)
+        {
+            var calibration = new List<SyncMeasurement>();
+            var verification = new List<SyncMeasurement>();
+            try
+            {
+                for (int index = 0; index < samplingProfile.CalibrationSampleCount; index++)
+                {
+                    ulong syncId = CreateCommandId();
+                    calibration.Add(await MeasureSyncAsync(
+                        device.DeviceId,
+                        address,
+                        noDelay,
+                        syncId,
+                        cancellationToken));
+                    await Task.Delay(15, cancellationToken);
+                }
+
+                await Task.Delay(25, cancellationToken);
+
+                for (int index = 0; index < samplingProfile.VerificationSampleCount; index++)
+                {
+                    ulong syncId = CreateCommandId();
+                    verification.Add(await MeasureSyncAsync(
+                        device.DeviceId,
+                        address,
+                        noDelay,
+                        syncId,
+                        cancellationToken));
+                    await Task.Delay(15, cancellationToken);
+                }
+
+                ForwardSyncAttemptCandidate candidate = BuildForwardSyncAttemptCandidate(
+                    calibration,
+                    verification,
+                    samplingProfile,
+                    attempt,
+                    initialResidualMicroseconds);
+                initialResidualMicroseconds ??= candidate.ResidualMicroseconds;
+                bestCandidate = BetterForwardSyncAttempt(bestCandidate, candidate);
+
+                if (ForwardSyncNeedsRetry(candidate))
+                {
+                    RecordForwardSyncCandidate(
+                        device,
+                        candidate,
+                        accepted: false,
+                        degraded: false);
+
+                    if (attempt < MaxSynchronizationAttempts)
+                    {
+                        SetStartDiagnostic(
+                            $"START: {device.DeviceId} forward-floor RETRY {attempt}/{MaxSynchronizationAttempts} — " +
+                            $"final top3 spread={candidate.FinalConsensus.TopSampleSpreadMicroseconds} us " +
+                            $"(retry >{ForwardTop3SpreadRetryLimitMicroseconds}), " +
+                            $"cal/verify delta={candidate.ResidualMicroseconds:+#;-#;0} us " +
+                            $"(retry |delta| >{ForwardCalibrationVerificationDeltaRetryLimitMicroseconds}); " +
+                            $"measured uncertainty ±{candidate.UncertaintyMicroseconds} us. " +
+                            $"Half spreads {candidate.CalibrationConsensus.TopSampleSpreadMicroseconds}/" +
+                            $"{candidate.VerificationConsensus.TopSampleSpreadMicroseconds} us are diagnostic only.");
+                        await Task.Delay(SynchronizationRetryQuietMilliseconds, cancellationToken);
+                        continue;
+                    }
+
+                    break;
+                }
+
+                await ApplyForwardSyncCandidateAsync(
+                    device,
+                    address,
+                    candidate,
+                    degraded: false,
+                    cancellationToken);
+
+                StatusMessage =
+                    $"{device.DeviceId} forward-only sync PASS: med3 of " +
+                    $"{calibration.Count + verification.Count} ingress samples; " +
+                    $"final top3 spread={candidate.FinalConsensus.TopSampleSpreadMicroseconds} us, " +
+                    $"cal/verify delta={candidate.ResidualMicroseconds:+#;-#;0} us, " +
+                    $"uncertainty ±{candidate.UncertaintyMicroseconds} us.";
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                string failureKind = ClassifySyncFailure(exception);
+                device.MarkSynchronizationAttemptFailed(
+                    attempt,
+                    MaxSynchronizationAttempts,
+                    failureKind);
+
+                bool retryableTransport =
+                    SelectedNetworkInterface is not null &&
+                    udpService.IsReady &&
+                    SyncRetryPolicy.IsRetryableTransportFailure(exception);
+                if (retryableTransport && attempt < MaxSynchronizationAttempts)
+                {
+                    SetStartDiagnostic(
+                        $"START: {device.DeviceId} transient forward-sync RETRY {attempt}/{MaxSynchronizationAttempts}: " +
+                        $"{failureKind}: {exception.Message}");
+                    await Task.Delay(SynchronizationRetryQuietMilliseconds, cancellationToken);
+                    continue;
+                }
+
+                if (retryableTransport && bestCandidate is not null &&
+                    attempt >= MaxSynchronizationAttempts)
+                {
+                    break;
+                }
+
+                throw;
+            }
+        }
+
+        if (bestCandidate is null)
+        {
+            device.MarkSynchronizationQualityFailed(MaxSynchronizationAttempts);
+            throw new InvalidOperationException(
+                $"{device.DeviceId} produced no usable forward-floor attempt after " +
+                $"{MaxSynchronizationAttempts} attempts.");
+        }
+
+        await ApplyForwardSyncCandidateAsync(
+            device,
+            address,
+            bestCandidate,
+            degraded: true,
+            cancellationToken);
+
+        SetStartDiagnostic(
+            $"START: {device.DeviceId} retries exhausted; retaining best DEGRADED sync " +
+            $"from attempt {bestCandidate.Attempt}/{MaxSynchronizationAttempts}: " +
+            $"final top3 spread={bestCandidate.FinalConsensus.TopSampleSpreadMicroseconds} us, " +
+            $"cal/verify delta={bestCandidate.ResidualMicroseconds:+#;-#;0} us, " +
+            $"measured uncertainty ±{bestCandidate.UncertaintyMicroseconds} us. " +
+            $"The 20 ms fleet readiness bound will decide whether START is safe.");
+    }
+
+    private static DeviceViewModel[] RotateRoundRobinOrder(
+        IReadOnlyList<DeviceViewModel> participants,
+        int round)
+    {
+        if (participants.Count == 0) return [];
+        int start = ((round % participants.Count) + participants.Count) % participants.Count;
+        var ordered = new DeviceViewModel[participants.Count];
+        for (int index = 0; index < participants.Count; index++)
+        {
+            ordered[index] = participants[(start + index) % participants.Count];
+        }
+        return ordered;
+    }
+
+    private async Task SynchronizeParticipantsForwardOnlyRoundRobinAsync(
+        DeviceViewModel[] baseOrder,
+        SyncSamplingProfile samplingProfile,
+        CancellationToken cancellationToken = default)
+    {
+        if (baseOrder.Length == 0) return;
+
+        SyncPathDelayProfile noDelay = SyncPathDelayExperiment.GetProfile(SyncPathDelayMode.None);
+        var addresses = new Dictionary<string, IPAddress>(StringComparer.Ordinal);
+        var calibration = new Dictionary<string, List<SyncMeasurement>>(StringComparer.Ordinal);
+        var verification = new Dictionary<string, List<SyncMeasurement>>(StringComparer.Ordinal);
+
+        foreach (DeviceViewModel device in baseOrder)
+        {
+            if (!device.TryGetIpAddress(out IPAddress? address) || address is null)
+            {
+                throw new InvalidOperationException($"{device.DeviceId} has no current IP address.");
+            }
+            addresses[device.DeviceId] = address;
+            calibration[device.DeviceId] = [];
+            verification[device.DeviceId] = [];
+        }
+
+        async Task MeasureRoundAsync(
+            int round,
+            Dictionary<string, List<SyncMeasurement>> destination,
+            string phase)
+        {
+            DeviceViewModel[] order = RotateRoundRobinOrder(baseOrder, round);
+            for (int index = 0; index < order.Length; index++)
+            {
+                DeviceViewModel device = order[index];
+                SetStartDiagnostic(
+                    $"START: forward-sync round-robin {phase} round {round + 1}: " +
+                    $"{device.DisplayName} ({index + 1}/{order.Length}), " +
+                    $"first={order[0].DeviceId}.");
+                try
+                {
+                    ulong syncId = CreateCommandId();
+                    destination[device.DeviceId].Add(await MeasureSyncAsync(
+                        device.DeviceId,
+                        addresses[device.DeviceId],
+                        noDelay,
+                        syncId,
+                        cancellationToken));
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception)
+                {
+                    // Missing samples are handled per device after all round-robin
+                    // rounds complete. One station never forces a fleet-wide rerun.
+                }
+
+                if (index + 1 < order.Length)
+                {
+                    await Task.Delay(ForwardRoundRobinInterDeviceDelayMilliseconds, cancellationToken);
+                }
+            }
+        }
+
+        for (int round = 0; round < samplingProfile.CalibrationSampleCount; round++)
+        {
+            await MeasureRoundAsync(round, calibration, "calibration");
+        }
+
+        await Task.Delay(25, cancellationToken);
+
+        for (int round = 0; round < samplingProfile.VerificationSampleCount; round++)
+        {
+            await MeasureRoundAsync(
+                samplingProfile.CalibrationSampleCount + round,
+                verification,
+                "verification");
+        }
+
+        foreach (DeviceViewModel device in baseOrder)
+        {
+            List<SyncMeasurement> cal = calibration[device.DeviceId];
+            List<SyncMeasurement> ver = verification[device.DeviceId];
+
+            if (cal.Count < samplingProfile.CalibrationSampleCount ||
+                ver.Count < samplingProfile.VerificationSampleCount)
+            {
+                device.MarkSynchronizationAttemptFailed(
+                    1,
+                    MaxSynchronizationAttempts,
+                    "round-robin transport/sample loss");
+                SetStartDiagnostic(
+                    $"START: {device.DeviceId} round-robin collected {cal.Count}+{ver.Count} samples; " +
+                    "retrying only this timer with a fresh 8+8 block.");
+                await Task.Delay(SynchronizationRetryQuietMilliseconds, cancellationToken);
+                await SynchronizeDeviceForwardOnlyAsync(
+                    device,
+                    addresses[device.DeviceId],
+                    samplingProfile,
+                    cancellationToken,
+                    firstAttempt: 2);
+                continue;
+            }
+
+            ForwardSyncAttemptCandidate candidate = BuildForwardSyncAttemptCandidate(
+                cal,
+                ver,
+                samplingProfile,
+                attempt: 1);
+
+            if (ForwardSyncNeedsRetry(candidate))
+            {
+                RecordForwardSyncCandidate(
+                    device,
+                    candidate,
+                    accepted: false,
+                    degraded: false);
+
+                SetStartDiagnostic(
+                    $"START: {device.DeviceId} forward-floor RETRY 1/{MaxSynchronizationAttempts} — " +
+                    $"final top3 spread={candidate.FinalConsensus.TopSampleSpreadMicroseconds} us " +
+                    $"(retry >{ForwardTop3SpreadRetryLimitMicroseconds}), " +
+                    $"cal/verify delta={candidate.ResidualMicroseconds:+#;-#;0} us " +
+                    $"(retry |delta| >{ForwardCalibrationVerificationDeltaRetryLimitMicroseconds}); " +
+                    $"uncertainty ±{candidate.UncertaintyMicroseconds} us. " +
+                    $"Half spreads {candidate.CalibrationConsensus.TopSampleSpreadMicroseconds}/" +
+                    $"{candidate.VerificationConsensus.TopSampleSpreadMicroseconds} us are diagnostic only.");
+                await Task.Delay(SynchronizationRetryQuietMilliseconds, cancellationToken);
+                await SynchronizeDeviceForwardOnlyAsync(
+                    device,
+                    addresses[device.DeviceId],
+                    samplingProfile,
+                    cancellationToken,
+                    firstAttempt: 2,
+                    initialBestCandidate: candidate);
+                continue;
+            }
+
+            try
+            {
+                await ApplyForwardSyncCandidateAsync(
+                    device,
+                    addresses[device.DeviceId],
+                    candidate,
+                    degraded: false,
+                    cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception exception) when (
+                SelectedNetworkInterface is not null &&
+                udpService.IsReady &&
+                SyncRetryPolicy.IsRetryableTransportFailure(exception))
+            {
+                device.MarkSynchronizationAttemptFailed(
+                    1,
+                    MaxSynchronizationAttempts,
+                    "round-robin SYNC_SET transport");
+                SetStartDiagnostic(
+                    $"START: {device.DeviceId} round-robin SYNC_SET RETRY — {exception.Message}");
+                await Task.Delay(SynchronizationRetryQuietMilliseconds, cancellationToken);
+                await SynchronizeDeviceForwardOnlyAsync(
+                    device,
+                    addresses[device.DeviceId],
+                    samplingProfile,
+                    cancellationToken,
+                    firstAttempt: 2,
+                    initialBestCandidate: candidate);
+            }
+        }
+
+        int degradedCount = baseOrder.Count(device => device.SynchronizationDegraded);
+        SetStartDiagnostic(
+            $"START: round-robin forward sync complete on {baseOrder.Length} timer(s): " +
+            $"med3 floor; retry when final top3 spread >{ForwardTop3SpreadRetryLimitMicroseconds} us " +
+            $"or |cal/verify delta| >{ForwardCalibrationVerificationDeltaRetryLimitMicroseconds} us; " +
+            $"degraded-after-retry={degradedCount}. The 20 ms readiness gate remains authoritative.");
+    }
+
     private async Task<SyncMeasurement> MeasureSyncAsync(
         string expectedDeviceId,
         IPAddress address,
@@ -786,7 +1372,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             syncId,
             sample,
             received.ActualMasterToDeviceArtificialDelayMicroseconds,
-            reply.ActualArtificialReplyDelayMicroseconds);
+            reply.ActualArtificialReplyDelayMicroseconds,
+            reply.IngressLocalMicroseconds);
     }
 
     private async Task RunBenchmarkInternalAsync()
@@ -2322,14 +2909,123 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         long SentMasterMicroseconds,
         long LeadMicroseconds);
 
+    private DeviceViewModel[] ResolveProductionSyncOrder(
+        DeviceViewModel[] participants,
+        out string orderLabel,
+        out int? seriesRunNumber)
+    {
+        seriesRunNumber = null;
+        bool reverse = ProductionSyncOrderModeIndex == 1;
+        if (ProductionSyncOrderModeIndex == 2)
+        {
+            seriesRunNumber = productionSyncSeriesCompletedStarts + 1;
+            reverse = (seriesRunNumber.Value & 1) == 0;
+        }
+
+        DeviceViewModel[] ordered = reverse
+            ? participants.Reverse().ToArray()
+            : participants.ToArray();
+        orderLabel = string.Join(">", ordered.Select(device => device.DeviceId));
+        return ordered;
+    }
+
+    private void RecordSuccessfulProductionSyncSeriesStart()
+    {
+        if (ProductionSyncOrderModeIndex != 2) return;
+        productionSyncSeriesCompletedStarts++;
+        OnPropertyChanged(nameof(ProductionSyncOrderDescription));
+    }
+
+    private static string BuildProductionParticipantKey(IEnumerable<DeviceViewModel> participants) =>
+        string.Join("|", participants.Select(device => device.DeviceId).OrderBy(id => id, StringComparer.Ordinal));
+
+    private void SetDegradedStartPending(IReadOnlyList<DeviceViewModel> participants)
+    {
+        degradedStartParticipantKey = BuildProductionParticipantKey(participants);
+        degradedStartPending = true;
+        OnPropertyChanged(nameof(CanStartDegraded));
+    }
+
+    private void ClearDegradedStartPending()
+    {
+        degradedStartPending = false;
+        degradedStartParticipantKey = string.Empty;
+        OnPropertyChanged(nameof(CanStartDegraded));
+    }
+
+    private bool CanReusePendingDegradedSync(IReadOnlyList<DeviceViewModel> participants)
+    {
+        if (!degradedStartPending ||
+            !string.Equals(
+                degradedStartParticipantKey,
+                BuildProductionParticipantKey(participants),
+                StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        bool anyDegraded = false;
+        foreach (DeviceViewModel device in participants)
+        {
+            ParticipantSessionSnapshot session = device.SessionSnapshot;
+            if (!device.IsSynchronized ||
+                !device.SynchronizationSessionGeneration.HasValue ||
+                device.SynchronizationSessionGeneration.Value != session.Generation)
+            {
+                return false;
+            }
+            anyDegraded |= device.SynchronizationDegraded;
+        }
+        return anyDegraded;
+    }
+
+    private static string BuildDegradedSyncSummary(IEnumerable<DeviceViewModel> devices)
+    {
+        return string.Join(
+            "; ",
+            devices
+                .Where(device => device.SynchronizationDegraded)
+                .Select(device =>
+                    $"{device.DeviceId}: ±{device.SynchronizationUncertaintyMicroseconds ?? 0} us " +
+                    $"(final spread {device.ForwardTop3SpreadMicroseconds ?? 0} us, " +
+                    $"delta {(device.ResidualErrorMicroseconds ?? 0):+#;-#;0} us)"));
+    }
+
+    private static string BuildSyncQualityTraceSummary(IEnumerable<PreparedParticipant> participants)
+    {
+        return string.Join(
+            ";",
+            participants.Select(participant =>
+            {
+                DeviceViewModel device = participant.Device;
+                return $"{device.DeviceId}:degraded={(device.SynchronizationDegraded ? 1 : 0)}" +
+                    $":delta={device.ResidualErrorMicroseconds ?? 0}" +
+                    $":spread={device.ForwardTop3SpreadMicroseconds ?? 0}" +
+                    $":uncertainty={device.SynchronizationUncertaintyMicroseconds ?? 0}";
+            }));
+    }
+
     private async Task SendStartAtAsync()
     {
+        bool requestedDegradedConfirmation = allowDegradedSyncStartOnce;
+        allowDegradedSyncStartOnce = false;
+
+        SetStartDiagnostic(
+            requestedDegradedConfirmation
+                ? "START ANYWAY (DEGRADED): validating the retained synchronization and 20 ms readiness bound..."
+                : "START: checking network, duration, selected participants, RTC qualification, synchronization and ARM requirements...");
+
         if (SelectedNetworkInterface is null || !udpService.IsReady)
         {
-            StatusMessage = "Select an active physical network interface before sending a command.";
+            SetStartDiagnostic(
+                "START BLOCKED — NETWORK: Select an active physical network interface before sending a command.");
             return;
         }
-        if (!TryDuration(out uint duration)) return;
+        if (!TryDuration(out uint duration))
+        {
+            StartSynchronizationResult = $"START BLOCKED — DURATION: {StatusMessage}";
+            return;
+        }
 
         DeviceViewModel[] participants = Devices.Where(device => device.IsSelected).ToArray();
         if (participants.Length == 0)
@@ -2339,6 +3035,19 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     StartBlockReason.MissingExpectedDevice,
                     "(none)",
                     "Select at least one participant.")]);
+            return;
+        }
+
+        if (requestedDegradedConfirmation &&
+            (!degradedStartPending ||
+             !string.Equals(
+                 degradedStartParticipantKey,
+                 BuildProductionParticipantKey(participants),
+                 StringComparison.Ordinal)))
+        {
+            ClearDegradedStartPending();
+            SetStartDiagnostic(
+                "START ANYWAY cancelled: the selected participant set no longer matches the retained degraded synchronization. Press normal START for a fresh sync.");
             return;
         }
 
@@ -2359,7 +3068,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
 
         using (reservation)
         {
-            if (!await sendLock.WaitAsync(0)) return;
+            if (!await sendLock.WaitAsync(0))
+            {
+                SetStartDiagnostic(
+                    "START BLOCKED — CONTROLLER BUSY: Another controller operation is still active. Wait for it to finish and press START again.");
+                return;
+            }
 
             bool timingQuiet = false;
             PreparedStartRun? preparedForAbort = null;
@@ -2369,6 +3083,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             UpdateCanSend();
             try
             {
+                SetStartDiagnostic(
+                    $"START: preflight check for {participants.Length} selected timer(s). Requesting fresh STATUS and RTC qualification...");
+
                 // A fresh preflight STATUS prevents a restarted controller from sending
                 // SYNC_SET to a device that is already ARMED/RUNNING in an unknown run.
                 DateTimeOffset preflightAfterUtc = DateTimeOffset.UtcNow;
@@ -2383,41 +3100,46 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     return;
                 }
 
-                await EnterTimingQuietPeriodAsync(CancellationToken.None);
-                timingQuiet = true;
+                DeviceViewModel[] syncParticipants = ResolveProductionSyncOrder(
+                    participants,
+                    out string productionSyncOrderLabel,
+                    out int? productionSyncSeriesRunNumber);
 
-                SyncSamplingProfile productionSampling =
-                    SyncSamplingExperiment.GetProfile(SyncSamplingMode.Baseline8Plus8);
-                SyncPathDelayProfile noDelay =
-                    SyncPathDelayExperiment.GetProfile(SyncPathDelayMode.None);
-
-                foreach (DeviceViewModel device in participants)
+                bool reusePendingDegradedSync =
+                    requestedDegradedConfirmation && CanReusePendingDegradedSync(participants);
+                if (requestedDegradedConfirmation && !reusePendingDegradedSync)
                 {
-                    device.MarkSynchronizing();
-                    device.ClearStartMeasurement();
+                    ClearDegradedStartPending();
+                    SetStartDiagnostic(
+                        "START ANYWAY cancelled: the retained degraded sync is stale or the device session changed. Press normal START for a fresh sync.");
+                    return;
                 }
 
-                for (int index = 0; index < participants.Length; index++)
+                if (!reusePendingDegradedSync)
                 {
-                    DeviceViewModel device = participants[index];
-                    if (!device.TryGetIpAddress(out IPAddress? address) || address is null)
+                    ClearDegradedStartPending();
+                    SetStartDiagnostic(
+                        "START: preflight requirements passed. Entering timing-quiet synchronization...");
+                    await EnterTimingQuietPeriodAsync(CancellationToken.None);
+                    timingQuiet = true;
+
+                    SyncSamplingProfile productionSampling =
+                        SyncSamplingExperiment.GetProfile(SyncSamplingMode.Baseline8Plus8);
+
+                    foreach (DeviceViewModel device in participants)
                     {
-                        ReportStartBlocks([
-                            new StartBlock(
-                                StartBlockReason.MissingExpectedDevice,
-                                device.DeviceId,
-                                "Wait for discovery or deselect this participant.")]);
-                        return;
+                        device.MarkSynchronizing();
+                        device.ClearStartMeasurement();
                     }
 
-                    StatusMessage =
-                        $"Preparing {device.DisplayName} ({index + 1}/{participants.Length})...";
                     try
                     {
-                        await SynchronizeDeviceAsync(
-                            device,
-                            address,
-                            noDelay,
+                        string syncStartMessage = productionSyncSeriesRunNumber.HasValue
+                            ? $"START: SYNC series run {productionSyncSeriesRunNumber}; base order {productionSyncOrderLabel}; starting rotating round-robin med3 synchronization..."
+                            : $"START: SYNC base order {productionSyncOrderLabel}; starting rotating round-robin med3 synchronization...";
+                        SetStartDiagnostic(syncStartMessage);
+                        await SynchronizeParticipantsForwardOnlyRoundRobinAsync(
+                            syncParticipants,
                             productionSampling,
                             CancellationToken.None);
                     }
@@ -2426,16 +3148,23 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                         ReportStartBlocks([
                             new StartBlock(
                                 StartBlockReason.SyncFailed,
-                                device.DeviceId,
+                                "SYNC",
                                 $"Press START again for a fresh sync. {exception.Message}")]);
                         return;
                     }
+
+                    // Resume ordinary STATUS only after all foreground SYNC traffic is done.
+                    ExitTimingQuietPeriod();
+                    timingQuiet = false;
+                }
+                else
+                {
+                    SetStartDiagnostic(
+                        "START ANYWAY (DEGRADED): reusing the retained synchronization; no new SYNC traffic is being generated. Rechecking STATUS/session and the 20 ms readiness bound...");
                 }
 
-                // Resume ordinary STATUS only after all foreground SYNC traffic is done.
-                ExitTimingQuietPeriod();
-                timingQuiet = false;
-
+                SetStartDiagnostic(
+                    "START: synchronization passed. Requesting fresh post-sync STATUS from every selected timer...");
                 DateTimeOffset postSyncStatusAfterUtc = DateTimeOffset.UtcNow;
                 IReadOnlyList<StartBlock> postSyncStatusBlocks = await RefreshAndValidatePostSyncStatusAsync(
                     participants,
@@ -2459,8 +3188,47 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     targetCandidateUs);
                 if (!gateResult.Accepted)
                 {
+                    ClearDegradedStartPending();
                     ReportStartBlocks(gateResult.Blocks);
                     return;
+                }
+
+                DeviceViewModel[] degradedDevices = participants
+                    .Where(device => device.SynchronizationDegraded)
+                    .ToArray();
+                if (degradedDevices.Length != 0 && !requestedDegradedConfirmation)
+                {
+                    SetDegradedStartPending(participants);
+                    string degradedSummary = BuildDegradedSyncSummary(degradedDevices);
+                    string pairText = gateResult.WorstPairStartUncertaintyMicroseconds.HasValue
+                        ? $"{gateResult.WorstPairStartUncertaintyMicroseconds.Value} us"
+                        : "single-device / no pair value";
+                    SetStartDiagnostic(
+                        $"START PAUSED — DEGRADED SYNC retained after retry budget. {degradedSummary}. " +
+                        $"The existing 20 ms readiness gate PASSES (predicted worst pair {pairText}). " +
+                        "Click START ANYWAY (DEGRADED) to reuse this exact synchronization without rerunning SYNC, " +
+                        "or click normal START for a fresh synchronization.");
+                    StatusMessage =
+                        $"Degraded synchronization is within the 20 ms safety bound; explicit confirmation required. {degradedSummary}";
+                    return;
+                }
+
+                if (degradedDevices.Length != 0)
+                {
+                    ClearDegradedStartPending();
+                    string degradedSummary = BuildDegradedSyncSummary(degradedDevices);
+                    string pairText = gateResult.WorstPairStartUncertaintyMicroseconds.HasValue
+                        ? $"{gateResult.WorstPairStartUncertaintyMicroseconds.Value} us"
+                        : "single-device / no pair value";
+                    SetStartDiagnostic(
+                        $"START ANYWAY CONFIRMED — DEGRADED SYNC: {degradedSummary}. " +
+                        $"20 ms readiness gate PASSED; predicted worst pair {pairText}. Proceeding to ARMING...");
+                }
+                else
+                {
+                    ClearDegradedStartPending();
+                    SetStartDiagnostic(
+                        $"START: all readiness requirements passed for {participants.Length} timer(s). Freezing participant set and preparing ARMING...");
                 }
 
                 ulong commandId = CreateCommandId();
@@ -2492,7 +3260,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     prepared.CommandId,
                     prepared.TargetMasterMicroseconds,
                     prepared.DurationSeconds,
-                    prepared.Participants.Select(participant => participant.Address).ToArray());
+                    prepared.Participants.Select(participant => participant.Address).ToArray(),
+                    productionSyncOrderLabel,
+                    BuildSyncQualityTraceSummary(prepared.Participants));
 
                 var command = new CommandPacket(
                     CommandType.StartAt,
@@ -2508,7 +3278,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 }
 
                 clock.ArmAt(prepared.DurationSeconds, prepared.TargetMasterMicroseconds);
-                StartSynchronizationResult = "ARMING selected participants...";
+                SetStartDiagnostic(
+                    $"START: ARMING {prepared.Participants.Count} selected timer(s); waiting for ACKs and final STATUS barrier...");
 
                 startAtMayHaveBeenSent = true;
                 StartBlock? armFailure = await ArmPreparedRunAsync(
@@ -2529,6 +3300,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 }
 
                 await StartProductionSilentRunAsync(prepared, CancellationToken.None);
+                RecordSuccessfulProductionSyncSeriesStart();
 
                 preparedForAbort = null;
                 productionStartTelemetryContext = new StartTelemetryContext(
@@ -2538,7 +3310,11 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     productionStartTelemetryContext.CommandId,
                     productionStartTelemetryContext.Participants,
                     "Production START");
+                string seriesPrefix = productionSyncSeriesRunNumber.HasValue
+                    ? $"Series run {productionSyncSeriesRunNumber} sync order {productionSyncOrderLabel}. "
+                    : $"Sync order {productionSyncOrderLabel}. ";
                 StatusMessage =
+                    seriesPrefix +
                     $"Countdown prepared. {prepared.Participants.Count} selected timer(s) will start together. " +
                     "Automatic STATUS polling is paused while RUNNING; use REFRESH STATUS (SELECTED) only when needed.";
             }
@@ -2562,7 +3338,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 }
                 else
                 {
-                    StatusMessage = $"START prepare failed: {exception.Message}";
+                    SetStartDiagnostic($"START BLOCKED — CONTROLLER ERROR: {exception.Message}");
                 }
             }
             finally
@@ -2719,7 +3495,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
 
             if (rtcBlocks.Count == 0)
             {
-                StatusMessage = $"RTC qualification ready on all {participants.Count} selected timer(s); starting clock synchronization...";
+                SetStartDiagnostic(
+                    $"START: RTC qualification ready on all {participants.Count} selected timer(s); starting clock synchronization...");
                 return [];
             }
 
@@ -2735,8 +3512,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 .Select(block => $"{block.DeviceId}: {block.Remedy}"));
             if (rtcBlocks.Count > 4) summary += $"; +{rtcBlocks.Count - 4} more";
             int remainingSeconds = Math.Max(0, (int)Math.Ceiling((deadlineUtc - now).TotalSeconds));
-            StatusMessage =
-                $"Waiting for RTC qualification ({remainingSeconds}s timeout): {summary}";
+            SetStartDiagnostic(
+                $"START waiting for RTC qualification ({remainingSeconds}s timeout): {summary}");
             await Task.Delay(RtcQualificationObservationInterval, cancellationToken);
         }
     }
@@ -3423,6 +4200,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
         if (!await sendLock.WaitAsync(0)) return;
 
+        ClearDegradedStartPending();
         isSending = true;
         UpdateCanSend();
         try
@@ -3471,18 +4249,43 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         Devices.FirstOrDefault(device =>
             string.Equals(device.DeviceId, deviceId, StringComparison.Ordinal))?.DisplayName ?? deviceId;
 
+    private void SetStartDiagnostic(string message)
+    {
+        StartSynchronizationResult = message;
+        StatusMessage = message;
+    }
+
+    private static string FormatStartBlockReason(StartBlockReason reason) => reason switch
+    {
+        StartBlockReason.Offline => "OFFLINE",
+        StartBlockReason.StatusStale => "STATUS STALE",
+        StartBlockReason.ParticipantBusy => "PARTICIPANT BUSY",
+        StartBlockReason.RtcNotLocked => "RTC NOT LOCKED",
+        StartBlockReason.RtcNotQualified => "RTC NOT QUALIFIED",
+        StartBlockReason.SyncFailed => "SYNC FAILED",
+        StartBlockReason.SyncInvalidated => "SYNC INVALIDATED",
+        StartBlockReason.TimingBudgetExceeded => "TIMING BUDGET EXCEEDED",
+        StartBlockReason.ArmAckMissing => "ARM ACK MISSING",
+        StartBlockReason.AbortUnconfirmed => "ABORT UNCONFIRMED",
+        StartBlockReason.MissingExpectedDevice => "MISSING PARTICIPANT",
+        _ => reason.ToString().ToUpperInvariant(),
+    };
+
     private void ReportStartBlocks(IReadOnlyList<StartBlock> blocks)
     {
         if (blocks.Count == 0) return;
-        string details = string.Join(
-            " | ",
-            blocks.Select(block =>
-                $"{OperatorDeviceName(block.DeviceId)}: {block.Remedy}"));
-        StartSynchronizationResult = string.Join(
-            " | ",
-            blocks.Select(block =>
-                $"{block.Reason}: {OperatorDeviceName(block.DeviceId)}. {block.Remedy}"));
-        StatusMessage = $"START could not begin. {details}";
+
+        string[] diagnosticLines = blocks.Select(block =>
+            $"• {FormatStartBlockReason(block.Reason)} — {OperatorDeviceName(block.DeviceId)}: {block.Remedy}").ToArray();
+        StartSynchronizationResult =
+            $"START BLOCKED — {blocks.Count} requirement{(blocks.Count == 1 ? string.Empty : "s")} not satisfied.\n" +
+            string.Join("\n", diagnosticLines);
+
+        StartBlock first = blocks[0];
+        string more = blocks.Count > 1 ? $" (+{blocks.Count - 1} more; see START diagnostics)" : string.Empty;
+        StatusMessage =
+            $"START blocked — {FormatStartBlockReason(first.Reason)}: " +
+            $"{OperatorDeviceName(first.DeviceId)}. {first.Remedy}{more}";
     }
 
     private bool TryGetReadyDevices(out List<(DeviceViewModel Device, IPAddress Address)> readyDevices)
@@ -3912,6 +4715,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     {
         CanSend = !isSending && manualStartAtSession is null &&
             SelectedNetworkInterface is not null && udpService.IsReady;
+        OnPropertyChanged(nameof(CanStartDegraded));
         RefreshManualStartAtButtonStates();
     }
 
@@ -3929,13 +4733,17 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         ulong commandId,
         long targetMasterMicroseconds,
         uint durationSeconds,
-        IReadOnlyList<IPAddress> statusUnicastTargets)
+        IReadOnlyList<IPAddress> statusUnicastTargets,
+        string syncOrder,
+        string syncQualitySummary)
     {
         var session = new ControllerTxTraceSession(
             commandId,
             targetMasterMicroseconds,
             durationSeconds,
-            statusUnicastTargets);
+            statusUnicastTargets,
+            syncOrder,
+            syncQualitySummary);
 
         lock (controllerTxTraceGate)
         {
@@ -4025,7 +4833,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
 
         var builder = new StringBuilder();
         builder.AppendLine(
-            "RunCommandId,TStarMasterUs,DurationSeconds,PacketMasterUs,DeltaFromTStarUs,PhaseUs,LeadToNextBoundaryUs,PacketType,Destination,Attempt,Bytes,CorrelationId");
+            "RunCommandId,TStarMasterUs,DurationSeconds,PacketMasterUs,DeltaFromTStarUs,PhaseUs,LeadToNextBoundaryUs,PacketType,Destination,Attempt,Bytes,CorrelationId,SyncOrder,SyncQualitySummary");
 
         foreach (ControllerTxTraceRow row in rows)
         {
@@ -4040,7 +4848,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 .Append(row.Destination).Append(',')
                 .Append(row.Attempt).Append(',')
                 .Append(row.DatagramBytes).Append(',')
-                .Append(row.CorrelationId.ToString("X16"))
+                .Append(row.CorrelationId.ToString("X16")).Append(',')
+                .Append(session.SyncOrder).Append(',')
+                .Append(session.SyncQualitySummary)
                 .AppendLine();
         }
 
@@ -4220,13 +5030,17 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         ulong commandId,
         long targetMasterMicroseconds,
         uint durationSeconds,
-        IReadOnlyList<IPAddress> statusUnicastTargets)
+        IReadOnlyList<IPAddress> statusUnicastTargets,
+        string syncOrder,
+        string syncQualitySummary)
     {
         public ulong CommandId { get; } = commandId;
         public long TargetMasterMicroseconds { get; } = targetMasterMicroseconds;
         public uint DurationSeconds { get; } = durationSeconds;
         public IReadOnlyList<IPAddress> StatusUnicastTargets { get; } =
             statusUnicastTargets.Distinct().ToArray();
+        public string SyncOrder { get; } = syncOrder;
+        public string SyncQualitySummary { get; } = syncQualitySummary;
         public List<ControllerTxTraceRow> Rows { get; } = [];
     }
 
@@ -4612,5 +5426,23 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         ulong SyncId,
         ClockSyncSample Sample,
         long ActualForwardDelayUs,
-        uint ActualReverseDelayUs);
+        uint ActualReverseDelayUs,
+        long IngressLocalUs);
+
+    private sealed record ForwardSyncConsensus(
+        ulong RepresentativeSyncId,
+        long MasterMinusLocalOffsetMicroseconds,
+        long OffsetEpochLocalMicroseconds,
+        long EffectiveMasterEpochMicroseconds,
+        long BestRttMicroseconds,
+        long TopSampleSpreadMicroseconds);
+
+    private sealed record ForwardSyncAttemptCandidate(
+        ForwardSyncConsensus CalibrationConsensus,
+        ForwardSyncConsensus VerificationConsensus,
+        ForwardSyncConsensus FinalConsensus,
+        long ResidualMicroseconds,
+        long UncertaintyMicroseconds,
+        int Attempt,
+        long InitialResidualMicroseconds);
 }

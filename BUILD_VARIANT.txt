@@ -1,11 +1,3 @@
-v6.21 RTC-qualified START controller + production-silent RUNNING
-START button automatically waits up to 90 seconds for every selected RTC to qualify:
-- state = LOCKED
-- fit_points >= 64
-- fit_rms_us <= 3.0
-- queue_drops = 0
-- temperature_valid = 1
-Normal pre-run discovery supplies qualification updates; no once-per-second forced polling.
-After qualification, existing 8+8 sync, +/-3 ms gate, ARM, final STATUS barrier and silent RUNNING remain unchanged.
-Manual REFRESH STATUS and RESET remain available while RUNNING.
-Requires v6.21-or-newer firmware for qualification fields.
+FactoryTimer Zeit v6.22.3 - degraded sync uncertainty / start-anyway diagnostic
+Firmware: unchanged v6.22
+Controller: med3 + rotating round-robin + per-device retry; final-spread 150 us / cal-ver 500 us retry criteria; best-attempt uncertainty enters 20 ms readiness gate; explicit START ANYWAY (DEGRADED).

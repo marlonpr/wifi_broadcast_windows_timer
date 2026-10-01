@@ -105,6 +105,16 @@
                             </ItemsControl.ItemTemplate>
                         </ItemsControl>
 
+                        <ComboBox Header="Round-robin base order (diagnostic)"
+                                  SelectedIndex="{Binding ProductionSyncOrderModeIndex, Mode=TwoWay}"
+                                  IsEnabled="{Binding CanSend}" HorizontalAlignment="Stretch">
+                            <ComboBoxItem Content="Normal" />
+                            <ComboBoxItem Content="Reverse" />
+                            <ComboBoxItem Content="Alternate each successful START" />
+                        </ComboBox>
+                        <TextBlock Text="{Binding ProductionSyncOrderDescription}" TextWrapping="Wrap"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
                         <Grid ColumnSpacing="12" Margin="0,6,0,0">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
@@ -115,6 +125,22 @@
                             <Button Grid.Column="1" Content="RESET" Click="Reset_Click"
                                     IsEnabled="{Binding CanSend}" HorizontalAlignment="Stretch" />
                         </Grid>
+
+                        <Border Padding="10" CornerRadius="6"
+                                Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="START diagnostics" FontWeight="SemiBold" />
+                                <TextBlock Text="{Binding StartSynchronizationResult}" TextWrapping="Wrap"
+                                           FontFamily="Consolas" />
+                                <Button Content="START ANYWAY (DEGRADED)"
+                                        Click="StartDegraded_Click"
+                                        IsEnabled="{Binding CanStartDegraded}"
+                                        HorizontalAlignment="Stretch"
+                                        ToolTipService.ToolTip="Available only after retries are exhausted and the measured degraded synchronization still passes the 20 ms fleet readiness bound. Reuses the retained sync without rerunning SYNC." />
+                            </StackPanel>
+                        </Border>
+
                         <Button Content="REFRESH STATUS (SELECTED)" Click="RefreshStatus_Click"
                                 IsEnabled="{Binding CanSend}" HorizontalAlignment="Stretch"
                                 ToolTipService.ToolTip="One-shot STATUS request. Automatic polling stays paused while timers are running." />

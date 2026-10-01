@@ -43,7 +43,8 @@ public sealed record StartParticipantGateInput(
     ushort? ReportedRtcFitPoints = 129,
     double? ReportedRtcFitRmsMicroseconds = 0d,
     uint? ReportedRtcQueueDrops = 0,
-    bool? ReportedRtcTemperatureValid = true);
+    bool? ReportedRtcTemperatureValid = true,
+    long? SynchronizationUncertaintyMicroseconds = null);
 
 public sealed record StartGateResult(
     bool Accepted,
@@ -244,7 +245,11 @@ public static class StartReadinessGate
             long residualMagnitude = participant.ResidualErrorMicroseconds == long.MinValue
                 ? long.MaxValue
                 : Math.Abs(participant.ResidualErrorMicroseconds);
-            long startUncertaintyUs = checked(residualMagnitude + DriftBoundMicroseconds(ageUs));
+            long measuredSynchronizationUncertaintyUs = participant.SynchronizationUncertaintyMicroseconds.HasValue
+                ? Math.Max(0, participant.SynchronizationUncertaintyMicroseconds.Value)
+                : residualMagnitude;
+            long startUncertaintyUs = checked(
+                measuredSynchronizationUncertaintyUs + DriftBoundMicroseconds(ageUs));
             startUncertaintyByDevice.Add(participant.DeviceId, startUncertaintyUs);
         }
 
