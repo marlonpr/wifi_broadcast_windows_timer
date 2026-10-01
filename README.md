@@ -1,3 +1,7 @@
+
+## v6.22.4 pooled forward-sync update
+
+Production START synchronization now accumulates forward-ingress evidence across retry attempts. Retry is driven only by cumulative pooled top-3 spread >150 us; cal/verification delta remains diagnostic and contributes to uncertainty. Devices still needing evidence are retried together in rotating round-robin rounds. See `V6_22_4_POOLED_FORWARD_SYNC.md`. Firmware baseline is v6.23.2 unchanged.
 # Factory countdown timer proof of concept
 
 ## Absolute-time synchronization test revision

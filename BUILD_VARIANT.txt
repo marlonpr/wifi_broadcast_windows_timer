@@ -1,3 +1,3 @@
-FactoryTimer Zeit v6.22.3 - degraded sync uncertainty / start-anyway diagnostic
-Firmware: unchanged v6.22
-Controller: med3 + rotating round-robin + per-device retry; final-spread 150 us / cal-ver 500 us retry criteria; best-attempt uncertainty enters 20 ms readiness gate; explicit START ANYWAY (DEGRADED).
+FactoryTimer Zeit v6.22.4 - cumulative pooled forward synchronization
+Firmware baseline: v6.23.2 unchanged
+Controller: med3 forward floor + cumulative sample pooling; retry only on pooled top-3 spread >150 us; cal/ver delta diagnostic + uncertainty only; retry set sampled together in rotating round-robin rounds; cumulative degraded fallback enters the existing 20 ms readiness gate.
