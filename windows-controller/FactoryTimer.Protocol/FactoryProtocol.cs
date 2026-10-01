@@ -64,6 +64,10 @@ public enum ProtocolParseError
     Channel,
     Bssid,
     RtcDiscipline,
+    RtcFitPoints,
+    RtcFitRms,
+    RtcQueueDrops,
+    RtcTemperatureValid,
     Brightness,
 }
 
@@ -101,7 +105,11 @@ public sealed record StatusPacket(
     int? RssiDbm = null,
     int? WifiChannel = null,
     string? Bssid = null,
-    RtcDisciplineState RtcState = RtcDisciplineState.Unknown) : InboundPacket(DeviceId);
+    RtcDisciplineState RtcState = RtcDisciplineState.Unknown,
+    ushort? RtcFitPoints = null,
+    double? RtcFitRmsMicroseconds = null,
+    uint? RtcQueueDrops = null,
+    bool? RtcTemperatureValid = null) : InboundPacket(DeviceId);
 
 public sealed record SyncReplyPacket(
     string DeviceId,
@@ -412,10 +420,10 @@ public static class FactoryProtocol
             return true;
         }
 
-        // Extended FCT2 STATUS adds Wi-Fi diagnostics and, in current firmware,
-        // the RTC discipline state. The nine-field Wi-Fi-only form and legacy
-        // FCT1 packet remain accepted for backward compatibility.
-        if ((fields.Length == 9 || fields.Length == 10) &&
+        // Extended FCT2 STATUS adds Wi-Fi diagnostics and RTC qualification.
+        // Forms with 9 fields (Wi-Fi only), 10 fields (RTC state only), and
+        // 14 fields (v6.21 START qualification metrics) remain parseable.
+        if ((fields.Length == 9 || fields.Length == 10 || fields.Length == 14) &&
             fields[0] == Version2 && fields[1] == "STATUS")
         {
             if (!ValidDeviceId(fields[2]))
@@ -456,13 +464,46 @@ public static class FactoryProtocol
                 return false;
             }
             RtcDisciplineState rtcState = RtcDisciplineState.Unknown;
-            if (fields.Length == 10 && !TryRtcDisciplineState(fields[9], out rtcState))
+            ushort? rtcFitPoints = null;
+            double? rtcFitRmsUs = null;
+            uint? rtcQueueDrops = null;
+            bool? rtcTemperatureValid = null;
+            if (fields.Length >= 10 && !TryRtcDisciplineState(fields[9], out rtcState))
             {
                 error = ProtocolParseError.RtcDiscipline;
                 return false;
             }
+            if (fields.Length == 14)
+            {
+                if (!ushort.TryParse(fields[10], NumberStyles.None, CultureInfo.InvariantCulture, out ushort points))
+                {
+                    error = ProtocolParseError.RtcFitPoints;
+                    return false;
+                }
+                if (!double.TryParse(fields[11], NumberStyles.Float, CultureInfo.InvariantCulture, out double rmsUs) ||
+                    !double.IsFinite(rmsUs) || rmsUs < 0d || rmsUs > 1_000_000d)
+                {
+                    error = ProtocolParseError.RtcFitRms;
+                    return false;
+                }
+                if (!uint.TryParse(fields[12], NumberStyles.None, CultureInfo.InvariantCulture, out uint queueDrops))
+                {
+                    error = ProtocolParseError.RtcQueueDrops;
+                    return false;
+                }
+                if (fields[13] != "0" && fields[13] != "1")
+                {
+                    error = ProtocolParseError.RtcTemperatureValid;
+                    return false;
+                }
+                rtcFitPoints = points;
+                rtcFitRmsUs = rmsUs;
+                rtcQueueDrops = queueDrops;
+                rtcTemperatureValid = fields[13] == "1";
+            }
             packet = new StatusPacket(
-                fields[2], commandId, state, remaining, rssi, channel, fields[8], rtcState);
+                fields[2], commandId, state, remaining, rssi, channel, fields[8], rtcState,
+                rtcFitPoints, rtcFitRmsUs, rtcQueueDrops, rtcTemperatureValid);
             return true;
         }
 

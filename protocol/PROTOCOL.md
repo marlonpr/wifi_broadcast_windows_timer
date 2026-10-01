@@ -142,13 +142,15 @@ START_AT transmission is never artificially delayed by this experiment. The cont
 
 ## Extended STATUS diagnostics
 
-Updated firmware emits an FCT2 STATUS packet with Wi-Fi diagnostics:
+Current v6.21 firmware emits an FCT2 STATUS packet with Wi-Fi diagnostics and RTC START-qualification fields:
 
 ```text
-FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF
+FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF|LOCKED|129|0.785|0|1
 ```
 
-Fields after `remaining` are RSSI in dBm, Wi-Fi primary channel, and BSSID. The updated controller still accepts the legacy six-field FCT1 STATUS packet, so older firmware remains discoverable; diagnostic fields are simply unavailable for legacy STATUS.
+Fields after `remaining` are RSSI in dBm, Wi-Fi primary channel, BSSID, RTC discipline state, RTC fit-point count, RTC fit RMS in microseconds, SQW ISR queue-drop count, and temperature-valid (`0`/`1`).
+
+The v6.21 parser still accepts legacy six-field FCT1 STATUS, nine-field FCT2 Wi-Fi STATUS, and ten-field FCT2 RTC-state STATUS for diagnostics/discovery. Production START qualification, however, requires the v6.21 RTC metrics.
 
 ## Verification quality gate and retry
 

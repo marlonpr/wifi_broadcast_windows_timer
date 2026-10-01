@@ -1,7 +1,6 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Security.Cryptography;
-using System.Runtime.InteropServices;
 using System.Text;
 using FactoryTimer.Controller.Core;
 using FactoryTimer.Protocol;
@@ -11,12 +10,6 @@ namespace FactoryTimer.Controller;
 
 internal sealed class MainViewModel : ObservableObject, IDisposable
 {
-    [DllImport("winmm.dll", ExactSpelling = true)]
-    private static extern uint timeBeginPeriod(uint uPeriod);
-
-    [DllImport("winmm.dll", ExactSpelling = true)]
-    private static extern uint timeEndPeriod(uint uPeriod);
-
     private const int StartLeadTimeMilliseconds = 2000; // benchmark only
     private const long ProductionStartLeadMicroseconds = 5_000_000;
     private const int ArmRetryIntervalMilliseconds = 80;
@@ -29,20 +22,14 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private const long ManualStartAtMaximumSchedulerLatenessMicroseconds = 1;
     private const long ManualStartAtMinimumSendGapMicroseconds = 1_000_000;
     private static readonly TimeSpan FreshStatusWaitTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan RtcQualificationWaitTimeout = TimeSpan.FromSeconds(90);
+    private static readonly TimeSpan RtcQualificationObservationInterval = TimeSpan.FromMilliseconds(500);
     private const int ConsensusLowRttSampleCount = 3;
     private const long SyncQualityThresholdMicroseconds = 3_000;
     private const int MaxSynchronizationAttempts = 5;
     private const int SynchronizationRetryQuietMilliseconds = 150;
     private const int StatusDiscoveryDrainMilliseconds = 100;
-    // Bench-only STATUS lead sweep. Desired leads are arrival leads at the ESP32,
-    // not controller-send leads. Negative values target arrivals just after the boundary.
-    private static readonly long[] StatusSweepTargetRxLeadMicroseconds =
-        [6_000, 5_500, 5_000, 4_500, 4_000, 3_500, 3_000, 2_500, 2_000, 1_500,
-         1_000, 500, 200, 0, -200, -500, -800, -1_000, -1_500, -2_000];
-    private const long StatusSweepDefaultTransitMicroseconds = 2_500;
-    private const long StatusSweepEsp01TransitMicroseconds = 2_558;
-    private const long StatusSweepEsp02TransitMicroseconds = 2_344;
-    private const long StatusSweepSpinWindowMicroseconds = 20_000;
+    private const int RecoveredRunningStatusGraceMilliseconds = 2000;
     private readonly DispatcherQueue dispatcherQueue;
     private readonly DispatcherQueueTimer uiTimer;
     private readonly UdpControllerService udpService;
@@ -53,8 +40,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private readonly ParticipantReservationManager reservationManager = new();
     private readonly object controllerTxTraceGate = new();
     private ControllerTxTraceSession? controllerTxTraceSession;
-    private CancellationTokenSource? statusLeadSweepCancellation;
-    private Task statusLeadSweepTask = Task.CompletedTask;
+    private CancellationTokenSource? productionSilentRunCancellation;
+    private Task productionSilentRunTask = Task.CompletedTask;
+    private bool productionSilentRunActive;
+    private bool productionSilentRunOwnsExactWindow;
     private ArmAcknowledgementTracker? activeArmAcknowledgementTracker;
     private ResetAcknowledgementTracker? activeAbortResetAcknowledgementTracker;
     private IReadOnlyList<ControllerNetworkInterface> networkInterfaces = [];
@@ -366,7 +355,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 StartSynchronizationResult =
                     "START_AT requires a fresh synchronization after changing the T4 receive path.";
 
-                if (SelectedNetworkInterface is not null && !timingQuietPeriodActive)
+                if (SelectedNetworkInterface is not null && !timingQuietPeriodActive && !productionSilentRunActive)
                 {
                     statusDiscovery.StartOrRestart(
                         SelectedNetworkInterface,
@@ -424,6 +413,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     public Task SendResetAsync() => SendResetInternalAsync();
 
     public Task SendBrightnessAsync() => SendBrightnessInternalAsync();
+
+    public Task RefreshSelectedStatusAsync() => RefreshSelectedStatusInternalAsync();
 
     public void SelectAllParticipants()
     {
@@ -2384,7 +2375,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 IReadOnlyList<StartBlock> preflightBlocks = await RefreshAndValidatePreflightAsync(
                     participants,
                     preflightAfterUtc,
-                    CancellationToken.None);
+                    CancellationToken.None,
+                    waitForRtcQualification: true);
                 if (preflightBlocks.Count != 0)
                 {
                     ReportStartBlocks(preflightBlocks);
@@ -2536,7 +2528,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     return;
                 }
 
-                await StartStatusLeadSweepAsync(prepared, CancellationToken.None);
+                await StartProductionSilentRunAsync(prepared, CancellationToken.None);
 
                 preparedForAbort = null;
                 productionStartTelemetryContext = new StartTelemetryContext(
@@ -2547,7 +2539,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     productionStartTelemetryContext.Participants,
                     "Production START");
                 StatusMessage =
-                    $"Countdown prepared. {prepared.Participants.Count} selected timer(s) will start together.";
+                    $"Countdown prepared. {prepared.Participants.Count} selected timer(s) will start together. " +
+                    "Automatic STATUS polling is paused while RUNNING; use REFRESH STATUS (SELECTED) only when needed.";
             }
             catch (Exception exception)
             {
@@ -2589,7 +2582,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private async Task<IReadOnlyList<StartBlock>> RefreshAndValidatePreflightAsync(
         IReadOnlyList<DeviceViewModel> participants,
         DateTimeOffset requireStatusAfterUtc,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool waitForRtcQualification = false)
     {
         List<StartBlock> missingAddressBlocks = participants
             .Where(device => !device.TryGetIpAddress(out _))
@@ -2599,6 +2593,14 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 "Wait for discovery or deselect this participant."))
             .ToList();
         if (missingAddressBlocks.Count != 0) return missingAddressBlocks;
+
+        if (waitForRtcQualification)
+        {
+            IReadOnlyList<StartBlock> rtcWaitBlocks = await WaitForRtcStartQualificationAsync(
+                participants, cancellationToken);
+            if (rtcWaitBlocks.Count != 0) return rtcWaitBlocks;
+            requireStatusAfterUtc = DateTimeOffset.UtcNow;
+        }
 
         await RequestFreshStatusesAsync(participants, cancellationToken);
         await WaitForFreshStatusesAsync(participants, requireStatusAfterUtc, cancellationToken);
@@ -2634,15 +2636,109 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     "Wait for completion or use the normal manual RESET action."));
                 continue;
             }
-            if (session.RtcState != RtcDisciplineState.Locked)
-            {
-                blocks.Add(new StartBlock(
-                    StartBlockReason.RtcNotLocked,
-                    device.DeviceId,
-                    $"RTC discipline is {session.RtcState.ToString().ToUpperInvariant()}; wait for LOCKED before START."));
-            }
+            StartBlock? rtcBlock = RtcStartQualification.Evaluate(
+                device.DeviceId, session.RtcState, session.RtcFitPoints, session.RtcFitRmsMicroseconds,
+                session.RtcQueueDrops, session.RtcTemperatureValid);
+            if (rtcBlock is not null) blocks.Add(rtcBlock);
         }
         return blocks;
+    }
+
+    private async Task<IReadOnlyList<StartBlock>> WaitForRtcStartQualificationAsync(
+        IReadOnlyList<DeviceViewModel> participants,
+        CancellationToken cancellationToken)
+    {
+        DateTimeOffset deadlineUtc = DateTimeOffset.UtcNow + RtcQualificationWaitTimeout;
+
+        // One explicit refresh at entry. After this, observe the normal pre-run
+        // discovery stream instead of generating one STATUS request per second;
+        // network traffic itself can perturb SQW timestamp capture.
+        DateTimeOffset initialStatusAfterUtc = DateTimeOffset.UtcNow;
+        await RequestFreshStatusesAsync(participants, cancellationToken);
+        await WaitForFreshStatusesAsync(participants, initialStatusAfterUtc, cancellationToken);
+
+        while (true)
+        {
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            bool anyStale = participants.Any(device =>
+            {
+                ParticipantSessionSnapshot session = device.SessionSnapshot;
+                return !session.LastStatusAtUtc.HasValue ||
+                    now - session.LastStatusAtUtc.Value >= StartReadinessGate.MaximumStatusAge;
+            });
+
+            if (anyStale)
+            {
+                DateTimeOffset refreshAfterUtc = DateTimeOffset.UtcNow;
+                await RequestFreshStatusesAsync(participants, cancellationToken);
+                await WaitForFreshStatusesAsync(participants, refreshAfterUtc, cancellationToken);
+                now = DateTimeOffset.UtcNow;
+            }
+
+            var rtcBlocks = new List<StartBlock>();
+            foreach (DeviceViewModel device in participants)
+            {
+                ParticipantSessionSnapshot session = device.SessionSnapshot;
+                if (!session.LastStatusAtUtc.HasValue ||
+                    now - session.LastStatusAtUtc.Value >= StartReadinessGate.MaximumStatusAge)
+                {
+                    return [new StartBlock(
+                        StartBlockReason.StatusStale,
+                        device.DeviceId,
+                        "RTC qualification wait did not receive a fresh STATUS; check the device/network and press START again.")];
+                }
+                if (!device.IsOnlineAt(now))
+                {
+                    return [new StartBlock(
+                        StartBlockReason.Offline,
+                        device.DeviceId,
+                        "Device went offline while waiting for RTC qualification; reconnect it and press START again.")];
+                }
+                if (session.TimerState is TimerState.Armed or TimerState.Running)
+                {
+                    return [new StartBlock(
+                        StartBlockReason.ParticipantBusy,
+                        device.DeviceId,
+                        "Device entered ARMED/RUNNING while waiting for RTC qualification; use normal RESET if recovery is required.")];
+                }
+
+                StartBlock? rtcBlock = RtcStartQualification.Evaluate(
+                    device.DeviceId, session.RtcState, session.RtcFitPoints, session.RtcFitRmsMicroseconds,
+                    session.RtcQueueDrops, session.RtcTemperatureValid);
+                if (rtcBlock is not null)
+                {
+                    // Missing v6.21 metrics and queue drops cannot become healthy merely
+                    // by waiting. Surface them immediately instead of consuming 90 s.
+                    bool metricsUnavailable = session.RtcState == RtcDisciplineState.Locked &&
+                        (!session.RtcFitPoints.HasValue || !session.RtcFitRmsMicroseconds.HasValue ||
+                         !session.RtcQueueDrops.HasValue || !session.RtcTemperatureValid.HasValue);
+                    if (metricsUnavailable || session.RtcQueueDrops is > 0) return [rtcBlock];
+                    rtcBlocks.Add(rtcBlock);
+                }
+            }
+
+            if (rtcBlocks.Count == 0)
+            {
+                StatusMessage = $"RTC qualification ready on all {participants.Count} selected timer(s); starting clock synchronization...";
+                return [];
+            }
+
+            if (now >= deadlineUtc)
+            {
+                return rtcBlocks.Select(block => block with
+                {
+                    Remedy = $"RTC qualification timed out after {RtcQualificationWaitTimeout.TotalSeconds:F0} s. {block.Remedy}"
+                }).ToArray();
+            }
+
+            string summary = string.Join("; ", rtcBlocks.Take(4)
+                .Select(block => $"{block.DeviceId}: {block.Remedy}"));
+            if (rtcBlocks.Count > 4) summary += $"; +{rtcBlocks.Count - 4} more";
+            int remainingSeconds = Math.Max(0, (int)Math.Ceiling((deadlineUtc - now).TotalSeconds));
+            StatusMessage =
+                $"Waiting for RTC qualification ({remainingSeconds}s timeout): {summary}";
+            await Task.Delay(RtcQualificationObservationInterval, cancellationToken);
+        }
     }
 
     private async Task<IReadOnlyList<StartBlock>> RefreshAndValidatePostSyncStatusAsync(
@@ -2684,12 +2780,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     "Wait for completion or use the normal manual RESET action."));
                 continue;
             }
-            if (session.RtcState != RtcDisciplineState.Locked)
+            StartBlock? rtcBlock = RtcStartQualification.Evaluate(
+                device.DeviceId, session.RtcState, session.RtcFitPoints, session.RtcFitRmsMicroseconds,
+                session.RtcQueueDrops, session.RtcTemperatureValid, "Post-SYNC RTC");
+            if (rtcBlock is not null)
             {
-                blocks.Add(new StartBlock(
-                    StartBlockReason.RtcNotLocked,
-                    device.DeviceId,
-                    $"RTC discipline is {session.RtcState.ToString().ToUpperInvariant()}; wait for LOCKED before START."));
+                blocks.Add(rtcBlock);
                 continue;
             }
             if (!device.SynchronizationSessionGeneration.HasValue ||
@@ -3168,6 +3264,70 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         IReadOnlyList<string> MissingResetAcknowledgements,
         IReadOnlyList<string> MissingSafeStatuses);
 
+    private async Task RefreshSelectedStatusInternalAsync()
+    {
+        if (SelectedNetworkInterface is null || !udpService.IsReady)
+        {
+            StatusMessage = "Select an active physical network interface before requesting status.";
+            return;
+        }
+
+        DeviceViewModel[] selected = Devices.Where(device => device.IsSelected).ToArray();
+        if (selected.Length == 0)
+        {
+            StatusMessage = "Select at least one timer before requesting status.";
+            return;
+        }
+        if (!await sendLock.WaitAsync(0)) return;
+
+        isSending = true;
+        UpdateCanSend();
+        try
+        {
+            var sent = new List<string>();
+            var skipped = new List<string>();
+            foreach (DeviceViewModel device in selected)
+            {
+                if (!device.TryGetIpAddress(out IPAddress? address) || address is null)
+                {
+                    skipped.Add(device.DisplayName);
+                    continue;
+                }
+
+                ulong commandId = CreateCommandId();
+                await udpService.SendTaggedStatusRequestAsync(
+                    commandId,
+                    address,
+                    "MANUAL_STATUS_REQUEST");
+                sent.Add(device.DisplayName);
+            }
+
+            if (sent.Count == 0)
+            {
+                StatusMessage =
+                    "No selected timer has a known IP address. Wait for discovery, then try REFRESH STATUS again.";
+                return;
+            }
+
+            string skippedText = skipped.Count == 0
+                ? string.Empty
+                : $" No known IP for: {string.Join(", ", skipped)}.";
+            StatusMessage =
+                $"One-shot STATUS requested from {string.Join(", ", sent)}.{skippedText} " +
+                "Automatic polling remains paused while a production countdown is RUNNING.";
+        }
+        catch (Exception exception)
+        {
+            StatusMessage = $"Manual STATUS request failed: {exception.Message}";
+        }
+        finally
+        {
+            isSending = false;
+            UpdateCanSend();
+            sendLock.Release();
+        }
+    }
+
     private async Task SendBrightnessInternalAsync()
     {
         if (SelectedNetworkInterface is null || !udpService.IsReady)
@@ -3527,7 +3687,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     {
                         device.BeginSearching();
                     }
-                    if (!timingQuietPeriodActive)
+                    if (!timingQuietPeriodActive && !productionSilentRunActive)
                     {
                         statusDiscovery.StartOrRestart(
                             selectedNetworkInterface,
@@ -3572,8 +3732,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     {
         try
         {
+            foreach (DeviceViewModel device in Devices)
+            {
+                device.EndIntentionalStatusPause();
+            }
             ControllerNetworkInterface? selection = SelectedNetworkInterface;
-            if (!disposed && selection is not null && udpService.IsReady)
+            if (!disposed && selection is not null && udpService.IsReady && !productionSilentRunActive)
             {
                 statusDiscovery.StartOrRestart(
                     selection,
@@ -3587,149 +3751,147 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private static long EstimatedStatusTransitMicroseconds(string deviceId) =>
-        deviceId switch
-        {
-            "ESP01" => StatusSweepEsp01TransitMicroseconds,
-            "ESP02" => StatusSweepEsp02TransitMicroseconds,
-            _ => StatusSweepDefaultTransitMicroseconds,
-        };
-
-    private async Task StartStatusLeadSweepAsync(
+    private async Task StartProductionSilentRunAsync(
         PreparedStartRun prepared,
         CancellationToken cancellationToken)
     {
-        statusLeadSweepCancellation?.Cancel();
-        statusLeadSweepCancellation?.Dispose();
-        statusLeadSweepCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        CancellationToken token = statusLeadSweepCancellation.Token;
+        productionSilentRunCancellation?.Cancel();
+        productionSilentRunCancellation?.Dispose();
+        productionSilentRunCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        CancellationToken token = productionSilentRunCancellation.Token;
+        productionSilentRunActive = true;
+        productionSilentRunOwnsExactWindow = true;
 
-        // Final ARM verification has completed by the time this is called. Stop
-        // ordinary discovery so the only application STATUS_REQUEST traffic during
-        // the diagnostic run is the explicitly scheduled lead sweep.
+        // v6.20 production policy: once the final ARM barrier has passed, stop all
+        // automatic application STATUS traffic for the RUNNING window. Keep UDP RX
+        // alive so RESET and an operator-requested one-shot STATUS remain available.
+        foreach (DeviceViewModel device in Devices)
+        {
+            device.BeginIntentionalStatusPause();
+        }
         await statusDiscovery.StopAndWaitAsync();
         await Task.Delay(StatusDiscoveryDrainMilliseconds, token);
 
-        statusLeadSweepTask = RunStatusLeadSweepAsync(prepared, token);
-        _ = statusLeadSweepTask;
+        productionSilentRunTask = HoldProductionSilentWindowAsync(prepared, token);
+        _ = productionSilentRunTask;
     }
 
-    private async Task RunStatusLeadSweepAsync(
+    private async Task HoldProductionSilentWindowAsync(
         PreparedStartRun prepared,
         CancellationToken cancellationToken)
     {
-        bool oneMillisecondTimerPeriod = timeBeginPeriod(1) == 0;
         try
         {
-            var events = new List<StatusSweepEvent>();
-            int boundaries = Math.Min(
-                (int)prepared.DurationSeconds,
-                StatusSweepTargetRxLeadMicroseconds.Length);
-
-            foreach (PreparedParticipant participant in prepared.Participants)
-            {
-                long transitUs = EstimatedStatusTransitMicroseconds(participant.Device.DeviceId);
-                for (int index = 0; index < boundaries; ++index)
-                {
-                    int boundary = index + 1;
-                    long targetRxLeadUs = StatusSweepTargetRxLeadMicroseconds[index];
-                    long boundaryMasterUs = checked(
-                        prepared.TargetMasterMicroseconds + boundary * 1_000_000L);
-                    long sendMasterUs = checked(
-                        boundaryMasterUs - targetRxLeadUs - transitUs);
-                    events.Add(new StatusSweepEvent(
-                        sendMasterUs,
-                        boundary,
-                        targetRxLeadUs,
-                        participant));
-                }
-            }
-
-            foreach (StatusSweepEvent sweepEvent in events.OrderBy(e => e.SendMasterMicroseconds))
-            {
-                await WaitUntilMasterTimePreciselyAsync(
-                    sweepEvent.SendMasterMicroseconds,
-                    cancellationToken).ConfigureAwait(false);
-
-                string tag = FormattableString.Invariant(
-                    $"STATUS_SWEEP_B{sweepEvent.Boundary:00}_TARGET_RX_LEAD_{sweepEvent.TargetRxLeadMicroseconds}");
-                await udpService.SendTaggedStatusRequestAsync(
-                    CreateCommandId(),
-                    sweepEvent.Participant.Address,
-                    tag,
-                    cancellationToken).ConfigureAwait(false);
-            }
-
-            long runEndUs = checked(
+            long resumeUs = checked(
                 prepared.TargetMasterMicroseconds +
                 (long)prepared.DurationSeconds * 1_000_000L +
                 500_000L);
-            await WaitUntilMasterTimePreciselyAsync(runEndUs, cancellationToken)
+            await WaitUntilMasterTimeAsync(resumeUs, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            return;
         }
         catch (Exception exception)
         {
             dispatcherQueue.TryEnqueue(() =>
             {
-                StatusMessage = $"STATUS lead sweep failed: {exception.Message}";
+                StatusMessage = $"Production-silent RUNNING hold failed: {exception.Message}";
             });
         }
-        finally
-        {
-            if (oneMillisecondTimerPeriod)
-            {
-                _ = timeEndPeriod(1);
-            }
-            ControllerNetworkInterface? selection = SelectedNetworkInterface;
-            if (!disposed && selection is not null && udpService.IsReady)
-            {
-                statusDiscovery.StartOrRestart(
-                    selection,
-                    () => Volatile.Read(ref manualBroadcastOverride),
-                    GetRunStatusUnicastTargets);
-            }
-        }
+
+        dispatcherQueue.TryEnqueue(ResumeAutomaticStatusDiscoveryAfterRun);
     }
 
-    private static async Task WaitUntilMasterTimePreciselyAsync(
-        long targetMasterMicroseconds,
-        CancellationToken cancellationToken)
+    private void ObserveProductionRunningStatus(StatusPacket status)
     {
-        while (true)
+        // Keep qualification/manual-test workflows behaviorally unchanged.
+        if (IsBenchmarkRunning || isPreparingManualStartAtTest || manualStartAtSession is not null) return;
+
+        if (status.State == TimerState.Running)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            long remainingUs = targetMasterMicroseconds - MasterClock.NowMicroseconds;
-            if (remainingUs <= 0) return;
-
-            if (remainingUs > StatusSweepSpinWindowMicroseconds)
+            if (productionSilentRunActive)
             {
-                int delayMs = (int)Math.Max(
-                    1L,
-                    (remainingUs - StatusSweepSpinWindowMicroseconds) / 1000L);
-                await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
-                continue;
+                if (!productionSilentRunOwnsExactWindow)
+                {
+                    ScheduleRecoveredRunningStatusPause(status.RemainingSeconds);
+                }
+                return;
             }
 
-            // QPC-backed MasterClock spin for the final <=20 ms. This deliberately absorbs
-            // the default Windows scheduler/timer granularity seen in the first sweep. No file I/O or UI
-            // work occurs here; SendTracedAsync timestamps immediately before SendAsync.
-            while (MasterClock.NowMicroseconds < targetMasterMicroseconds)
+            // Controller restart/reconnect recovery: the first normal discovery
+            // request tells us a timer is already RUNNING. Stop future automatic
+            // polling immediately; the in-flight discovery datagram may still yield
+            // replies from the other timers, which is exactly the one-shot recovery
+            // snapshot we want.
+            productionSilentRunActive = true;
+            productionSilentRunOwnsExactWindow = false;
+            foreach (DeviceViewModel device in Devices)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                Thread.SpinWait(32);
+                device.BeginIntentionalStatusPause();
             }
+            statusDiscovery.Stop();
+            ScheduleRecoveredRunningStatusPause(status.RemainingSeconds);
+            StatusMessage =
+                "RUNNING timer detected. Automatic STATUS polling is paused for timing performance; use REFRESH STATUS when needed.";
             return;
         }
+
+        if (!productionSilentRunActive || productionSilentRunOwnsExactWindow) return;
+        if (Devices.Any(device => device.SessionSnapshot.TimerState == TimerState.Running)) return;
+
+        productionSilentRunCancellation?.Cancel();
+        ResumeAutomaticStatusDiscoveryAfterRun();
     }
 
-    private sealed record StatusSweepEvent(
-        long SendMasterMicroseconds,
-        int Boundary,
-        long TargetRxLeadMicroseconds,
-        PreparedParticipant Participant);
+    private void ScheduleRecoveredRunningStatusPause(uint remainingSeconds)
+    {
+        productionSilentRunCancellation?.Cancel();
+        productionSilentRunCancellation?.Dispose();
+        productionSilentRunCancellation = new CancellationTokenSource();
+        CancellationToken token = productionSilentRunCancellation.Token;
+        productionSilentRunTask = HoldRecoveredRunningStatusPauseAsync(remainingSeconds, token);
+        _ = productionSilentRunTask;
+    }
+
+    private async Task HoldRecoveredRunningStatusPauseAsync(
+        uint remainingSeconds,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            TimeSpan delay = TimeSpan.FromMilliseconds(
+                checked((long)remainingSeconds * 1000L + RecoveredRunningStatusGraceMilliseconds));
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+        dispatcherQueue.TryEnqueue(ResumeAutomaticStatusDiscoveryAfterRun);
+    }
+
+    private void ResumeAutomaticStatusDiscoveryAfterRun()
+    {
+        productionSilentRunActive = false;
+        productionSilentRunOwnsExactWindow = false;
+        productionSilentRunCancellation?.Dispose();
+        productionSilentRunCancellation = null;
+        foreach (DeviceViewModel device in Devices)
+        {
+            device.EndIntentionalStatusPause();
+        }
+
+        ControllerNetworkInterface? selection = SelectedNetworkInterface;
+        if (!disposed && selection is not null && udpService.IsReady && !timingQuietPeriodActive)
+        {
+            statusDiscovery.StartOrRestart(
+                selection,
+                () => Volatile.Read(ref manualBroadcastOverride),
+                GetRunStatusUnicastTargets);
+        }
+    }
 
     private void RefreshNetworkDetails()
     {
@@ -3929,6 +4091,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 }
                 case StatusPacket status:
                     device.Apply(status, e.RemoteEndPoint);
+                    ObserveProductionRunningStatus(status);
                     break;
                 case StartedPacket started:
                     device.Apply(started, e.RemoteEndPoint);
@@ -3982,6 +4145,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         foreach (DeviceViewModel device in Devices)
         {
             device.UpdateEstimatedMasterTime(masterNowUs);
+            device.UpdateRunningRemainingEstimate(now);
         }
         RefreshManualStartAtUi();
     }
@@ -4018,9 +4182,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         benchmarkCancellation?.Cancel();
         benchmarkCancellation?.Dispose();
         benchmarkCancellation = null;
-        statusLeadSweepCancellation?.Cancel();
-        statusLeadSweepCancellation?.Dispose();
-        statusLeadSweepCancellation = null;
+        productionSilentRunCancellation?.Cancel();
+        productionSilentRunCancellation?.Dispose();
+        productionSilentRunCancellation = null;
         ManualStartAtSession? manualSession = manualStartAtSession;
         manualStartAtSession = null;
         Volatile.Write(ref activeArmAcknowledgementTracker, null);

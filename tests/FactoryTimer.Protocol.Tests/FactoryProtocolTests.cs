@@ -179,6 +179,10 @@ public sealed class FactoryProtocolTests
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-200|6|AA:BB:CC:DD:EE:FF", ProtocolParseError.Rssi)]
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|999|AA:BB:CC:DD:EE:FF", ProtocolParseError.Channel)]
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|NOT-A-BSSID", ProtocolParseError.Bssid)]
+    [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|AA:BB:CC:DD:EE:FF|LOCKED|x|0.500|0|1", ProtocolParseError.RtcFitPoints)]
+    [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|AA:BB:CC:DD:EE:FF|LOCKED|64|NaN|0|1", ProtocolParseError.RtcFitRms)]
+    [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|AA:BB:CC:DD:EE:FF|LOCKED|64|0.500|x|1", ProtocolParseError.RtcQueueDrops)]
+    [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|AA:BB:CC:DD:EE:FF|LOCKED|64|0.500|0|2", ProtocolParseError.RtcTemperatureValid)]
     public void RejectsMalformedOrUnsupportedInbound(string text, ProtocolParseError expected)
     {
         Assert.IsFalse(FactoryProtocol.TryParseInbound(text, out _, out ProtocolParseError actual));
@@ -221,4 +225,34 @@ public sealed class FactoryProtocolTests
         StatusPacket status = (StatusPacket)packet!;
         Assert.AreEqual(RtcDisciplineState.Locked, status.RtcState);
     }
+    [TestMethod]
+    public void ParsesV621RtcQualificationMetricsFromStatus()
+    {
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(
+            "FCT2|STATUS|ESP02|0000000000000000|READY|20|-45|9|AA:BB:CC:DD:EE:FF|LOCKED|129|0.785|0|1",
+            out InboundPacket? packet,
+            out ProtocolParseError error));
+        Assert.AreEqual(ProtocolParseError.None, error);
+        StatusPacket status = (StatusPacket)packet!;
+        Assert.AreEqual(RtcDisciplineState.Locked, status.RtcState);
+        Assert.AreEqual((ushort)129, status.RtcFitPoints!.Value);
+        Assert.AreEqual(0.785, status.RtcFitRmsMicroseconds!.Value, 0.0001);
+        Assert.AreEqual(0u, status.RtcQueueDrops!.Value);
+        Assert.IsTrue(status.RtcTemperatureValid!.Value);
+    }
+
+    [TestMethod]
+    public void LegacyRtcStateOnlyStatusKeepsQualificationMetricsUnknown()
+    {
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(
+            "FCT2|STATUS|ESP02|0000000000000000|READY|20|-45|9|AA:BB:CC:DD:EE:FF|LOCKED",
+            out InboundPacket? packet,
+            out _));
+        StatusPacket status = (StatusPacket)packet!;
+        Assert.IsNull(status.RtcFitPoints);
+        Assert.IsNull(status.RtcFitRmsMicroseconds);
+        Assert.IsNull(status.RtcQueueDrops);
+        Assert.IsNull(status.RtcTemperatureValid);
+    }
+
 }

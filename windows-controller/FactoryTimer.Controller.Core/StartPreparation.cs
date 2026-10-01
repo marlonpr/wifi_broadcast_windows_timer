@@ -10,6 +10,7 @@ public enum StartBlockReason
     StatusStale,
     ParticipantBusy,
     RtcNotLocked,
+    RtcNotQualified,
     SyncFailed,
     SyncInvalidated,
     TimingBudgetExceeded,
@@ -38,7 +39,11 @@ public sealed record StartParticipantGateInput(
     IPAddress? ReportedIpAddress,
     TimerState? ReportedState,
     ulong? ReportedCommandId,
-    RtcDisciplineState ReportedRtcState = RtcDisciplineState.Locked);
+    RtcDisciplineState ReportedRtcState = RtcDisciplineState.Locked,
+    ushort? ReportedRtcFitPoints = 129,
+    double? ReportedRtcFitRmsMicroseconds = 0d,
+    uint? ReportedRtcQueueDrops = 0,
+    bool? ReportedRtcTemperatureValid = true);
 
 public sealed record StartGateResult(
     bool Accepted,
@@ -48,6 +53,74 @@ public sealed record StartGateResult(
 {
     public static StartGateResult Blocked(params StartBlock[] blocks) =>
         new(false, blocks, null, new Dictionary<string, long>());
+}
+
+public static class RtcStartQualification
+{
+    public const ushort MinimumFitPoints = 64;
+    public const double MaximumFitRmsMicroseconds = 3.0;
+
+    public static StartBlock? Evaluate(
+        string deviceId,
+        RtcDisciplineState state,
+        ushort? fitPoints,
+        double? fitRmsMicroseconds,
+        uint? queueDrops,
+        bool? temperatureValid,
+        string context = "RTC")
+    {
+        if (state != RtcDisciplineState.Locked)
+        {
+            return new StartBlock(
+                StartBlockReason.RtcNotLocked,
+                deviceId,
+                $"{context} discipline is {state.ToString().ToUpperInvariant()}; waiting for LOCKED.");
+        }
+
+        if (!fitPoints.HasValue || !fitRmsMicroseconds.HasValue ||
+            !queueDrops.HasValue || !temperatureValid.HasValue)
+        {
+            return new StartBlock(
+                StartBlockReason.RtcNotQualified,
+                deviceId,
+                $"{context} qualification metrics are unavailable; flash v6.21-or-newer firmware.");
+        }
+
+        if (fitPoints.Value < MinimumFitPoints)
+        {
+            return new StartBlock(
+                StartBlockReason.RtcNotQualified,
+                deviceId,
+                $"{context} fit has {fitPoints.Value}/{MinimumFitPoints} points; waiting for qualification.");
+        }
+
+        if (!double.IsFinite(fitRmsMicroseconds.Value) ||
+            fitRmsMicroseconds.Value > MaximumFitRmsMicroseconds)
+        {
+            return new StartBlock(
+                StartBlockReason.RtcNotQualified,
+                deviceId,
+                $"{context} fit RMS is {fitRmsMicroseconds.Value:F3} us; requires <= {MaximumFitRmsMicroseconds:F1} us.");
+        }
+
+        if (queueDrops.Value != 0)
+        {
+            return new StartBlock(
+                StartBlockReason.RtcNotQualified,
+                deviceId,
+                $"{context} SQW ISR queue has {queueDrops.Value} drop(s); reboot/check this timer before START.");
+        }
+
+        if (!temperatureValid.Value)
+        {
+            return new StartBlock(
+                StartBlockReason.RtcNotQualified,
+                deviceId,
+                $"{context} DS3231 temperature is not valid yet; waiting for a valid RTC reading.");
+        }
+
+        return null;
+    }
 }
 
 public static class StartReadinessGate
@@ -115,12 +188,16 @@ public static class StartReadinessGate
                 continue;
             }
 
-            if (participant.ReportedRtcState != RtcDisciplineState.Locked)
+            StartBlock? rtcBlock = RtcStartQualification.Evaluate(
+                participant.DeviceId,
+                participant.ReportedRtcState,
+                participant.ReportedRtcFitPoints,
+                participant.ReportedRtcFitRmsMicroseconds,
+                participant.ReportedRtcQueueDrops,
+                participant.ReportedRtcTemperatureValid);
+            if (rtcBlock is not null)
             {
-                blocks.Add(new StartBlock(
-                    StartBlockReason.RtcNotLocked,
-                    participant.DeviceId,
-                    $"RTC discipline is {participant.ReportedRtcState.ToString().ToUpperInvariant()}; wait for LOCKED before START."));
+                blocks.Add(rtcBlock);
                 continue;
             }
 
@@ -252,13 +329,10 @@ public static class StartArmSessionGuard
                 "Device session changed during ARMING. Press START again.");
         }
 
-        if (current.RtcState != RtcDisciplineState.Locked)
-        {
-            return new StartBlock(
-                StartBlockReason.RtcNotLocked,
-                deviceId,
-                $"RTC discipline changed to {current.RtcState.ToString().ToUpperInvariant()} during ARMING; abort and wait for LOCKED.");
-        }
+        StartBlock? rtcBlock = RtcStartQualification.Evaluate(
+            deviceId, current.RtcState, current.RtcFitPoints, current.RtcFitRmsMicroseconds,
+            current.RtcQueueDrops, current.RtcTemperatureValid, "RTC during ARMING");
+        if (rtcBlock is not null) return rtcBlock;
 
         if (current.TimerState is TimerState.Armed or TimerState.Running &&
             current.CommandId.HasValue &&
@@ -344,13 +418,10 @@ public static class StartFinalBarrier
                 "Device session changed before final ARM verification; press START again.");
         }
 
-        if (current.RtcState != RtcDisciplineState.Locked)
-        {
-            return new StartBlock(
-                StartBlockReason.RtcNotLocked,
-                deviceId,
-                $"Final STATUS reports RTC discipline {current.RtcState.ToString().ToUpperInvariant()}; abort and wait for LOCKED.");
-        }
+        StartBlock? rtcBlock = RtcStartQualification.Evaluate(
+            deviceId, current.RtcState, current.RtcFitPoints, current.RtcFitRmsMicroseconds,
+            current.RtcQueueDrops, current.RtcTemperatureValid, "Final STATUS RTC");
+        if (rtcBlock is not null) return rtcBlock;
 
         if (current.TimerState is TimerState.Armed &&
             current.CommandId == preparedCommandId)
@@ -486,7 +557,11 @@ public sealed record ParticipantSessionSnapshot(
     ulong? CommandId,
     long? LastLocalTimestampMicroseconds,
     bool DisconnectObserved,
-    RtcDisciplineState RtcState = RtcDisciplineState.Locked);
+    RtcDisciplineState RtcState = RtcDisciplineState.Locked,
+    ushort? RtcFitPoints = 129,
+    double? RtcFitRmsMicroseconds = 0d,
+    uint? RtcQueueDrops = 0,
+    bool? RtcTemperatureValid = true);
 
 public sealed class ParticipantSessionTracker
 {
@@ -499,7 +574,12 @@ public sealed class ParticipantSessionTracker
     private long? lastLocalTimestampMicroseconds;
     private bool disconnectObserved;
     private bool disconnectInferenceSuppressed;
+    private bool intentionalStatusPauseActive;
     private RtcDisciplineState rtcDisciplineState = RtcDisciplineState.Unknown;
+    private ushort? rtcFitPoints;
+    private double? rtcFitRmsMicroseconds;
+    private uint? rtcQueueDrops;
+    private bool? rtcTemperatureValid;
 
     public ParticipantSessionSnapshot Snapshot
     {
@@ -515,7 +595,11 @@ public sealed class ParticipantSessionTracker
                     commandId,
                     lastLocalTimestampMicroseconds,
                     disconnectObserved,
-                    rtcDisciplineState);
+                    rtcDisciplineState,
+                    rtcFitPoints,
+                    rtcFitRmsMicroseconds,
+                    rtcQueueDrops,
+                    rtcTemperatureValid);
             }
         }
     }
@@ -533,12 +617,16 @@ public sealed class ParticipantSessionTracker
             if (invalidated) generation++;
 
             disconnectObserved = false;
-            disconnectInferenceSuppressed = false;
+            disconnectInferenceSuppressed = intentionalStatusPauseActive;
             ipAddress = sourceAddress;
             lastStatusAtUtc = observedAtUtc;
             timerState = status.State;
             commandId = status.CommandId;
             rtcDisciplineState = status.RtcState;
+            rtcFitPoints = status.RtcFitPoints;
+            rtcFitRmsMicroseconds = status.RtcFitRmsMicroseconds;
+            rtcQueueDrops = status.RtcQueueDrops;
+            rtcTemperatureValid = status.RtcTemperatureValid;
         }
     }
 
@@ -578,7 +666,20 @@ public sealed class ParticipantSessionTracker
 
     public void BeginIntentionalStatusPause()
     {
-        lock (gate) disconnectInferenceSuppressed = true;
+        lock (gate)
+        {
+            intentionalStatusPauseActive = true;
+            disconnectInferenceSuppressed = true;
+        }
+    }
+
+    public void EndIntentionalStatusPause()
+    {
+        lock (gate)
+        {
+            intentionalStatusPauseActive = false;
+            disconnectInferenceSuppressed = false;
+        }
     }
 
     public void MarkDisconnectedObserved()
@@ -593,12 +694,17 @@ public sealed class ParticipantSessionTracker
             generation++;
             disconnectObserved = false;
             disconnectInferenceSuppressed = false;
+            intentionalStatusPauseActive = false;
             lastStatusAtUtc = null;
             ipAddress = null;
             timerState = null;
             commandId = null;
             lastLocalTimestampMicroseconds = null;
             rtcDisciplineState = RtcDisciplineState.Unknown;
+            rtcFitPoints = null;
+            rtcFitRmsMicroseconds = null;
+            rtcQueueDrops = null;
+            rtcTemperatureValid = null;
         }
     }
 }

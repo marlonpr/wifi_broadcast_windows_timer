@@ -539,4 +539,95 @@ public sealed class StartPreparationTests
         Assert.IsFalse(result.Accepted);
         Assert.AreEqual(StartBlockReason.RtcNotLocked, result.Blocks.Single().Reason);
     }
+
+    [TestMethod]
+    public void GateRejectsLockedRtcWithTooFewFitPoints()
+    {
+        StartParticipantGateInput input = Participant(
+            "ESP01", residualUs: 0, effectiveEpochUs: 10_000_000) with
+        {
+            ReportedRtcFitPoints = 63,
+        };
+        StartGateResult result = StartReadinessGate.Evaluate([input], Now, 20_000_000);
+        Assert.IsFalse(result.Accepted);
+        Assert.AreEqual(StartBlockReason.RtcNotQualified, result.Blocks.Single().Reason);
+    }
+
+    [TestMethod]
+    public void GateRejectsLockedRtcWithHighRms()
+    {
+        StartParticipantGateInput input = Participant(
+            "ESP01", residualUs: 0, effectiveEpochUs: 10_000_000) with
+        {
+            ReportedRtcFitRmsMicroseconds = 3.001,
+        };
+        StartGateResult result = StartReadinessGate.Evaluate([input], Now, 20_000_000);
+        Assert.IsFalse(result.Accepted);
+        Assert.AreEqual(StartBlockReason.RtcNotQualified, result.Blocks.Single().Reason);
+    }
+
+    [TestMethod]
+    public void GateRejectsLockedRtcWithQueueDropsOrInvalidTemperature()
+    {
+        StartParticipantGateInput drops = Participant(
+            "ESP01", residualUs: 0, effectiveEpochUs: 10_000_000) with
+        {
+            ReportedRtcQueueDrops = 1,
+        };
+        Assert.AreEqual(
+            StartBlockReason.RtcNotQualified,
+            StartReadinessGate.Evaluate([drops], Now, 20_000_000).Blocks.Single().Reason);
+
+        StartParticipantGateInput noTemp = Participant(
+            "ESP01", residualUs: 0, effectiveEpochUs: 10_000_000) with
+        {
+            ReportedRtcTemperatureValid = false,
+        };
+        Assert.AreEqual(
+            StartBlockReason.RtcNotQualified,
+            StartReadinessGate.Evaluate([noTemp], Now, 20_000_000).Blocks.Single().Reason);
+    }
+
+    [TestMethod]
+    public void GateRejectsLegacyLockedRtcWhenQualificationMetricsAreMissing()
+    {
+        StartParticipantGateInput input = Participant(
+            "ESP01", residualUs: 0, effectiveEpochUs: 10_000_000) with
+        {
+            ReportedRtcFitPoints = null,
+            ReportedRtcFitRmsMicroseconds = null,
+            ReportedRtcQueueDrops = null,
+            ReportedRtcTemperatureValid = null,
+        };
+        StartGateResult result = StartReadinessGate.Evaluate([input], Now, 20_000_000);
+        Assert.IsFalse(result.Accepted);
+        Assert.AreEqual(StartBlockReason.RtcNotQualified, result.Blocks.Single().Reason);
+    }
+    [TestMethod]
+    public void IntentionalStatusPausePersistsAcrossStatusUntilExplicitEnd()
+    {
+        var tracker = new ParticipantSessionTracker();
+        var ready = new StatusPacket("ESP01", 0, TimerState.Ready, 0);
+        IPAddress address = IPAddress.Parse("192.168.5.101");
+        tracker.ObserveStatus(ready, address, Now);
+        long generation = tracker.Snapshot.Generation;
+
+        tracker.BeginIntentionalStatusPause();
+        tracker.ObserveStatus(ready, address, Now + TimeSpan.FromSeconds(1));
+        tracker.ObserveConnectivity(
+            Now + TimeSpan.FromMinutes(10),
+            TimeSpan.FromSeconds(6),
+            monitoringEnabled: true);
+        tracker.ObserveStatus(ready, address, Now + TimeSpan.FromMinutes(10) + TimeSpan.FromSeconds(1));
+        Assert.AreEqual(generation, tracker.Snapshot.Generation);
+
+        tracker.EndIntentionalStatusPause();
+        tracker.ObserveConnectivity(
+            Now + TimeSpan.FromMinutes(11),
+            TimeSpan.FromSeconds(6),
+            monitoringEnabled: true);
+        tracker.ObserveStatus(ready, address, Now + TimeSpan.FromMinutes(11) + TimeSpan.FromSeconds(1));
+        Assert.AreEqual(generation + 1, tracker.Snapshot.Generation);
+    }
+
 }

@@ -47,7 +47,7 @@ dotnet run --project .\windows-controller\FactoryTimer.Controller\FactoryTimer.C
 
 The app locates an operational IPv4 Wi-Fi adapter and computes its directed broadcast address from the adapter address and prefix length. It does not assume a `/24` network. Leave the manual override empty for normal use. For a lab or loopback relay test, enter a specific IPv4 destination before pressing START or RESET.
 
-The app binds one asynchronous UDP socket to the selected Wi-Fi address (or all IPv4 interfaces when no Wi-Fi adapter is available). The same socket sends three command copies about 40 ms apart and receives unicast ACK/STATUS responses. A device is ONLINE after a valid response and OFFLINE after five seconds without status; firmware heartbeat status is sent every two seconds.
+The app binds one asynchronous UDP socket to the selected Wi-Fi address (or all IPv4 interfaces when no Wi-Fi adapter is available). The same socket sends commands and receives unicast ACK/STATUS responses. Normal discovery/status monitoring runs while timers are not in a production countdown. During RUNNING, v6.20+ production policy pauses automatic STATUS traffic and preserves the known RUNNING session until the run ends or the operator explicitly requests status.
 
 ## ESP32 firmware
 
@@ -239,3 +239,13 @@ The Windows controller now exposes `8 + 8 — baseline` and `4 + 4 — candidate
 ## Operator installer
 
 For factory-PC deployment, use the self-contained installer build in `installer/`. See `installer/README.md` and `INSTALLER_DEPLOYMENT.md`. The generated setup EXE contains the self-contained .NET 10 + Windows App SDK application and the Microsoft Visual C++ x64 prerequisite, so operator PCs do not need Visual Studio, the .NET SDK, or a separately installed .NET runtime for this app.
+
+
+## v6.20 production-silent RUNNING
+
+During a production countdown the controller does not poll timer STATUS automatically. Use **REFRESH STATUS (SELECTED)** for an operator-requested one-shot status query. RESET remains available. If the controller starts while a timer is already RUNNING, it takes one discovery snapshot and then returns to silent RUNNING operation. See `V6_20_PRODUCTION_SILENT_CONTROLLER.md`.
+
+
+## v6.21 RTC-qualified START
+
+The production START button now automatically waits up to 90 seconds for every selected DS3231 discipline to satisfy the START gate (`LOCKED`, at least 64 fit points, fit RMS <= 3.0 us, zero SQW queue drops, valid RTC temperature). Once ready, the existing fixed 8+8 synchronization, +/-3 ms gate, common T*, ARM/final barrier, and production-silent RUNNING sequence continues automatically. v6.21 firmware extends FCT2 STATUS with the RTC qualification metrics required by this gate. See `V6_21_RTC_QUALIFIED_START_CONTROLLER.md`.

@@ -30,6 +30,9 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
     private string rssi = "—";
     private string wifiChannelText = "—";
     private string bssid = "—";
+    private string lastStatusText = "Never";
+    private DateTimeOffset? lastStatusAtUtc;
+    private uint? lastStatusRemainingSeconds;
     private readonly DeviceStatusTracker statusTracker = new();
     private ulong pendingCommandId;
     private bool synchronizationAccepted;
@@ -78,6 +81,7 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
     public string Rssi { get => rssi; private set => SetProperty(ref rssi, value); }
     public string WifiChannelText { get => wifiChannelText; private set => SetProperty(ref wifiChannelText, value); }
     public string Bssid { get => bssid; private set => SetProperty(ref bssid, value); }
+    public string LastStatusText { get => lastStatusText; private set => SetProperty(ref lastStatusText, value); }
     public long? ResidualErrorMicroseconds => residualErrorMicroseconds;
     public long? VerificationOffsetMicroseconds => verificationOffsetMicroseconds;
     public long? AppliedOffsetMicroseconds => appliedOffsetMicroseconds;
@@ -135,7 +139,11 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
             session.IpAddress,
             session.TimerState,
             session.CommandId,
-            session.RtcState);
+            session.RtcState,
+            session.RtcFitPoints,
+            session.RtcFitRmsMicroseconds,
+            session.RtcQueueDrops,
+            session.RtcTemperatureValid);
     }
 
     public bool TryGetIpAddress(out IPAddress? address) =>
@@ -215,6 +223,9 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         uint remainingSecondsPart = status.RemainingSeconds % 60u;
         RemainingSeconds = $"{remainingMinutes:00}:{remainingSecondsPart:00}";
         State = status.State.ToString().ToUpperInvariant();
+        lastStatusAtUtc = now;
+        lastStatusRemainingSeconds = status.RemainingSeconds;
+        LastStatusText = now.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture);
 
         if (status.RssiDbm.HasValue)
         {
@@ -235,11 +246,38 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         RefreshOnlineStatus(now);
     }
 
+    public void UpdateRunningRemainingEstimate(DateTimeOffset nowUtc)
+    {
+        if (!string.Equals(State, "RUNNING", StringComparison.Ordinal) ||
+            !lastStatusAtUtc.HasValue || !lastStatusRemainingSeconds.HasValue)
+        {
+            return;
+        }
+
+        double elapsedSeconds = Math.Max(0d, (nowUtc - lastStatusAtUtc.Value).TotalSeconds);
+        uint elapsedWholeSeconds = elapsedSeconds >= uint.MaxValue
+            ? uint.MaxValue
+            : (uint)Math.Floor(elapsedSeconds);
+        uint remaining = elapsedWholeSeconds >= lastStatusRemainingSeconds.Value
+            ? 0u
+            : lastStatusRemainingSeconds.Value - elapsedWholeSeconds;
+        RemainingSeconds = $"{remaining / 60u:00}:{remaining % 60u:00}";
+    }
+
     public void ObserveSyncLocalTimestamp(long localTimestampMicroseconds) =>
         sessionTracker.ObserveLocalTimestamp(localTimestampMicroseconds);
 
-    public void BeginIntentionalStatusPause() =>
+    public void BeginIntentionalStatusPause()
+    {
         sessionTracker.BeginIntentionalStatusPause();
+        statusTracker.BeginIntentionalStatusPause();
+    }
+
+    public void EndIntentionalStatusPause()
+    {
+        sessionTracker.EndIntentionalStatusPause();
+        statusTracker.EndIntentionalStatusPause();
+    }
 
     public void MarkSynchronizing()
     {

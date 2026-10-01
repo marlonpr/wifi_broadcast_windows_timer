@@ -342,4 +342,21 @@ public sealed class StatusDiscoveryTests
         Assert.IsFalse(transport.Requests.Any(request =>
             request.Destination.Equals(IPAddress.Parse("192.168.0.255"))));
     }
+    [TestMethod]
+    public void IntentionalStatusPauseKeepsKnownDeviceOnlineUntilExplicitEnd()
+    {
+        var tracker = new DeviceStatusTracker();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        tracker.BeginSearching(now);
+        tracker.RecordValidStatus(now);
+
+        tracker.BeginIntentionalStatusPause();
+        Assert.AreEqual(DeviceAvailability.Online,
+            tracker.GetAvailability(now + TimeSpan.FromMinutes(10)));
+
+        tracker.EndIntentionalStatusPause();
+        Assert.AreEqual(DeviceAvailability.Offline,
+            tracker.GetAvailability(now + TimeSpan.FromMinutes(10)));
+    }
+
 }

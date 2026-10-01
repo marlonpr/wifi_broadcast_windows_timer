@@ -115,6 +115,9 @@
                             <Button Grid.Column="1" Content="RESET" Click="Reset_Click"
                                     IsEnabled="{Binding CanSend}" HorizontalAlignment="Stretch" />
                         </Grid>
+                        <Button Content="REFRESH STATUS (SELECTED)" Click="RefreshStatus_Click"
+                                IsEnabled="{Binding CanSend}" HorizontalAlignment="Stretch"
+                                ToolTipService.ToolTip="One-shot STATUS request. Automatic polling stays paused while timers are running." />
                     </StackPanel>
                 </Grid>
             </Border>
@@ -153,6 +156,15 @@
                                             <TextBlock Grid.Column="2" Text="Remaining" Margin="12,0,0,0"
                                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                             <TextBlock Grid.Column="3" Text="{Binding RemainingSeconds}" FontFamily="Consolas" />
+                                        </Grid>
+                                        <Grid ColumnSpacing="8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="Last status" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            <TextBlock Grid.Column="1" Text="{Binding LastStatusText}" HorizontalAlignment="Right"
+                                                       FontFamily="Consolas" />
                                         </Grid>
                                     </StackPanel>
                                 </Border>

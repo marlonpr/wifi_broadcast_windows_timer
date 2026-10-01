@@ -66,6 +66,9 @@ public sealed partial class MainWindow : Window
 
     private async void Reset_Click(object sender, RoutedEventArgs e) => await viewModel.SendResetAsync();
 
+    private async void RefreshStatus_Click(object sender, RoutedEventArgs e) =>
+        await viewModel.RefreshSelectedStatusAsync();
+
     private async void Brightness_Click(object sender, RoutedEventArgs e) =>
         await viewModel.SendBrightnessAsync();
 
