@@ -27,7 +27,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private const int ConsensusLowRttSampleCount = 3;
     private const long SyncQualityThresholdMicroseconds = 3_000; // legacy/manual diagnostics only
     private const long ForwardTop3SpreadRetryLimitMicroseconds = 150;
-    // Diagnostic/uncertainty reference only in v6.22.4.  Cal/verification
+    // Diagnostic/uncertainty reference only in v6.22.7.  Cal/verification
     // disagreement no longer triggers a retry; only the cumulative pooled top-3
     // forward-floor spread does.
     private const long ForwardCalibrationVerificationDeltaReferenceMicroseconds = 500;
@@ -795,7 +795,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         IReadOnlyList<SyncMeasurement> samples,
         int sampleCount)
     {
-        // Production v6.22.4 keeps the median of the three fastest forward-ingress
+        // Production v6.22.7 keeps the median of the three fastest forward-ingress
         // samples (the second-fastest sample).  The 10-run post-v6.22 analyzer
         // series exposed one case where the third-fastest sample was ~200 us
         // slower than the first two; averaging all three moved b0 by ~60 us.
@@ -3159,6 +3159,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     prepared.TargetMasterMicroseconds,
                     prepared.DurationSeconds,
                     prepared.Participants.Select(participant => participant.Address).ToArray(),
+                    prepared.Participants.Select(participant => participant.Device.DeviceId).ToArray(),
                     productionSyncOrderLabel,
                     BuildSyncQualityTraceSummary(prepared.Participants));
 
@@ -4632,6 +4633,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         long targetMasterMicroseconds,
         uint durationSeconds,
         IReadOnlyList<IPAddress> statusUnicastTargets,
+        IReadOnlyList<string> participantDeviceIds,
         string syncOrder,
         string syncQualitySummary)
     {
@@ -4640,6 +4642,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             targetMasterMicroseconds,
             durationSeconds,
             statusUnicastTargets,
+            participantDeviceIds,
             syncOrder,
             syncQualitySummary);
 
@@ -4676,32 +4679,83 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    private void RecordControllerHealthSnapshot(StatusPacket status)
+    {
+        lock (controllerTxTraceGate)
+        {
+            ControllerTxTraceSession? session = controllerTxTraceSession;
+            if (session is null || status.CommandId != session.CommandId ||
+                !session.ParticipantDeviceIds.Contains(status.DeviceId))
+            {
+                return;
+            }
+
+            DeviceHealthSnapshot snapshot = DeviceHealthSnapshot.FromStatus(
+                status, MasterClock.NowMicroseconds);
+
+            if (status.State == TimerState.Running)
+            {
+                // Preserve the first RUNNING status: firmware sends it immediately
+                // after START, so rtc_rate_ppm is the start-adjacent qualification
+                // value rather than a later manual-refresh sample.
+                if (!session.StartHealthByDevice.ContainsKey(status.DeviceId))
+                {
+                    session.StartHealthByDevice[status.DeviceId] = snapshot;
+                }
+            }
+            else if (status.State == TimerState.Finished)
+            {
+                // A later post-run STATUS_REQUEST may contain a more complete
+                // display summary than the immediate FINISHED state-change reply.
+                // Keep the latest FINISHED snapshot.
+                session.PostRunHealthByDevice[status.DeviceId] = snapshot;
+            }
+        }
+    }
+
     private async Task CompleteControllerTxTraceAfterRunAsync(
         ControllerTxTraceSession session)
     {
         try
         {
-            long captureEndUs = checked(
+            // After the countdown is over, explicitly fetch a compact FINISHED
+            // health snapshot from each frozen participant. This is outside the
+            // timing-critical run and avoids relying on 15 serial monitors or on
+            // the periodic discovery loop happening to poll every device before
+            // the trace is written.
+            long postRunHealthBeginUs = checked(
                 session.TargetMasterMicroseconds +
                 (long)session.DurationSeconds * 1_000_000L +
-                2_000_000L);
-            await WaitUntilMasterTimeAsync(captureEndUs, CancellationToken.None)
+                250_000L);
+            await WaitUntilMasterTimeAsync(postRunHealthBeginUs, CancellationToken.None)
+                .ConfigureAwait(false);
+            await CollectPostRunHealthAsync(session, CancellationToken.None)
                 .ConfigureAwait(false);
 
             ControllerTxTraceRow[] rows;
+            Dictionary<string, DeviceHealthSnapshot> startHealth;
+            Dictionary<string, DeviceHealthSnapshot> postRunHealth;
             lock (controllerTxTraceGate)
             {
                 if (!ReferenceEquals(controllerTxTraceSession, session)) return;
                 controllerTxTraceSession = null;
                 rows = session.Rows.ToArray();
+                startHealth = new Dictionary<string, DeviceHealthSnapshot>(
+                    session.StartHealthByDevice, StringComparer.Ordinal);
+                postRunHealth = new Dictionary<string, DeviceHealthSnapshot>(
+                    session.PostRunHealthByDevice, StringComparer.Ordinal);
             }
 
-            string path = await WriteControllerTxTraceCsvAsync(session, rows)
+            string fileStamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss");
+            string txPath = await WriteControllerTxTraceCsvAsync(session, rows, fileStamp)
+                .ConfigureAwait(false);
+            string healthPath = await WriteControllerHealthCsvAsync(
+                    session, startHealth, postRunHealth, fileStamp)
                 .ConfigureAwait(false);
             dispatcherQueue.TryEnqueue(() =>
             {
-                ControllerTxTracePath = $"TX trace: {path}";
-                StatusMessage = $"Controller TX timing trace saved: {path}";
+                ControllerTxTracePath = $"TX trace: {txPath} | Health: {healthPath}";
+                StatusMessage = $"Controller timing + fleet-health traces saved: {txPath}; {healthPath}";
             });
         }
         catch (Exception exception)
@@ -4713,9 +4767,45 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    private async Task CollectPostRunHealthAsync(
+        ControllerTxTraceSession session,
+        CancellationToken cancellationToken)
+    {
+        const int maxRounds = 2;
+        for (int round = 1; round <= maxRounds; round++)
+        {
+            KeyValuePair<string, IPAddress>[] missing;
+            lock (controllerTxTraceGate)
+            {
+                if (!ReferenceEquals(controllerTxTraceSession, session)) return;
+                missing = session.ParticipantAddresses
+                    .Where(pair => !session.PostRunHealthByDevice.ContainsKey(pair.Key))
+                    .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                    .ToArray();
+            }
+
+            if (missing.Length == 0) return;
+
+            foreach (KeyValuePair<string, IPAddress> target in missing)
+            {
+                await udpService.SendTaggedStatusRequestAsync(
+                    CreateCommandId(),
+                    target.Value,
+                    "HEALTH_STATUS_REQUEST",
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            // Replies are normally immediate. Give the full retry set enough
+            // time to arrive before deciding which devices still need a second
+            // post-run request.
+            await Task.Delay(350, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     private static async Task<string> WriteControllerTxTraceCsvAsync(
         ControllerTxTraceSession session,
-        IReadOnlyList<ControllerTxTraceRow> rows)
+        IReadOnlyList<ControllerTxTraceRow> rows,
+        string fileStamp)
     {
         string documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
         if (string.IsNullOrWhiteSpace(documents))
@@ -4727,7 +4817,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         Directory.CreateDirectory(directory);
         string path = Path.Combine(
             directory,
-            $"controller_tx_{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}_{session.CommandId:X16}.csv");
+            $"controller_tx_{fileStamp}_{session.CommandId:X16}.csv");
 
         var builder = new StringBuilder();
         builder.AppendLine(
@@ -4750,6 +4840,45 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 .Append(session.SyncOrder).Append(',')
                 .Append(session.SyncQualitySummary)
                 .AppendLine();
+        }
+
+        await File.WriteAllTextAsync(
+            path,
+            builder.ToString(),
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)).ConfigureAwait(false);
+        return path;
+    }
+
+    private static async Task<string> WriteControllerHealthCsvAsync(
+        ControllerTxTraceSession session,
+        IReadOnlyDictionary<string, DeviceHealthSnapshot> startHealth,
+        IReadOnlyDictionary<string, DeviceHealthSnapshot> postRunHealth,
+        string fileStamp)
+    {
+        string documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        if (string.IsNullOrWhiteSpace(documents))
+        {
+            documents = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        }
+
+        string directory = Path.Combine(documents, "FactoryTimer", "TimingQualification");
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(
+            directory,
+            $"controller_health_{fileStamp}_{session.CommandId:X16}.csv");
+
+        var builder = new StringBuilder();
+        builder.AppendLine(DeviceHealthSnapshot.CsvHeader);
+        foreach (string deviceId in session.ParticipantDeviceIds.OrderBy(id => id, StringComparer.Ordinal))
+        {
+            startHealth.TryGetValue(deviceId, out DeviceHealthSnapshot? start);
+            postRunHealth.TryGetValue(deviceId, out DeviceHealthSnapshot? post);
+            builder.AppendLine(DeviceHealthSnapshot.ToCsv(
+                session.CommandId, session.TargetMasterMicroseconds, session.DurationSeconds,
+                deviceId, "START", start));
+            builder.AppendLine(DeviceHealthSnapshot.ToCsv(
+                session.CommandId, session.TargetMasterMicroseconds, session.DurationSeconds,
+                deviceId, "POST_RUN", post));
         }
 
         await File.WriteAllTextAsync(
@@ -4798,6 +4927,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     break;
                 }
                 case StatusPacket status:
+                    RecordControllerHealthSnapshot(status);
                     device.Apply(status, e.RemoteEndPoint);
                     ObserveProductionRunningStatus(status);
                     break;
@@ -4929,17 +5059,174 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         long targetMasterMicroseconds,
         uint durationSeconds,
         IReadOnlyList<IPAddress> statusUnicastTargets,
+        IReadOnlyList<string> participantDeviceIds,
         string syncOrder,
         string syncQualitySummary)
     {
         public ulong CommandId { get; } = commandId;
         public long TargetMasterMicroseconds { get; } = targetMasterMicroseconds;
         public uint DurationSeconds { get; } = durationSeconds;
-        public IReadOnlyList<IPAddress> StatusUnicastTargets { get; } =
-            statusUnicastTargets.Distinct().ToArray();
+        public IReadOnlyDictionary<string, IPAddress> ParticipantAddresses { get; } =
+            BuildParticipantAddressMap(participantDeviceIds, statusUnicastTargets);
+        public IReadOnlyList<IPAddress> StatusUnicastTargets =>
+            ParticipantAddresses.Values.Distinct().ToArray();
+        public HashSet<string> ParticipantDeviceIds { get; } =
+            new(participantDeviceIds, StringComparer.Ordinal);
         public string SyncOrder { get; } = syncOrder;
         public string SyncQualitySummary { get; } = syncQualitySummary;
         public List<ControllerTxTraceRow> Rows { get; } = [];
+        public Dictionary<string, DeviceHealthSnapshot> StartHealthByDevice { get; } =
+            new(StringComparer.Ordinal);
+        public Dictionary<string, DeviceHealthSnapshot> PostRunHealthByDevice { get; } =
+            new(StringComparer.Ordinal);
+
+        private static IReadOnlyDictionary<string, IPAddress> BuildParticipantAddressMap(
+            IReadOnlyList<string> deviceIds,
+            IReadOnlyList<IPAddress> addresses)
+        {
+            if (deviceIds.Count != addresses.Count)
+            {
+                throw new ArgumentException("Participant device/address counts must match.");
+            }
+
+            var result = new Dictionary<string, IPAddress>(StringComparer.Ordinal);
+            for (int i = 0; i < deviceIds.Count; i++)
+            {
+                result[deviceIds[i]] = addresses[i];
+            }
+            return result;
+        }
+    }
+
+    private sealed record DeviceHealthSnapshot(
+        long CapturedMasterMicroseconds,
+        TimerState State,
+        RtcDisciplineState RtcState,
+        ushort? RtcFitPoints,
+        double? RtcFitRmsMicroseconds,
+        uint? RtcQueueDrops,
+        bool? RtcTemperatureValid,
+        double? RtcRatePpmVsRtc,
+        ulong? RtcFitOutliers,
+        ulong? RtcAcceptedEdges,
+        ulong? RtcInferredMissingEdges,
+        ulong? RtcHoldoverEntries,
+        double? RtcTemperatureC,
+        int? RtcSqwCore,
+        byte? HealthFlags,
+        long? SyncSourceOffsetMicroseconds,
+        long? SyncEpochLocalMicroseconds,
+        long? SyncEpochDisciplinedMicroseconds,
+        long? SyncMasterMinusDisciplinedMicroseconds,
+        long? SyncEpochMasterMicroseconds,
+        long? StartErrorMicroseconds,
+        long? SchedulerLatenessMicroseconds,
+        long? StartPublishLatenessMicroseconds,
+        long? WorstPublishLatenessMicroseconds,
+        uint? FrameNotReadyCount)
+    {
+        public const string CsvHeader =
+            "RunCommandId,TStarMasterUs,DurationSeconds,DeviceId,Phase,StatusCaptured,CapturedMasterUs,TimerState,RtcState," +
+            "RtcRatePpmVsRtc,RtcFitPoints,RtcFitRmsUs,RtcFitOutliers,RtcAcceptedEdges,RtcInferredMissingEdges,RtcHoldoverEntries,RtcQueueDrops,RtcTemperatureValid,RtcTemperatureC,RtcSqwCore,HealthFlags," +
+            "SyncEpochMasterMinusLocalUs,SyncEpochLocalUs,SyncEpochDisciplinedUs,SyncEpochMasterUs,SyncEpochMasterMinusDisciplinedUs," +
+            "StartErrorUs,SchedulerLatenessUs,StartPublishLatenessUs,WorstPublishLatenessUs,FrameNotReady";
+
+        public static DeviceHealthSnapshot FromStatus(StatusPacket status, long capturedMasterMicroseconds)
+        {
+            long? epochMasterUs = null;
+            if (status.SyncSourceOffsetMicroseconds.HasValue && status.SyncEpochLocalMicroseconds.HasValue)
+            {
+                epochMasterUs = checked(
+                    status.SyncSourceOffsetMicroseconds.Value +
+                    status.SyncEpochLocalMicroseconds.Value);
+            }
+
+            return new DeviceHealthSnapshot(
+                capturedMasterMicroseconds,
+                status.State,
+                status.RtcState,
+                status.RtcFitPoints,
+                status.RtcFitRmsMicroseconds,
+                status.RtcQueueDrops,
+                status.RtcTemperatureValid,
+                status.RtcRatePpmVsRtc,
+                status.RtcFitOutliers,
+                status.RtcAcceptedEdges,
+                status.RtcInferredMissingEdges,
+                status.RtcHoldoverEntries,
+                status.RtcTemperatureC,
+                status.RtcSqwCore,
+                status.HealthFlags,
+                status.SyncSourceOffsetMicroseconds,
+                status.SyncEpochLocalMicroseconds,
+                status.SyncEpochDisciplinedMicroseconds,
+                status.SyncMasterMinusDisciplinedMicroseconds,
+                epochMasterUs,
+                status.StartErrorMicroseconds,
+                status.SchedulerLatenessMicroseconds,
+                status.StartPublishLatenessMicroseconds,
+                status.WorstPublishLatenessMicroseconds,
+                status.FrameNotReadyCount);
+        }
+
+        public static string ToCsv(
+            ulong commandId,
+            long targetMasterMicroseconds,
+            uint durationSeconds,
+            string deviceId,
+            string phase,
+            DeviceHealthSnapshot? health)
+        {
+            static string Long(long? value) => value?.ToString(
+                System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            static string ULong(ulong? value) => value?.ToString(
+                System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            static string UInt(uint? value) => value?.ToString(
+                System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            static string UShort(ushort? value) => value?.ToString(
+                System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            static string Int(int? value) => value?.ToString(
+                System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            static string Byte(byte? value) => value?.ToString(
+                System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            static string Double(double? value, string format) => value?.ToString(
+                format, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            static string Bool(bool? value) => value.HasValue ? (value.Value ? "1" : "0") : string.Empty;
+
+            return string.Join(
+                ",",
+                commandId.ToString("X16"),
+                targetMasterMicroseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                durationSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                deviceId,
+                phase,
+                health is null ? "0" : "1",
+                health is null ? string.Empty : health.CapturedMasterMicroseconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                health?.State.ToString().ToUpperInvariant() ?? string.Empty,
+                health?.RtcState.ToString().ToUpperInvariant() ?? string.Empty,
+                Double(health?.RtcRatePpmVsRtc, "F6"),
+                UShort(health?.RtcFitPoints),
+                Double(health?.RtcFitRmsMicroseconds, "F3"),
+                ULong(health?.RtcFitOutliers),
+                ULong(health?.RtcAcceptedEdges),
+                ULong(health?.RtcInferredMissingEdges),
+                ULong(health?.RtcHoldoverEntries),
+                UInt(health?.RtcQueueDrops),
+                Bool(health?.RtcTemperatureValid),
+                Double(health?.RtcTemperatureC, "F2"),
+                Int(health?.RtcSqwCore),
+                Byte(health?.HealthFlags),
+                Long(health?.SyncSourceOffsetMicroseconds),
+                Long(health?.SyncEpochLocalMicroseconds),
+                Long(health?.SyncEpochDisciplinedMicroseconds),
+                Long(health?.SyncEpochMasterMicroseconds),
+                Long(health?.SyncMasterMinusDisciplinedMicroseconds),
+                Long(health?.StartErrorMicroseconds),
+                Long(health?.SchedulerLatenessMicroseconds),
+                Long(health?.StartPublishLatenessMicroseconds),
+                Long(health?.WorstPublishLatenessMicroseconds),
+                UInt(health?.FrameNotReadyCount));
+        }
     }
 
     private sealed record ControllerTxTraceRow(

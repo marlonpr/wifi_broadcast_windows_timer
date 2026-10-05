@@ -68,6 +68,23 @@ public enum ProtocolParseError
     RtcFitRms,
     RtcQueueDrops,
     RtcTemperatureValid,
+    RtcRate,
+    RtcFitOutliers,
+    RtcTemperature,
+    RtcSqwCore,
+    HealthFlags,
+    SyncSourceOffset,
+    SyncEpochLocal,
+    SyncEpochDisciplined,
+    SyncMasterMinusDisciplined,
+    StartError,
+    SchedulerLateness,
+    StartPublishLateness,
+    WorstPublishLateness,
+    FrameNotReady,
+    RtcAcceptedEdges,
+    RtcInferredMissingEdges,
+    RtcHoldoverEntries,
     Brightness,
 }
 
@@ -110,7 +127,24 @@ public sealed record StatusPacket(
     ushort? RtcFitPoints = null,
     double? RtcFitRmsMicroseconds = null,
     uint? RtcQueueDrops = null,
-    bool? RtcTemperatureValid = null) : InboundPacket(DeviceId);
+    bool? RtcTemperatureValid = null,
+    double? RtcRatePpmVsRtc = null,
+    ulong? RtcFitOutliers = null,
+    double? RtcTemperatureC = null,
+    int? RtcSqwCore = null,
+    byte? HealthFlags = null,
+    long? SyncSourceOffsetMicroseconds = null,
+    long? SyncEpochLocalMicroseconds = null,
+    long? SyncEpochDisciplinedMicroseconds = null,
+    long? SyncMasterMinusDisciplinedMicroseconds = null,
+    long? StartErrorMicroseconds = null,
+    long? SchedulerLatenessMicroseconds = null,
+    long? StartPublishLatenessMicroseconds = null,
+    long? WorstPublishLatenessMicroseconds = null,
+    uint? FrameNotReadyCount = null,
+    ulong? RtcAcceptedEdges = null,
+    ulong? RtcInferredMissingEdges = null,
+    ulong? RtcHoldoverEntries = null) : InboundPacket(DeviceId);
 
 public sealed record SyncReplyPacket(
     string DeviceId,
@@ -139,7 +173,7 @@ public static class FactoryProtocol
 {
     public const string Version1 = "FCT1";
     public const string Version2 = "FCT2";
-    public const int MaximumPacketLength = 191;
+    public const int MaximumPacketLength = 511;
     public const uint MinimumDurationSeconds = 1;
     public const uint MaximumDurationSeconds = 86_400;
     public const uint MinimumStartDelayMilliseconds = 100;
@@ -444,10 +478,12 @@ public static class FactoryProtocol
             return true;
         }
 
-        // Extended FCT2 STATUS adds Wi-Fi diagnostics and RTC qualification.
-        // Forms with 9 fields (Wi-Fi only), 10 fields (RTC state only), and
-        // 14 fields (v6.21 START qualification metrics) remain parseable.
-        if ((fields.Length == 9 || fields.Length == 10 || fields.Length == 14) &&
+        // Extended FCT2 STATUS adds Wi-Fi diagnostics, RTC qualification, and
+        // (v6.23.3+) compact fleet-health telemetry. Legacy 9/10/14-field
+        // forms and the v6.23.3 28-field health form remain parseable;
+        // v6.23.4 appends three RTC continuity counters (31 fields).
+        if ((fields.Length == 9 || fields.Length == 10 || fields.Length == 14 ||
+             fields.Length == 28 || fields.Length == 31) &&
             fields[0] == Version2 && fields[1] == "STATUS")
         {
             if (!ValidDeviceId(fields[2]))
@@ -487,17 +523,36 @@ public static class FactoryProtocol
                 error = ProtocolParseError.Bssid;
                 return false;
             }
+
             RtcDisciplineState rtcState = RtcDisciplineState.Unknown;
             ushort? rtcFitPoints = null;
             double? rtcFitRmsUs = null;
             uint? rtcQueueDrops = null;
             bool? rtcTemperatureValid = null;
+            double? rtcRatePpmVsRtc = null;
+            ulong? rtcFitOutliers = null;
+            double? rtcTemperatureC = null;
+            int? rtcSqwCore = null;
+            byte? healthFlags = null;
+            long? syncSourceOffsetUs = null;
+            long? syncEpochLocalUs = null;
+            long? syncEpochDisciplinedUs = null;
+            long? syncMasterMinusDisciplinedUs = null;
+            long? startErrorUs = null;
+            long? schedulerLatenessUs = null;
+            long? startPublishLatenessUs = null;
+            long? worstPublishLatenessUs = null;
+            uint? frameNotReadyCount = null;
+            ulong? rtcAcceptedEdges = null;
+            ulong? rtcInferredMissingEdges = null;
+            ulong? rtcHoldoverEntries = null;
+
             if (fields.Length >= 10 && !TryRtcDisciplineState(fields[9], out rtcState))
             {
                 error = ProtocolParseError.RtcDiscipline;
                 return false;
             }
-            if (fields.Length == 14)
+            if (fields.Length >= 14)
             {
                 if (!ushort.TryParse(fields[10], NumberStyles.None, CultureInfo.InvariantCulture, out ushort points))
                 {
@@ -525,9 +580,139 @@ public static class FactoryProtocol
                 rtcQueueDrops = queueDrops;
                 rtcTemperatureValid = fields[13] == "1";
             }
+
+            if (fields.Length == 28 || fields.Length == 31)
+            {
+                if (!double.TryParse(fields[14], NumberStyles.Float, CultureInfo.InvariantCulture, out double ratePpm) ||
+                    !double.IsFinite(ratePpm) || ratePpm is < -1_000_000d or > 1_000_000d)
+                {
+                    error = ProtocolParseError.RtcRate;
+                    return false;
+                }
+                if (!ulong.TryParse(fields[15], NumberStyles.None, CultureInfo.InvariantCulture, out ulong fitOutliers))
+                {
+                    error = ProtocolParseError.RtcFitOutliers;
+                    return false;
+                }
+                if (!double.TryParse(fields[16], NumberStyles.Float, CultureInfo.InvariantCulture, out double temperatureC) ||
+                    !double.IsFinite(temperatureC) || temperatureC is < -1000d or > 1000d)
+                {
+                    error = ProtocolParseError.RtcTemperature;
+                    return false;
+                }
+                if (!int.TryParse(fields[17], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out int sqwCore) ||
+                    sqwCore is < -1 or > 1)
+                {
+                    error = ProtocolParseError.RtcSqwCore;
+                    return false;
+                }
+                if (!byte.TryParse(fields[18], NumberStyles.None, CultureInfo.InvariantCulture, out byte flags) || flags > 7)
+                {
+                    error = ProtocolParseError.HealthFlags;
+                    return false;
+                }
+
+                if (!TryLong(fields[19], nonnegative: false, out long sourceOffset))
+                {
+                    error = ProtocolParseError.SyncSourceOffset;
+                    return false;
+                }
+                if (!TryLong(fields[20], nonnegative: true, out long epochLocal))
+                {
+                    error = ProtocolParseError.SyncEpochLocal;
+                    return false;
+                }
+                if (!TryLong(fields[21], nonnegative: true, out long epochDisciplined))
+                {
+                    error = ProtocolParseError.SyncEpochDisciplined;
+                    return false;
+                }
+                if (!TryLong(fields[22], nonnegative: false, out long masterMinusDisciplined))
+                {
+                    error = ProtocolParseError.SyncMasterMinusDisciplined;
+                    return false;
+                }
+                if (!TryLong(fields[23], nonnegative: false, out long startError))
+                {
+                    error = ProtocolParseError.StartError;
+                    return false;
+                }
+                if (!TryLong(fields[24], nonnegative: false, out long schedulerLateness))
+                {
+                    error = ProtocolParseError.SchedulerLateness;
+                    return false;
+                }
+                if (!TryLong(fields[25], nonnegative: false, out long startPublishLateness))
+                {
+                    error = ProtocolParseError.StartPublishLateness;
+                    return false;
+                }
+                if (!TryLong(fields[26], nonnegative: false, out long worstPublishLateness))
+                {
+                    error = ProtocolParseError.WorstPublishLateness;
+                    return false;
+                }
+                if (!uint.TryParse(fields[27], NumberStyles.None, CultureInfo.InvariantCulture, out uint frameNotReady))
+                {
+                    error = ProtocolParseError.FrameNotReady;
+                    return false;
+                }
+
+                if (fields.Length == 31)
+                {
+                    if (!ulong.TryParse(fields[28], NumberStyles.None, CultureInfo.InvariantCulture, out ulong acceptedEdges))
+                    {
+                        error = ProtocolParseError.RtcAcceptedEdges;
+                        return false;
+                    }
+                    if (!ulong.TryParse(fields[29], NumberStyles.None, CultureInfo.InvariantCulture, out ulong inferredMissingEdges))
+                    {
+                        error = ProtocolParseError.RtcInferredMissingEdges;
+                        return false;
+                    }
+                    if (!ulong.TryParse(fields[30], NumberStyles.None, CultureInfo.InvariantCulture, out ulong holdoverEntries))
+                    {
+                        error = ProtocolParseError.RtcHoldoverEntries;
+                        return false;
+                    }
+                    rtcAcceptedEdges = acceptedEdges;
+                    rtcInferredMissingEdges = inferredMissingEdges;
+                    rtcHoldoverEntries = holdoverEntries;
+                }
+
+                rtcRatePpmVsRtc = ratePpm;
+                rtcFitOutliers = fitOutliers;
+                rtcTemperatureC = temperatureC;
+                rtcSqwCore = sqwCore;
+                healthFlags = flags;
+                if ((flags & 0x01) != 0)
+                {
+                    syncSourceOffsetUs = sourceOffset;
+                    syncEpochLocalUs = epochLocal;
+                    syncEpochDisciplinedUs = epochDisciplined;
+                    syncMasterMinusDisciplinedUs = masterMinusDisciplined;
+                }
+                if ((flags & 0x02) != 0)
+                {
+                    startErrorUs = startError;
+                    schedulerLatenessUs = schedulerLateness;
+                }
+                if ((flags & 0x04) != 0)
+                {
+                    startPublishLatenessUs = startPublishLateness;
+                    worstPublishLatenessUs = worstPublishLateness;
+                    frameNotReadyCount = frameNotReady;
+                }
+            }
+
             packet = new StatusPacket(
                 fields[2], commandId, state, remaining, rssi, channel, fields[8], rtcState,
-                rtcFitPoints, rtcFitRmsUs, rtcQueueDrops, rtcTemperatureValid);
+                rtcFitPoints, rtcFitRmsUs, rtcQueueDrops, rtcTemperatureValid,
+                rtcRatePpmVsRtc, rtcFitOutliers, rtcTemperatureC, rtcSqwCore, healthFlags,
+                syncSourceOffsetUs, syncEpochLocalUs, syncEpochDisciplinedUs,
+                syncMasterMinusDisciplinedUs, startErrorUs, schedulerLatenessUs,
+                startPublishLatenessUs, worstPublishLatenessUs, frameNotReadyCount,
+                rtcAcceptedEdges, rtcInferredMissingEdges, rtcHoldoverEntries);
             return true;
         }
 

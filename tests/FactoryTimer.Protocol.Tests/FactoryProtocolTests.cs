@@ -204,6 +204,8 @@ public sealed class FactoryProtocolTests
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|AA:BB:CC:DD:EE:FF|LOCKED|64|NaN|0|1", ProtocolParseError.RtcFitRms)]
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|AA:BB:CC:DD:EE:FF|LOCKED|64|0.500|x|1", ProtocolParseError.RtcQueueDrops)]
     [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|AA:BB:CC:DD:EE:FF|LOCKED|64|0.500|0|2", ProtocolParseError.RtcTemperatureValid)]
+    [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|AA:BB:CC:DD:EE:FF|LOCKED|64|0.500|0|1|NaN|0|25.00|1|7|1|2|3|4|5|6|7|8|0", ProtocolParseError.RtcRate)]
+    [DataRow("FCT2|STATUS|ESP01|0123456789ABCDEF|RUNNING|19|-50|6|AA:BB:CC:DD:EE:FF|LOCKED|64|0.500|0|1|4.2|0|25.00|1|8|1|2|3|4|5|6|7|8|0", ProtocolParseError.HealthFlags)]
     public void RejectsMalformedOrUnsupportedInbound(string text, ProtocolParseError expected)
     {
         Assert.IsFalse(FactoryProtocol.TryParseInbound(text, out _, out ProtocolParseError actual));
@@ -215,7 +217,7 @@ public sealed class FactoryProtocolTests
     {
         Assert.IsFalse(FactoryProtocol.TryParseInbound([0x46, 0x00], out _, out ProtocolParseError binaryError));
         Assert.AreEqual(ProtocolParseError.NonPrintable, binaryError);
-        Assert.IsFalse(FactoryProtocol.TryParseInbound(new string('X', 192), out _, out ProtocolParseError longError));
+        Assert.IsFalse(FactoryProtocol.TryParseInbound(new string('X', 384), out _, out ProtocolParseError longError));
         Assert.AreEqual(ProtocolParseError.TooLong, longError);
     }
 
@@ -260,6 +262,59 @@ public sealed class FactoryProtocolTests
         Assert.AreEqual(0.785, status.RtcFitRmsMicroseconds!.Value, 0.0001);
         Assert.AreEqual(0u, status.RtcQueueDrops!.Value);
         Assert.IsTrue(status.RtcTemperatureValid!.Value);
+    }
+
+    [TestMethod]
+    public void ParsesV6233FleetHealthStatus()
+    {
+        const string text =
+            "FCT2|STATUS|ESP02|0123456789ABCDEF|FINISHED|0|-45|9|AA:BB:CC:DD:EE:FF|LOCKED|129|0.543|0|1|-6.742095|0|28.25|1|7|-4180060465|5460668433|5460704789|-4180096821|0|0|28|49|0";
+
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(text, out InboundPacket? packet, out ProtocolParseError error));
+        Assert.AreEqual(ProtocolParseError.None, error);
+        StatusPacket status = (StatusPacket)packet!;
+        Assert.AreEqual(-6.742095, status.RtcRatePpmVsRtc!.Value, 0.000001);
+        Assert.AreEqual(0UL, status.RtcFitOutliers!.Value);
+        Assert.AreEqual(28.25, status.RtcTemperatureC!.Value, 0.001);
+        Assert.AreEqual(1, status.RtcSqwCore!.Value);
+        Assert.AreEqual((byte)7, status.HealthFlags!.Value);
+        Assert.AreEqual(-4180060465L, status.SyncSourceOffsetMicroseconds!.Value);
+        Assert.AreEqual(5460668433L, status.SyncEpochLocalMicroseconds!.Value);
+        Assert.AreEqual(5460704789L, status.SyncEpochDisciplinedMicroseconds!.Value);
+        Assert.AreEqual(-4180096821L, status.SyncMasterMinusDisciplinedMicroseconds!.Value);
+        Assert.AreEqual(0L, status.StartErrorMicroseconds!.Value);
+        Assert.AreEqual(0L, status.SchedulerLatenessMicroseconds!.Value);
+        Assert.AreEqual(28L, status.StartPublishLatenessMicroseconds!.Value);
+        Assert.AreEqual(49L, status.WorstPublishLatenessMicroseconds!.Value);
+        Assert.AreEqual(0U, status.FrameNotReadyCount!.Value);
+    }
+
+
+    [TestMethod]
+    public void ParsesV6234QualificationContinuityCounters()
+    {
+        const string text =
+            "FCT2|STATUS|ESP02|0123456789ABCDEF|FINISHED|0|-45|9|AA:BB:CC:DD:EE:FF|LOCKED|129|0.543|0|1|-6.742095|0|28.25|1|7|-4180060465|5460668433|5460704789|-4180096821|0|0|28|49|0|5461|0|0";
+
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(text, out InboundPacket? packet, out ProtocolParseError error));
+        Assert.AreEqual(ProtocolParseError.None, error);
+        StatusPacket status = (StatusPacket)packet!;
+        Assert.AreEqual(5461UL, status.RtcAcceptedEdges!.Value);
+        Assert.AreEqual(0UL, status.RtcInferredMissingEdges!.Value);
+        Assert.AreEqual(0UL, status.RtcHoldoverEntries!.Value);
+    }
+
+    [TestMethod]
+    public void V6233HealthFlagsKeepInvalidGroupsUnknown()
+    {
+        const string text =
+            "FCT2|STATUS|ESP02|0000000000000000|READY|0|-45|9|AA:BB:CC:DD:EE:FF|LOCKED|129|0.543|0|1|-6.742095|0|28.25|1|0|0|0|0|0|0|0|0|0|0";
+
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(text, out InboundPacket? packet, out _));
+        StatusPacket status = (StatusPacket)packet!;
+        Assert.IsNull(status.SyncSourceOffsetMicroseconds);
+        Assert.IsNull(status.StartErrorMicroseconds);
+        Assert.IsNull(status.StartPublishLatenessMicroseconds);
     }
 
     [TestMethod]

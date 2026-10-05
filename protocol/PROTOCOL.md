@@ -142,15 +142,28 @@ START_AT transmission is never artificially delayed by this experiment. The cont
 
 ## Extended STATUS diagnostics
 
-Current v6.21 firmware emits an FCT2 STATUS packet with Wi-Fi diagnostics and RTC START-qualification fields:
+Firmware v6.23.4 emits a 31-field FCT2 STATUS. The first 28 fields preserve the v6.23.3 fleet-health form; three cumulative RTC continuity counters are appended:
 
 ```text
-FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF|LOCKED|129|0.785|0|1
+FCT2|STATUS|<DeviceId>|<CommandId>|<State>|<Remaining>|<RSSI>|<Channel>|<BSSID>|<RtcState>|<FitPoints>|<FitRmsUs>|<QueueDrops>|<TempValid>|<RtcRatePpmVsRtc>|<FitOutliers>|<RtcTempC>|<SqwCore>|<HealthFlags>|<SyncSourceOffsetUs>|<SyncEpochLocalUs>|<SyncEpochDisciplinedUs>|<SyncMasterMinusDisciplinedUs>|<StartErrorUs>|<SchedulerLatenessUs>|<StartPublishLatenessUs>|<WorstPublishLatenessUs>|<FrameNotReady>|<RtcAcceptedEdges>|<RtcInferredMissingEdges>|<RtcHoldoverEntries>
 ```
 
-Fields after `remaining` are RSSI in dBm, Wi-Fi primary channel, BSSID, RTC discipline state, RTC fit-point count, RTC fit RMS in microseconds, SQW ISR queue-drop count, and temperature-valid (`0`/`1`).
+`HealthFlags` is a bit mask:
 
-The v6.21 parser still accepts legacy six-field FCT1 STATUS, nine-field FCT2 Wi-Fi STATUS, and ten-field FCT2 RTC-state STATUS for diagnostics/discovery. Production START qualification, however, requires the v6.21 RTC metrics.
+- bit 0 (`1`): sync-epoch fields are valid;
+- bit 1 (`2`): START scheduler fields are valid for this `CommandId`;
+- bit 2 (`4`): display publication fields are valid for this `CommandId`.
+
+The DS3231/countdown-rate qualification quantity is evaluated at the same selected forward-sync epoch:
+
+```text
+Master - Disciplined =
+    SyncSourceOffsetUs + SyncEpochLocalUs - SyncEpochDisciplinedUs
+```
+
+`SyncMasterMinusDisciplinedUs` carries that result directly. The slope of raw `Master - Local` must not be used to qualify the RTC because `Local` is the ESP32 `esp_timer` timebase.
+
+The parser remains backward compatible with legacy six-field FCT1 STATUS plus 9-, 10-, 14-, and 28-field FCT2 STATUS packets. The 31-field v6.23.4 form is required for guarded two-START RTC qualification because it supplies accepted-edge, inferred-missing, and holdover-entry continuity counters.
 
 ## Verification quality gate and retry
 
