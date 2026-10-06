@@ -195,3 +195,40 @@ FCT2|CMD|BRIGHTNESS|<CommandId>|<percent>|0
 ```
 
 `percent` is an integer from `0` through `100`. `0` blanks LED output; `100` is maximum output brightness. The device replies with the ordinary ACK form using command type `BRIGHTNESS`. This setting does not alter timer state, synchronization state, START_AT scheduling, or the idle-logo framebuffer. It is runtime-only: after reboot the firmware returns to its build-time `CONFIG_FACTORY_DISPLAY_BRIGHTNESS` default.
+
+## v6.23.11 fleet CPU0 monitor STATUS suffix
+
+Firmware v6.23.11 appends eleven fields to the v6.23.4 31-field `FCT2|STATUS` form,
+producing 42 fields total:
+
+```text
+...|RtcAcceptedEdges|RtcInferredMissingEdges|RtcHoldoverEntries|
+Cpu0MonitorValid|Cpu0MonitorSamplesHex|Cpu0MonitorEventCountHex|
+Cpu0MonitorWorstUsHex|Cpu0MonitorWorstTask|Cpu0CommitLateCountHex|
+Cpu0CommitWorstUsHex|Cpu0CommitOverlap|Cpu0WrongCoreCallbacksHex|
+Cpu0MonitorOverflowHex|Cpu0InterruptLevelMatch
+```
+
+The six CPU0 numeric counters/lateness values use unsigned hexadecimal text without
+`0x` on the wire to preserve the 511-byte maximum packet envelope. Boolean fields use
+`0`/`1`. Task names are limited to 15 characters. The Windows controller exposes the
+parsed values as decimal numbers in its health CSV.
+
+
+## v6.23.15 sampler hardening STATUS suffix
+
+Firmware v6.23.15 extends the 42-field fleet-monitor STATUS with two fields,
+producing **44 fields total**:
+
+```text
+...|Cpu0InterruptLevelMatch|Cpu0MonitorMissedPeriodsHex|FirmwareElfSha8
+```
+
+`Cpu0MonitorMissedPeriodsHex` counts 250 us GPTimer deadlines skipped while one
+alarm ISR remained pending. It is independent of the >=50 us event-retention
+threshold and is exported as decimal `Cpu0MonitorMissedPeriods` plus derived
+`Cpu0MonitorExpectedPeriods = Cpu0MonitorSamples + Cpu0MonitorMissedPeriods` in
+the controller health CSV. `FirmwareElfSha8` is the first eight hexadecimal
+characters reported by `esp_app_get_elf_sha256()` and ties every STATUS row to
+the exact flashed ELF. The controller remains backward-compatible with the
+42-field v6.23.11 form.

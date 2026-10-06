@@ -1,4 +1,11 @@
-Factory Timer Windows controller / qualification tooling
-Controller runtime baseline: v6.22.7 validated synchronization path unchanged
-Qualification tooling: v6.22.8 10-minute START1 warm-up gate + batch-median module acceptance
-Firmware expected for flash-stall diagnostic: v6.23.5 diagnostic (v6.23.4 timing behavior unchanged)
+Factory Timer Windows controller
+Controller variant: v6.22.12 rollout hardening
+Functional baseline: v6.22.11 behavior unchanged
+Protocol: parses legacy FCT2 STATUS forms plus 42-field and 44-field fleet-monitor forms
+Health CSV: adds Cpu0MonitorMissedPeriods, Cpu0MonitorExpectedPeriods, FirmwareBuildId, StatusFieldCount
+TX CSV: explicit post-run HEALTH_STATUS_REQUEST packets remain in the trace until files are written
+Fleet exposure: clean board-hours are sample-derived; canary/missed-period/legacy/invalid rows contribute zero clean exposure
+Fleet tool: flags sample-grid misses, legacy STATUS, sample-rate drift, lat_canary contamination and build-ID absence
+Statistics: one-sided 95% zero-event upper bound per device and fleet-wide
+Closure gate: 60 clean fleet board-hours + >=4 clean ESP02 hours by default
+Canary tools: boundary-overlap, 1000 us mid-second task, and 1000 us same-level ISR validators

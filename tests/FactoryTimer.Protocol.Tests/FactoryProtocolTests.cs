@@ -175,14 +175,14 @@ public sealed class FactoryProtocolTests
             out InboundPacket? status,
             out _));
         Assert.AreEqual(
-            new StatusPacket("ESP02", 0x0123456789abcdef, TimerState.Running, 19), status);
+            new StatusPacket("ESP02", 0x0123456789abcdef, TimerState.Running, 19, StatusFieldCount: 6), status);
 
         Assert.IsTrue(FactoryProtocol.TryParseInbound(
             Encoding.ASCII.GetBytes("FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF"),
             out InboundPacket? extendedStatus,
             out _));
         Assert.AreEqual(
-            new StatusPacket("ESP03", 0x0123456789abcdef, TimerState.Running, 19, -57, 6, "AA:BB:CC:DD:EE:FF"),
+            new StatusPacket("ESP03", 0x0123456789abcdef, TimerState.Running, 19, -57, 6, "AA:BB:CC:DD:EE:FF", StatusFieldCount: 9),
             extendedStatus);
     }
 
@@ -329,6 +329,48 @@ public sealed class FactoryProtocolTests
         Assert.IsNull(status.RtcFitRmsMicroseconds);
         Assert.IsNull(status.RtcQueueDrops);
         Assert.IsNull(status.RtcTemperatureValid);
+    }
+
+    [TestMethod]
+    public void ParsesFleetCpu0MonitorStatus()
+    {
+        const string text =
+            "FCT2|STATUS|ESP02|0123456789ABCDEF|FINISHED|0|-45|9|AA:BB:CC:DD:EE:FF|LOCKED|129|0.543|0|1|-6.742095|0|28.25|1|7|-4180060465|5460668433|5460704789|-4180096821|0|0|28|49|0|5461|0|0|1|6DDD00|3|1C9|IDLE0|2|1C9|1|0|0|1";
+
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(Encoding.ASCII.GetBytes(text), out InboundPacket? packet, out ProtocolParseError error), error.ToString());
+        StatusPacket status = (StatusPacket)packet!;
+        Assert.AreEqual(true, status.Cpu0MonitorValid);
+        Assert.AreEqual(7_200_000U, status.Cpu0MonitorSamples);
+        Assert.AreEqual(3U, status.Cpu0MonitorEventCount);
+        Assert.AreEqual(457U, status.Cpu0MonitorWorstMicroseconds);
+        Assert.AreEqual("IDLE0", status.Cpu0MonitorWorstTask);
+        Assert.AreEqual(2U, status.Cpu0CommitLateCount);
+        Assert.AreEqual(457U, status.Cpu0CommitWorstMicroseconds);
+        Assert.AreEqual(true, status.Cpu0CommitOverlap);
+        Assert.AreEqual(0U, status.Cpu0WrongCoreCallbacks);
+        Assert.AreEqual(0U, status.Cpu0MonitorOverflow);
+        Assert.AreEqual(42, status.StatusFieldCount);
+        Assert.AreEqual(true, status.Cpu0InterruptLevelMatch);
+    }
+
+    [TestMethod]
+    public void ParsesFleetCpu0MonitorStatusV62315()
+    {
+        const string text =
+            "FCT2|STATUS|ESP02|0123456789ABCDEF|FINISHED|0|-45|9|AA:BB:CC:DD:EE:FF|LOCKED|129|0.543|0|1|-6.742095|A|28.25|1|7|-4180060465|5460668433|5460704789|-4180096821|0|0|28|49|0|1555|0|0|1|6DDD00|3|1C9|IDLE0|2|1C9|1|0|0|1|2|deadbeef";
+
+        Assert.IsTrue(FactoryProtocol.TryParseInbound(Encoding.ASCII.GetBytes(text), out InboundPacket? packet, out ProtocolParseError error), error.ToString());
+        StatusPacket status = (StatusPacket)packet!;
+        Assert.AreEqual(10UL, status.RtcFitOutliers);
+        Assert.AreEqual(0x1555UL, status.RtcAcceptedEdges);
+        Assert.AreEqual(true, status.Cpu0MonitorValid);
+        Assert.AreEqual(7_200_000U, status.Cpu0MonitorSamples);
+        Assert.AreEqual(3U, status.Cpu0MonitorEventCount);
+        Assert.AreEqual(457U, status.Cpu0MonitorWorstMicroseconds);
+        Assert.AreEqual("IDLE0", status.Cpu0MonitorWorstTask);
+        Assert.AreEqual(2U, status.Cpu0MonitorMissedPeriods);
+        Assert.AreEqual("deadbeef", status.FirmwareBuildId);
+        Assert.AreEqual(44, status.StatusFieldCount);
     }
 
 }

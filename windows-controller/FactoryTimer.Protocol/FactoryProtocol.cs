@@ -85,6 +85,19 @@ public enum ProtocolParseError
     RtcAcceptedEdges,
     RtcInferredMissingEdges,
     RtcHoldoverEntries,
+    Cpu0MonitorValid,
+    Cpu0MonitorSamples,
+    Cpu0MonitorEventCount,
+    Cpu0MonitorWorst,
+    Cpu0MonitorWorstTask,
+    Cpu0CommitLateCount,
+    Cpu0CommitWorst,
+    Cpu0CommitOverlap,
+    Cpu0WrongCoreCallbacks,
+    Cpu0MonitorOverflow,
+    Cpu0InterruptLevelMatch,
+    Cpu0MonitorMissedPeriods,
+    FirmwareBuildId,
     Brightness,
 }
 
@@ -144,7 +157,21 @@ public sealed record StatusPacket(
     uint? FrameNotReadyCount = null,
     ulong? RtcAcceptedEdges = null,
     ulong? RtcInferredMissingEdges = null,
-    ulong? RtcHoldoverEntries = null) : InboundPacket(DeviceId);
+    ulong? RtcHoldoverEntries = null,
+    bool? Cpu0MonitorValid = null,
+    uint? Cpu0MonitorSamples = null,
+    uint? Cpu0MonitorEventCount = null,
+    uint? Cpu0MonitorWorstMicroseconds = null,
+    string? Cpu0MonitorWorstTask = null,
+    uint? Cpu0CommitLateCount = null,
+    uint? Cpu0CommitWorstMicroseconds = null,
+    bool? Cpu0CommitOverlap = null,
+    uint? Cpu0WrongCoreCallbacks = null,
+    uint? Cpu0MonitorOverflow = null,
+    bool? Cpu0InterruptLevelMatch = null,
+    uint? Cpu0MonitorMissedPeriods = null,
+    string? FirmwareBuildId = null,
+    int StatusFieldCount = 0) : InboundPacket(DeviceId);
 
 public sealed record SyncReplyPacket(
     string DeviceId,
@@ -481,9 +508,11 @@ public static class FactoryProtocol
         // Extended FCT2 STATUS adds Wi-Fi diagnostics, RTC qualification, and
         // (v6.23.3+) compact fleet-health telemetry. Legacy 9/10/14-field
         // forms and the v6.23.3 28-field health form remain parseable;
-        // v6.23.4 appends three RTC continuity counters (31 fields).
+        // v6.23.4 appends three RTC continuity counters (31 fields), and
+        // v6.23.11 appends eleven compact CPU0-monitor fields (42 fields);
+        // v6.23.15 appends missed-period count and ELF-SHA8 build identity (44 fields).
         if ((fields.Length == 9 || fields.Length == 10 || fields.Length == 14 ||
-             fields.Length == 28 || fields.Length == 31) &&
+             fields.Length == 28 || fields.Length == 31 || fields.Length == 42 || fields.Length == 44) &&
             fields[0] == Version2 && fields[1] == "STATUS")
         {
             if (!ValidDeviceId(fields[2]))
@@ -546,6 +575,19 @@ public static class FactoryProtocol
             ulong? rtcAcceptedEdges = null;
             ulong? rtcInferredMissingEdges = null;
             ulong? rtcHoldoverEntries = null;
+            bool? cpu0MonitorValid = null;
+            uint? cpu0MonitorSamples = null;
+            uint? cpu0MonitorEventCount = null;
+            uint? cpu0MonitorWorstUs = null;
+            string? cpu0MonitorWorstTask = null;
+            uint? cpu0CommitLateCount = null;
+            uint? cpu0CommitWorstUs = null;
+            bool? cpu0CommitOverlap = null;
+            uint? cpu0WrongCoreCallbacks = null;
+            uint? cpu0MonitorOverflow = null;
+            bool? cpu0InterruptLevelMatch = null;
+            uint? cpu0MonitorMissedPeriods = null;
+            string? firmwareBuildId = null;
 
             if (fields.Length >= 10 && !TryRtcDisciplineState(fields[9], out rtcState))
             {
@@ -581,7 +623,7 @@ public static class FactoryProtocol
                 rtcTemperatureValid = fields[13] == "1";
             }
 
-            if (fields.Length == 28 || fields.Length == 31)
+            if (fields.Length == 28 || fields.Length == 31 || fields.Length == 42 || fields.Length == 44)
             {
                 if (!double.TryParse(fields[14], NumberStyles.Float, CultureInfo.InvariantCulture, out double ratePpm) ||
                     !double.IsFinite(ratePpm) || ratePpm is < -1_000_000d or > 1_000_000d)
@@ -589,7 +631,8 @@ public static class FactoryProtocol
                     error = ProtocolParseError.RtcRate;
                     return false;
                 }
-                if (!ulong.TryParse(fields[15], NumberStyles.None, CultureInfo.InvariantCulture, out ulong fitOutliers))
+                NumberStyles healthCounterStyle = fields.Length == 44 ? NumberStyles.HexNumber : NumberStyles.None;
+                if (!ulong.TryParse(fields[15], healthCounterStyle, CultureInfo.InvariantCulture, out ulong fitOutliers))
                 {
                     error = ProtocolParseError.RtcFitOutliers;
                     return false;
@@ -658,19 +701,20 @@ public static class FactoryProtocol
                     return false;
                 }
 
-                if (fields.Length == 31)
+                if (fields.Length == 31 || fields.Length == 42 || fields.Length == 44)
                 {
-                    if (!ulong.TryParse(fields[28], NumberStyles.None, CultureInfo.InvariantCulture, out ulong acceptedEdges))
+                    NumberStyles continuityCounterStyle = fields.Length == 44 ? NumberStyles.HexNumber : NumberStyles.None;
+                    if (!ulong.TryParse(fields[28], continuityCounterStyle, CultureInfo.InvariantCulture, out ulong acceptedEdges))
                     {
                         error = ProtocolParseError.RtcAcceptedEdges;
                         return false;
                     }
-                    if (!ulong.TryParse(fields[29], NumberStyles.None, CultureInfo.InvariantCulture, out ulong inferredMissingEdges))
+                    if (!ulong.TryParse(fields[29], continuityCounterStyle, CultureInfo.InvariantCulture, out ulong inferredMissingEdges))
                     {
                         error = ProtocolParseError.RtcInferredMissingEdges;
                         return false;
                     }
-                    if (!ulong.TryParse(fields[30], NumberStyles.None, CultureInfo.InvariantCulture, out ulong holdoverEntries))
+                    if (!ulong.TryParse(fields[30], continuityCounterStyle, CultureInfo.InvariantCulture, out ulong holdoverEntries))
                     {
                         error = ProtocolParseError.RtcHoldoverEntries;
                         return false;
@@ -678,6 +722,94 @@ public static class FactoryProtocol
                     rtcAcceptedEdges = acceptedEdges;
                     rtcInferredMissingEdges = inferredMissingEdges;
                     rtcHoldoverEntries = holdoverEntries;
+                }
+
+                if (fields.Length == 42 || fields.Length == 44)
+                {
+                    if (fields[31] != "0" && fields[31] != "1")
+                    {
+                        error = ProtocolParseError.Cpu0MonitorValid;
+                        return false;
+                    }
+                    if (!uint.TryParse(fields[32], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint monitorSamples))
+                    {
+                        error = ProtocolParseError.Cpu0MonitorSamples;
+                        return false;
+                    }
+                    if (!uint.TryParse(fields[33], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint monitorEvents))
+                    {
+                        error = ProtocolParseError.Cpu0MonitorEventCount;
+                        return false;
+                    }
+                    if (!uint.TryParse(fields[34], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint monitorWorst))
+                    {
+                        error = ProtocolParseError.Cpu0MonitorWorst;
+                        return false;
+                    }
+                    if (string.IsNullOrWhiteSpace(fields[35]) || fields[35].Length > 15)
+                    {
+                        error = ProtocolParseError.Cpu0MonitorWorstTask;
+                        return false;
+                    }
+                    if (!uint.TryParse(fields[36], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint commitLateCount))
+                    {
+                        error = ProtocolParseError.Cpu0CommitLateCount;
+                        return false;
+                    }
+                    if (!uint.TryParse(fields[37], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint commitWorst))
+                    {
+                        error = ProtocolParseError.Cpu0CommitWorst;
+                        return false;
+                    }
+                    if (fields[38] != "0" && fields[38] != "1")
+                    {
+                        error = ProtocolParseError.Cpu0CommitOverlap;
+                        return false;
+                    }
+                    if (!uint.TryParse(fields[39], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint wrongCore))
+                    {
+                        error = ProtocolParseError.Cpu0WrongCoreCallbacks;
+                        return false;
+                    }
+                    if (!uint.TryParse(fields[40], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint monitorOverflow))
+                    {
+                        error = ProtocolParseError.Cpu0MonitorOverflow;
+                        return false;
+                    }
+                    if (fields[41] != "0" && fields[41] != "1")
+                    {
+                        error = ProtocolParseError.Cpu0InterruptLevelMatch;
+                        return false;
+                    }
+
+                    cpu0MonitorValid = fields[31] == "1";
+                    cpu0MonitorSamples = monitorSamples;
+                    cpu0MonitorEventCount = monitorEvents;
+                    cpu0MonitorWorstUs = monitorWorst;
+                    cpu0MonitorWorstTask = fields[35];
+                    cpu0CommitLateCount = commitLateCount;
+                    cpu0CommitWorstUs = commitWorst;
+                    cpu0CommitOverlap = fields[38] == "1";
+                    cpu0WrongCoreCallbacks = wrongCore;
+                    cpu0MonitorOverflow = monitorOverflow;
+                    cpu0InterruptLevelMatch = fields[41] == "1";
+
+                    if (fields.Length == 44)
+                    {
+                        if (!uint.TryParse(fields[42], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint missedPeriods))
+                        {
+                            error = ProtocolParseError.Cpu0MonitorMissedPeriods;
+                            return false;
+                        }
+                        string buildId = fields[43];
+                        if (buildId.Length != 8 || !buildId.All(Uri.IsHexDigit))
+                        {
+                            error = ProtocolParseError.FirmwareBuildId;
+                            return false;
+                        }
+                        cpu0MonitorMissedPeriods = missedPeriods;
+                        firmwareBuildId = buildId.ToLowerInvariant();
+                    }
                 }
 
                 rtcRatePpmVsRtc = ratePpm;
@@ -712,7 +844,12 @@ public static class FactoryProtocol
                 syncSourceOffsetUs, syncEpochLocalUs, syncEpochDisciplinedUs,
                 syncMasterMinusDisciplinedUs, startErrorUs, schedulerLatenessUs,
                 startPublishLatenessUs, worstPublishLatenessUs, frameNotReadyCount,
-                rtcAcceptedEdges, rtcInferredMissingEdges, rtcHoldoverEntries);
+                rtcAcceptedEdges, rtcInferredMissingEdges, rtcHoldoverEntries,
+                cpu0MonitorValid, cpu0MonitorSamples, cpu0MonitorEventCount,
+                cpu0MonitorWorstUs, cpu0MonitorWorstTask, cpu0CommitLateCount,
+                cpu0CommitWorstUs, cpu0CommitOverlap, cpu0WrongCoreCallbacks,
+                cpu0MonitorOverflow, cpu0InterruptLevelMatch, cpu0MonitorMissedPeriods,
+                firmwareBuildId, fields.Length);
             return true;
         }
 
@@ -764,7 +901,7 @@ public static class FactoryProtocol
                 error = ProtocolParseError.Remaining;
                 return false;
             }
-            packet = new StatusPacket(fields[2], legacyCommandId, state, remaining);
+            packet = new StatusPacket(fields[2], legacyCommandId, state, remaining, StatusFieldCount: fields.Length);
             return true;
         }
 

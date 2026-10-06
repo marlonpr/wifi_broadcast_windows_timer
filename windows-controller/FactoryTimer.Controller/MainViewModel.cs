@@ -4774,19 +4774,26 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         const int maxRounds = 2;
         for (int round = 1; round <= maxRounds; round++)
         {
-            KeyValuePair<string, IPAddress>[] missing;
+            KeyValuePair<string, IPAddress>[] targets;
             lock (controllerTxTraceGate)
             {
                 if (!ReferenceEquals(controllerTxTraceSession, session)) return;
-                missing = session.ParticipantAddresses
-                    .Where(pair => !session.PostRunHealthByDevice.ContainsKey(pair.Key))
+                // Always issue one explicit post-run health request to every frozen
+                // participant.  Immediate FINISHED state-change packets may already
+                // have populated PostRunHealthByDevice, but the qualification TX CSV
+                // must remain a complete record of the traffic that produced the
+                // final POST_RUN snapshot.  Round 2 retries only missing devices.
+                targets = (round == 1
+                        ? session.ParticipantAddresses
+                        : session.ParticipantAddresses.Where(
+                            pair => !session.PostRunHealthByDevice.ContainsKey(pair.Key)))
                     .OrderBy(pair => pair.Key, StringComparer.Ordinal)
                     .ToArray();
             }
 
-            if (missing.Length == 0) return;
+            if (targets.Length == 0) return;
 
-            foreach (KeyValuePair<string, IPAddress> target in missing)
+            foreach (KeyValuePair<string, IPAddress> target in targets)
             {
                 await udpService.SendTaggedStatusRequestAsync(
                     CreateCommandId(),
@@ -5123,13 +5130,30 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         long? SchedulerLatenessMicroseconds,
         long? StartPublishLatenessMicroseconds,
         long? WorstPublishLatenessMicroseconds,
-        uint? FrameNotReadyCount)
+        uint? FrameNotReadyCount,
+        bool? Cpu0MonitorValid,
+        uint? Cpu0MonitorSamples,
+        uint? Cpu0MonitorEventCount,
+        uint? Cpu0MonitorWorstMicroseconds,
+        string? Cpu0MonitorWorstTask,
+        uint? Cpu0CommitLateCount,
+        uint? Cpu0CommitWorstMicroseconds,
+        bool? Cpu0CommitOverlap,
+        uint? Cpu0WrongCoreCallbacks,
+        uint? Cpu0MonitorOverflow,
+        bool? Cpu0InterruptLevelMatch,
+        uint? Cpu0MonitorMissedPeriods,
+        string? FirmwareBuildId,
+        int StatusFieldCount)
     {
         public const string CsvHeader =
             "RunCommandId,TStarMasterUs,DurationSeconds,DeviceId,Phase,StatusCaptured,CapturedMasterUs,TimerState,RtcState," +
             "RtcRatePpmVsRtc,RtcFitPoints,RtcFitRmsUs,RtcFitOutliers,RtcAcceptedEdges,RtcInferredMissingEdges,RtcHoldoverEntries,RtcQueueDrops,RtcTemperatureValid,RtcTemperatureC,RtcSqwCore,HealthFlags," +
             "SyncEpochMasterMinusLocalUs,SyncEpochLocalUs,SyncEpochDisciplinedUs,SyncEpochMasterUs,SyncEpochMasterMinusDisciplinedUs," +
-            "StartErrorUs,SchedulerLatenessUs,StartPublishLatenessUs,WorstPublishLatenessUs,FrameNotReady";
+            "StartErrorUs,SchedulerLatenessUs,StartPublishLatenessUs,WorstPublishLatenessUs,FrameNotReady," +
+            "Cpu0MonitorValid,Cpu0MonitorSamples,Cpu0MonitorEventCount,Cpu0MonitorWorstUs,Cpu0MonitorWorstTask," +
+            "Cpu0CommitLateCount,Cpu0CommitWorstUs,Cpu0CommitOverlap,Cpu0WrongCoreCallbacks,Cpu0MonitorOverflow,Cpu0InterruptLevelMatch," +
+            "Cpu0MonitorMissedPeriods,Cpu0MonitorExpectedPeriods,FirmwareBuildId,StatusFieldCount";
 
         public static DeviceHealthSnapshot FromStatus(StatusPacket status, long capturedMasterMicroseconds)
         {
@@ -5166,7 +5190,21 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 status.SchedulerLatenessMicroseconds,
                 status.StartPublishLatenessMicroseconds,
                 status.WorstPublishLatenessMicroseconds,
-                status.FrameNotReadyCount);
+                status.FrameNotReadyCount,
+                status.Cpu0MonitorValid,
+                status.Cpu0MonitorSamples,
+                status.Cpu0MonitorEventCount,
+                status.Cpu0MonitorWorstMicroseconds,
+                status.Cpu0MonitorWorstTask,
+                status.Cpu0CommitLateCount,
+                status.Cpu0CommitWorstMicroseconds,
+                status.Cpu0CommitOverlap,
+                status.Cpu0WrongCoreCallbacks,
+                status.Cpu0MonitorOverflow,
+                status.Cpu0InterruptLevelMatch,
+                status.Cpu0MonitorMissedPeriods,
+                status.FirmwareBuildId,
+                status.StatusFieldCount);
         }
 
         public static string ToCsv(
@@ -5192,6 +5230,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             static string Double(double? value, string format) => value?.ToString(
                 format, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
             static string Bool(bool? value) => value.HasValue ? (value.Value ? "1" : "0") : string.Empty;
+            static string Text(string? value) => string.IsNullOrEmpty(value)
+                ? string.Empty
+                : value.Replace(",", "_").Replace("\r", "_").Replace("\n", "_");
 
             return string.Join(
                 ",",
@@ -5225,7 +5266,24 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 Long(health?.SchedulerLatenessMicroseconds),
                 Long(health?.StartPublishLatenessMicroseconds),
                 Long(health?.WorstPublishLatenessMicroseconds),
-                UInt(health?.FrameNotReadyCount));
+                UInt(health?.FrameNotReadyCount),
+                Bool(health?.Cpu0MonitorValid),
+                UInt(health?.Cpu0MonitorSamples),
+                UInt(health?.Cpu0MonitorEventCount),
+                UInt(health?.Cpu0MonitorWorstMicroseconds),
+                Text(health?.Cpu0MonitorWorstTask),
+                UInt(health?.Cpu0CommitLateCount),
+                UInt(health?.Cpu0CommitWorstMicroseconds),
+                Bool(health?.Cpu0CommitOverlap),
+                UInt(health?.Cpu0WrongCoreCallbacks),
+                UInt(health?.Cpu0MonitorOverflow),
+                Bool(health?.Cpu0InterruptLevelMatch),
+                UInt(health?.Cpu0MonitorMissedPeriods),
+                health?.Cpu0MonitorSamples is uint samples && health?.Cpu0MonitorMissedPeriods is uint missed
+                    ? ((ulong)samples + missed).ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    : string.Empty,
+                Text(health?.FirmwareBuildId),
+                health is null ? string.Empty : health.StatusFieldCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
     }
 

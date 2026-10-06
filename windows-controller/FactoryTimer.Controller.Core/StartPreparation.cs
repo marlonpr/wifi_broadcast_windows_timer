@@ -58,7 +58,7 @@ public sealed record StartGateResult(
 
 public static class RtcStartQualification
 {
-    public const ushort MinimumFitPoints = 64;
+    public const ushort MinimumFitPoints = 129;
     public const double MaximumFitRmsMicroseconds = 3.0;
 
     public static StartBlock? Evaluate(
