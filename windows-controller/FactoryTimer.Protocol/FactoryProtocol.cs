@@ -173,6 +173,19 @@ public sealed record StatusPacket(
     string? FirmwareBuildId = null,
     int StatusFieldCount = 0) : InboundPacket(DeviceId);
 
+// Separate post-run diagnostics keep the production 44-field STATUS stable.
+public sealed record RunDiagnosticPacket(
+    string DeviceId, ulong CommandId, bool Valid, uint PeriodMicroseconds,
+    uint ThresholdMicroseconds, long MonitorStartMicroseconds, long TStarLocalMicroseconds,
+    long MonitorEndMicroseconds, uint FirstAlarmOffsetMicroseconds, ulong ExpectedPeriods,
+    uint SampleCallbacks, uint MissedPeriods, uint Cpu0EventsGe50, uint RtcEventsGe50,
+    uint WifiEventsGe50, uint UdpEventsGe50, uint CommitLateEvents, uint CommitGe300,
+    uint RearmFailures) : InboundPacket(DeviceId)
+{
+    public long MonitorElapsedMicroseconds => MonitorEndMicroseconds - MonitorStartMicroseconds;
+    public long MonitorStartToTStarMicroseconds => MonitorStartMicroseconds - TStarLocalMicroseconds;
+}
+
 public sealed record SyncReplyPacket(
     string DeviceId,
     ulong SyncId,
@@ -387,6 +400,11 @@ public static class FactoryProtocol
         packet = null;
         if (!ValidateEnvelope(text, out error)) return false;
         string[] fields = text.Split('|', StringSplitOptions.None);
+
+        if (fields.Length >= 2 && fields[0] == Version2 && fields[1] == "RUN_DIAG")
+        {
+            return TryParseRunDiagnostic(fields, out packet, out error);
+        }
 
         if (fields.Length >= 2 && fields[0] == Version2 && fields[1] == "SYNC_REPLY")
         {
@@ -970,6 +988,46 @@ public static class FactoryProtocol
         {
             throw new ArgumentOutOfRangeException(nameof(packet), "RESET timing fields must be zero.");
         }
+    }
+
+    private static bool TryParseRunDiagnostic(
+        string[] f, out InboundPacket? packet, out ProtocolParseError error)
+    {
+        packet = null;
+        error = ProtocolParseError.FieldCount;
+        if (f.Length != 21) return false;
+        error = ProtocolParseError.DeviceId;
+        if (!ValidDeviceId(f[2])) return false;
+        error = ProtocolParseError.CommandId;
+        if (!TryCommandId(f[3], allowZero: false, out ulong commandId)) return false;
+        error = ProtocolParseError.Cpu0MonitorValid;
+        if (f[4] is not ("0" or "1")) return false;
+        error = ProtocolParseError.Timestamp;
+        if (!TryUInt(f[5], 100, 10000, out uint period) ||
+            !TryUInt(f[6], 1, 10000, out uint threshold) ||
+            !TryLong(f[7], nonnegative: true, out long start) ||
+            !TryLong(f[8], nonnegative: true, out long tstar) ||
+            !TryLong(f[9], nonnegative: true, out long end) || end < start ||
+            !TryUInt(f[10], 1, period, out uint offset) ||
+            !ulong.TryParse(f[11], NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out ulong expected)) return false;
+        long elapsed = end - start;
+        ulong gridPeriods = elapsed < offset ? 0UL : 1UL + (ulong)((elapsed - offset) / period);
+        if (f[4] == "1" && expected != gridPeriods) return false;
+        uint[] counters = new uint[9];
+        error = ProtocolParseError.Cpu0MonitorEventCount;
+        for (int i = 0; i < counters.Length; i++)
+        {
+            if (!uint.TryParse(f[12 + i], NumberStyles.AllowHexSpecifier,
+                CultureInfo.InvariantCulture, out counters[i])) return false;
+        }
+        // Per-task and >=300 us counts must be subsets of their full counters.
+        if ((ulong)counters[3] + counters[4] + counters[5] > counters[2] ||
+            counters[7] > counters[6]) return false;
+        packet = new RunDiagnosticPacket(f[2], commandId, f[4] == "1", period, threshold,
+            start, tstar, end, offset, expected, counters[0], counters[1], counters[2],
+            counters[3], counters[4], counters[5], counters[6], counters[7], counters[8]);
+        error = ProtocolParseError.None;
+        return true;
     }
 
     private static bool ValidateEnvelope(string text, out ProtocolParseError error)

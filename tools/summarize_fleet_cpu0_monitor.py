@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""Summarize v6.23.15 CPU0 fleet-monitor telemetry from controller health CSVs.
+"""Summarize actual acceptance-to-completion CPU0 monitor windows.
 
-Exposure is derived from Cpu0MonitorSamples, never requested DurationSeconds.
-At 250 us cadence the nominal callback rate is 4000 Hz. v6.23.15 additionally
-reports Cpu0MonitorMissedPeriods: hardware deadlines swallowed while CPU0 could
-not service the GPTimer. Thus:
-
-  expected_periods = observed_callbacks + missed_periods
-
-The missed-period count is independent of the >=50 us event threshold and is a
-second blocker detector. Canary/legacy/invalid rows never contribute to CLEAN
-board-hours used by the rollout closure bound.
+RUN_DIAG provides the grid period, elapsed time and first-deadline phase.
+For the free-running grid the exact endpoint convention is (start, end]:
+expected = 0 if elapsed < first_offset else 1 + (elapsed-first_offset)//period.
+This differs from floor(elapsed/251) by at most one, independent of countdown
+duration. Missing window diagnostics cannot qualify as clean exposure.
 """
 from __future__ import annotations
 
@@ -22,7 +17,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-EXPECTED_SAMPLE_RATE_HZ = 4000.0
+EXPECTED_SAMPLE_RATE_HZ = 1_000_000.0 / 251.0
 CURRENT_STATUS_FIELD_COUNT = 44
 SEVERE_EVENT_US = 300
 ZERO_EVENT_95_COUNT = -math.log(0.05)
@@ -37,7 +32,7 @@ class DeviceSummary:
     monitor_events: int = 0
     worst_monitor_us: int = 0
     worst_monitor_task: str = "NONE"
-    severe_ge300_observed: bool = False
+    severe_ge300_observed: bool = False  # actual COMMIT delays, not sampler lateness
     commit_late_events: int = 0
     worst_commit_us: int = 0
     overlap_runs: int = 0
@@ -49,8 +44,10 @@ class DeviceSummary:
     sample_rate_warn_rows: int = 0
     canary_contamination_rows: int = 0
     build_id_warn_rows: int = 0
-    duration_seconds_for_valid_rows: int = 0
-    clean_duration_seconds: int = 0
+    monitor_elapsed_us: int = 0
+    clean_monitor_elapsed_us: int = 0
+    expected_periods: int = 0
+    commit_ge300_events: int = 0
     build_ids: set[str] = field(default_factory=set)
 
 
@@ -135,19 +132,32 @@ def main() -> int:
 
                 samples = as_int(row, "Cpu0MonitorSamples")
                 missed = as_int(row, "Cpu0MonitorMissedPeriods") if "Cpu0MonitorMissedPeriods" in row else 0
-                duration = as_int(row, "DurationSeconds")
                 out.monitor_samples += samples
                 out.missed_periods += missed
                 if missed > 0: out.missed_period_rows += 1
-                out.duration_seconds_for_valid_rows += duration
-
-                rate_warn = False
-                if duration <= 0:
-                    rate_warn = True
-                else:
-                    rate = samples / duration
-                    deviation_pct = abs(rate - EXPECTED_SAMPLE_RATE_HZ) / EXPECTED_SAMPLE_RATE_HZ * 100.0
-                    rate_warn = deviation_pct > args.sample_rate_tolerance_pct
+                period = as_int(row, "Cpu0MonitorPeriodUs")
+                elapsed = as_int(row, "MonitorElapsedUs")
+                start = as_int(row, "MonitorStartUs")
+                end = as_int(row, "MonitorEndUs")
+                offset = as_int(row, "FirstAlarmOffsetUs")
+                expected = as_int(row, "Cpu0MonitorExpectedPeriods")
+                grid = 0 if elapsed < offset or period <= 0 else 1 + (elapsed - offset) // period
+                window_valid = (
+                    as_bool(row, "RunDiagnosticCaptured") is True and
+                    as_bool(row, "RunDiagnosticValid") is True and
+                    period == 251 and as_int(row, "Cpu0MonitorThresholdUs") == 50 and
+                    elapsed > 0 and end - start == elapsed and 1 <= offset <= period and
+                    expected == grid and as_int(row, "MonitorRearmFailures") == 0 and
+                    as_int(row, "Cpu0EventsGe50Us") == as_int(row, "Cpu0MonitorEventCount") and
+                    as_int(row, "CommitLateEvents") == as_int(row, "Cpu0CommitLateCount")
+                )
+                # A stop can precede service of the last due hardware deadline.
+                # One terminal deadline is allowed; swallowed interior periods
+                # remain explicitly represented by MissedPeriods.
+                rate_warn = not window_valid or abs(samples + missed - expected) > 1
+                if window_valid:
+                    out.monitor_elapsed_us += elapsed
+                    out.expected_periods += expected
                 if rate_warn: out.sample_rate_warn_rows += 1
 
                 level_ok = as_bool(row, "Cpu0InterruptLevelMatch") is True
@@ -162,12 +172,16 @@ def main() -> int:
                 if canary: out.canary_contamination_rows += 1
                 else:
                     out.monitor_events += events
-                    if worst >= SEVERE_EVENT_US: out.severe_ge300_observed = True
 
                 if worst > out.worst_monitor_us:
                     out.worst_monitor_us = worst; out.worst_monitor_task = task
                 out.commit_late_events += as_int(row, "Cpu0CommitLateCount")
-                out.worst_commit_us = max(out.worst_commit_us, as_int(row, "Cpu0CommitWorstUs"))
+                commit_worst = as_int(row, "Cpu0CommitWorstUs")
+                out.worst_commit_us = max(out.worst_commit_us, commit_worst)
+                commit_ge300 = as_int(row, "CommitGe300Us")
+                out.commit_ge300_events += commit_ge300
+                if not canary and (commit_ge300 > 0 or commit_worst >= SEVERE_EVENT_US):
+                    out.severe_ge300_observed = True
                 if as_bool(row, "Cpu0CommitOverlap") is True: out.overlap_runs += 1
 
                 build_id = (row.get("FirmwareBuildId") or "").strip()
@@ -177,11 +191,11 @@ def main() -> int:
 
                 row_clean = (
                     not legacy and not canary and not rate_warn and missed == 0 and level_ok and
-                    wrong == 0 and overflow == 0 and build_ok
+                    wrong == 0 and build_ok
                 )
                 if row_clean:
                     out.clean_monitor_samples += samples
-                    out.clean_duration_seconds += max(duration, 0)
+                    out.clean_monitor_elapsed_us += elapsed
 
     header = (
         "DEVICE,RUNS,CLEAN_MON_HOURS,OBS_RATE_HZ,GRID_RATE_HZ,MISSED_PERIODS,MON_EVENTS,"
@@ -200,15 +214,15 @@ def main() -> int:
             'commit_late_events','overlap_runs','wrong_core_callbacks','overflows',
             'invalid_monitor_rows','level_mismatch_rows','legacy_status_rows',
             'sample_rate_warn_rows','canary_contamination_rows','build_id_warn_rows',
-            'duration_seconds_for_valid_rows','clean_duration_seconds'):
+            'monitor_elapsed_us','clean_monitor_elapsed_us','expected_periods','commit_ge300_events'):
             setattr(totals, name, getattr(totals, name) + getattr(s, name))
         fleet_severe |= s.severe_ge300_observed
         if s.worst_monitor_us > fleet_worst:
             fleet_worst = s.worst_monitor_us; fleet_worst_device = device
-        clean_hours = s.clean_monitor_samples / EXPECTED_SAMPLE_RATE_HZ / 3600.0
-        observed_rate = s.monitor_samples / s.duration_seconds_for_valid_rows if s.duration_seconds_for_valid_rows else 0.0
-        expected_periods = s.monitor_samples + s.missed_periods
-        grid_rate = expected_periods / s.duration_seconds_for_valid_rows if s.duration_seconds_for_valid_rows else 0.0
+        clean_hours = s.clean_monitor_elapsed_us / 3_600_000_000.0
+        observed_rate = s.monitor_samples * 1_000_000.0 / s.monitor_elapsed_us if s.monitor_elapsed_us else 0.0
+        expected_periods = s.expected_periods
+        grid_rate = expected_periods * 1_000_000.0 / s.monitor_elapsed_us if s.monitor_elapsed_us else 0.0
         upper, mean_hours = zero_event_bound(clean_hours, not s.severe_ge300_observed)
         print(
             f"{device},{s.runs},{clean_hours:.6f},{observed_rate:.3f},{grid_rate:.3f},"
@@ -219,16 +233,16 @@ def main() -> int:
             f"{s.sample_rate_warn_rows},{s.canary_contamination_rows},{s.missed_period_rows},{s.build_id_warn_rows},"
             f"{'|'.join(sorted(s.build_ids)) if s.build_ids else 'NONE'}")
 
-    clean_hours = totals.clean_monitor_samples / EXPECTED_SAMPLE_RATE_HZ / 3600.0
+    clean_hours = totals.clean_monitor_elapsed_us / 3_600_000_000.0
     fleet_upper, fleet_mean = zero_event_bound(clean_hours, not fleet_severe)
     telemetry_clean = (
         totals.legacy_status_rows == 0 and totals.sample_rate_warn_rows == 0 and
         totals.canary_contamination_rows == 0 and totals.missed_period_rows == 0 and totals.invalid_monitor_rows == 0 and
         totals.level_mismatch_rows == 0 and totals.wrong_core_callbacks == 0 and
-        totals.overflows == 0 and totals.build_id_warn_rows == 0
+        totals.build_id_warn_rows == 0
     )
     watch = by_device.get(args.watch_device)
-    watch_hours = watch.clean_monitor_samples / EXPECTED_SAMPLE_RATE_HZ / 3600.0 if watch else 0.0
+    watch_hours = watch.clean_monitor_elapsed_us / 3_600_000_000.0 if watch else 0.0
     watch_clean = bool(watch) and not watch.severe_ge300_observed and watch.canary_contamination_rows == 0
     closure_pass = (
         telemetry_clean and not fleet_severe and clean_hours >= args.closure_fleet_hours and
@@ -238,7 +252,7 @@ def main() -> int:
     print(f"FLEET_POST_RUN_ROWS={total_rows}")
     print(f"FLEET_MONITOR_SAMPLES={totals.monitor_samples}")
     print(f"FLEET_MONITOR_MISSED_PERIODS={totals.missed_periods}")
-    print(f"FLEET_MONITOR_EXPECTED_PERIODS={totals.monitor_samples + totals.missed_periods}")
+    print(f"FLEET_MONITOR_EXPECTED_PERIODS={totals.expected_periods}")
     print(f"FLEET_CLEAN_MONITOR_SAMPLES={totals.clean_monitor_samples}")
     print(f"FLEET_CLEAN_MONITORED_HOURS={clean_hours:.6f}")
     print(f"FLEET_NATURAL_MONITOR_EVENTS_GE50={totals.monitor_events}")
@@ -246,6 +260,9 @@ def main() -> int:
     print(f"FLEET_ZERO_GE300_95_UPPER_PER_HOUR={fleet_upper}")
     print(f"FLEET_ZERO_GE300_95_LOWER_MEAN_HOURS={fleet_mean}")
     print(f"FLEET_COMMIT_LATE_EVENTS={totals.commit_late_events}")
+    print(f"FLEET_COMMIT_GE300_EVENTS={totals.commit_ge300_events}")
+    print(f"FLEET_COMMIT_TIMING={'FAIL' if fleet_severe else 'PASS'}")
+    print(f"FLEET_MONITOR_ELAPSED_US={totals.monitor_elapsed_us}")
     print(f"FLEET_WORST_MONITOR_US={fleet_worst}")
     print(f"FLEET_WORST_MONITOR_DEVICE={fleet_worst_device}")
     print(f"FLEET_LEGACY_STATUS_ROWS={totals.legacy_status_rows}")

@@ -4690,8 +4690,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 return;
             }
 
+            session.RunDiagnosticsByDevice.TryGetValue(status.DeviceId, out RunDiagnosticPacket? diagnostic);
             DeviceHealthSnapshot snapshot = DeviceHealthSnapshot.FromStatus(
-                status, MasterClock.NowMicroseconds);
+                status, MasterClock.NowMicroseconds) with { RunDiagnostic = diagnostic };
 
             if (status.State == TimerState.Running)
             {
@@ -4709,6 +4710,21 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 // display summary than the immediate FINISHED state-change reply.
                 // Keep the latest FINISHED snapshot.
                 session.PostRunHealthByDevice[status.DeviceId] = snapshot;
+            }
+        }
+    }
+
+    private void RecordRunDiagnostic(RunDiagnosticPacket diagnostic)
+    {
+        lock (controllerTxTraceGate)
+        {
+            ControllerTxTraceSession? session = controllerTxTraceSession;
+            if (session is null || diagnostic.CommandId != session.CommandId ||
+                !session.ParticipantDeviceIds.Contains(diagnostic.DeviceId)) return;
+            session.RunDiagnosticsByDevice[diagnostic.DeviceId] = diagnostic;
+            if (session.PostRunHealthByDevice.TryGetValue(diagnostic.DeviceId, out DeviceHealthSnapshot? health))
+            {
+                session.PostRunHealthByDevice[diagnostic.DeviceId] = health with { RunDiagnostic = diagnostic };
             }
         }
     }
@@ -4786,7 +4802,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 targets = (round == 1
                         ? session.ParticipantAddresses
                         : session.ParticipantAddresses.Where(
-                            pair => !session.PostRunHealthByDevice.ContainsKey(pair.Key)))
+                            pair => !session.PostRunHealthByDevice.ContainsKey(pair.Key) ||
+                                    !session.RunDiagnosticsByDevice.ContainsKey(pair.Key)))
                     .OrderBy(pair => pair.Key, StringComparer.Ordinal)
                     .ToArray();
             }
@@ -4933,6 +4950,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     }
                     break;
                 }
+                case RunDiagnosticPacket diagnostic:
+                    RecordRunDiagnostic(diagnostic);
+                    break;
                 case StatusPacket status:
                     RecordControllerHealthSnapshot(status);
                     device.Apply(status, e.RemoteEndPoint);
@@ -5086,6 +5106,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             new(StringComparer.Ordinal);
         public Dictionary<string, DeviceHealthSnapshot> PostRunHealthByDevice { get; } =
             new(StringComparer.Ordinal);
+        public Dictionary<string, RunDiagnosticPacket> RunDiagnosticsByDevice { get; } =
+            new(StringComparer.Ordinal);
 
         private static IReadOnlyDictionary<string, IPAddress> BuildParticipantAddressMap(
             IReadOnlyList<string> deviceIds,
@@ -5146,6 +5168,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         string? FirmwareBuildId,
         int StatusFieldCount)
     {
+        public RunDiagnosticPacket? RunDiagnostic { get; init; }
+
         public const string CsvHeader =
             "RunCommandId,TStarMasterUs,DurationSeconds,DeviceId,Phase,StatusCaptured,CapturedMasterUs,TimerState,RtcState," +
             "RtcRatePpmVsRtc,RtcFitPoints,RtcFitRmsUs,RtcFitOutliers,RtcAcceptedEdges,RtcInferredMissingEdges,RtcHoldoverEntries,RtcQueueDrops,RtcTemperatureValid,RtcTemperatureC,RtcSqwCore,HealthFlags," +
@@ -5153,7 +5177,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             "StartErrorUs,SchedulerLatenessUs,StartPublishLatenessUs,WorstPublishLatenessUs,FrameNotReady," +
             "Cpu0MonitorValid,Cpu0MonitorSamples,Cpu0MonitorEventCount,Cpu0MonitorWorstUs,Cpu0MonitorWorstTask," +
             "Cpu0CommitLateCount,Cpu0CommitWorstUs,Cpu0CommitOverlap,Cpu0WrongCoreCallbacks,Cpu0MonitorOverflow,Cpu0InterruptLevelMatch," +
-            "Cpu0MonitorMissedPeriods,Cpu0MonitorExpectedPeriods,FirmwareBuildId,StatusFieldCount";
+            "Cpu0MonitorMissedPeriods,Cpu0MonitorExpectedPeriods,FirmwareBuildId,StatusFieldCount," +
+            "RunDiagnosticCaptured,RunDiagnosticValid,Cpu0MonitorPeriodUs,Cpu0MonitorThresholdUs," +
+            "MonitorStartUs,TStarLocalUs,MonitorStartToTStarUs,MonitorEndUs,MonitorElapsedUs,FirstAlarmOffsetUs," +
+            "Cpu0EventsGe50Us,RtcDisciplineEventsGe50Us,WifiEventsGe50Us,UdpEventsGe50Us,CommitLateEvents,CommitGe300Us,MonitorRearmFailures";
 
         public static DeviceHealthSnapshot FromStatus(StatusPacket status, long capturedMasterMicroseconds)
         {
@@ -5279,11 +5306,26 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 UInt(health?.Cpu0MonitorOverflow),
                 Bool(health?.Cpu0InterruptLevelMatch),
                 UInt(health?.Cpu0MonitorMissedPeriods),
-                health?.Cpu0MonitorSamples is uint samples && health?.Cpu0MonitorMissedPeriods is uint missed
-                    ? ((ulong)samples + missed).ToString(System.Globalization.CultureInfo.InvariantCulture)
-                    : string.Empty,
+                ULong(health?.RunDiagnostic?.ExpectedPeriods),
                 Text(health?.FirmwareBuildId),
-                health is null ? string.Empty : health.StatusFieldCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                health is null ? string.Empty : health.StatusFieldCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                health?.RunDiagnostic is null ? "0" : "1",
+                Bool(health?.RunDiagnostic?.Valid),
+                UInt(health?.RunDiagnostic?.PeriodMicroseconds),
+                UInt(health?.RunDiagnostic?.ThresholdMicroseconds),
+                Long(health?.RunDiagnostic?.MonitorStartMicroseconds),
+                Long(health?.RunDiagnostic?.TStarLocalMicroseconds),
+                Long(health?.RunDiagnostic?.MonitorStartToTStarMicroseconds),
+                Long(health?.RunDiagnostic?.MonitorEndMicroseconds),
+                Long(health?.RunDiagnostic?.MonitorElapsedMicroseconds),
+                UInt(health?.RunDiagnostic?.FirstAlarmOffsetMicroseconds),
+                UInt(health?.RunDiagnostic?.Cpu0EventsGe50),
+                UInt(health?.RunDiagnostic?.RtcEventsGe50),
+                UInt(health?.RunDiagnostic?.WifiEventsGe50),
+                UInt(health?.RunDiagnostic?.UdpEventsGe50),
+                UInt(health?.RunDiagnostic?.CommitLateEvents),
+                UInt(health?.RunDiagnostic?.CommitGe300),
+                UInt(health?.RunDiagnostic?.RearmFailures));
         }
     }
 

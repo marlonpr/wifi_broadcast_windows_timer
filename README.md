@@ -1,3 +1,43 @@
+# Factory timer controller 6.22.14
+
+6.22.14 changes Python tooling only; the Windows controller and protocol are
+unchanged from 6.22.13.
+
+- `validate_rtc_qualification_vs_analyzer.py`: the two-START prediction carries
+  each board's sync error at both STARTs. For a pair that adds (d2 - d1) / T to
+  ERROR_PPM, where d1/d2 are the physical START offsets. On 2026-10-07 one pair's
+  START offset moved up to 64 us between consecutive STARTs: 0.053 ppm at
+  T = 1200 s, more than the 0.05 ppm budget. The default minimum START interval
+  is now 2400 s. When the capture also contains both START trains, the tool
+  locates them from the controller's T* spacing and prints START1/START2
+  offsets, SYNC_TERM_PPM and SYNC_CORRECTED_ERROR_PPM for every pair, plus a
+  warning when sync noise uses more than half the budget. PASS/FAIL stays on the
+  raw error unless `--gate sync-corrected` is chosen.
+- `validate_firmware_preflight_log.py`: parses each ISR_PUBLISH record
+  separately (esp-idf-monitor can put a truncated copy and the full line on one
+  physical line), ignores damaged records, and reports a boundary seen only in
+  damaged records as `FIRMWARE_30S_PREFLIGHT=CAPTURE_DAMAGED` (exit 3,
+  re-capture) instead of a firmware FAIL. Requires the 6.23.17 suppression
+  evidence (`periodic_reads_during_run=0`) and a post-run temperature read after
+  the final scheduled COMMIT.
+
+## 6.22.13
+
+This revision consumes the separate 21-field RUN_DIAG reply while preserving
+legacy and 44-field STATUS parsing. POST_RUN CSV rows join STATUS/RUN_DIAG by
+device and command in either arrival order; the second health poll retries
+missing diagnostics. Actual elapsed monitor windows determine sample validation
+and board-hours. Missing diagnostics cannot supply qualified exposure.
+
+The hard timing verdict is FLEET_COMMIT_TIMING: actual COMMIT >=300 us fails it.
+Sampler lateness, overlap and retained-detail overflow remain telemetry. The
+longer rollout exposure gate separately retains conservative missed-period,
+canary and telemetry-integrity requirements.
+
+The V10 validator uses qualified/grouped original timestamps, supports multiple
+trains with separate intercepts and checks all three physical pairs against the
+two-START prediction at <=0.05 ppm. See the bundle README for current commands;
+material below records earlier revisions.
 
 ## v6.22.4 pooled forward-sync update
 

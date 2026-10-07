@@ -26,7 +26,6 @@ def main():
         'WORST_TASK_LAT_CANARY': (r.get('Cpu0MonitorWorstTask') or '').strip()=='lat_canary',
         'COMMIT_LATE_COUNT_1': i(r,'Cpu0CommitLateCount')==1,
         'COMMIT_WORST_300_TO_600_US': i(r,'Cpu0CommitWorstUs') is not None and 300 <= i(r,'Cpu0CommitWorstUs') <= 600,
-        'COMMIT_OVERLAP': (r.get('Cpu0CommitOverlap') or '').strip()=='1',
         'WRONG_CORE_0': i(r,'Cpu0WrongCoreCallbacks')==0,
         'OVERFLOW_0': i(r,'Cpu0MonitorOverflow')==0,
         'LEVEL_MATCH': (r.get('Cpu0InterruptLevelMatch') or '').strip()=='1',

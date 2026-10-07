@@ -11,12 +11,12 @@ checks={
  'legacy STATUS compatibility retained': all(f'fields.Length == {n}' in proto for n in (9,10,14,28,31)),
  'StatusFieldCount recorded by parser': 'StatusFieldCount = 0' in proto and 'fields.Length);' in proto,
  'StatusFieldCount CSV column': 'StatusFieldCount' in vm and 'FirmwareBuildId,StatusFieldCount' in vm,
- 'board hours from monitor samples': 'clean_monitor_samples / EXPECTED_SAMPLE_RATE_HZ / 3600.0' in sumtool,
- '4000Hz expected rate': 'EXPECTED_SAMPLE_RATE_HZ = 4000.0' in sumtool,
+ 'board hours from elapsed monitor window': 'clean_monitor_elapsed_us / 3_600_000_000.0' in sumtool,
+ '251us cadence': '1_000_000.0 / 251.0' in sumtool,
  'sample-rate warning': 'sample_rate_warn_rows' in sumtool and '--sample-rate-tolerance-pct' in sumtool,
  'legacy STATUS warning': 'legacy_status_rows' in sumtool and 'FLEET_LEGACY_STATUS_ROWS' in sumtool,
  'telemetry canary validator': 'CPU0_TELEMETRY_CANARY_PATH' in valtool,
- 'canary validator checks overlap': "'COMMIT_OVERLAP'" in valtool,
+ 'overlap excluded from gate': "'COMMIT_OVERLAP':" not in valtool,
  'protocol test checks field count': 'Assert.AreEqual(42, status.StatusFieldCount);' in tests and 'Assert.AreEqual(44, status.StatusFieldCount);' in tests,
 }
 failed=[]
