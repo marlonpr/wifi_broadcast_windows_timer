@@ -194,7 +194,8 @@ public sealed class StartPreparationTests
             TimerState: TimerState.Armed,
             CommandId: 0x1234,
             LastLocalTimestampMicroseconds: null,
-            DisconnectObserved: false);
+            DisconnectObserved: false,
+            DiagnosticFlags: 0);
 
         StartBlock? block = StartArmSessionGuard.Evaluate(
             "ESP01", frozen, current, preparedCommandId: 0x1234);
@@ -216,7 +217,8 @@ public sealed class StartPreparationTests
             TimerState: TimerState.Armed,
             CommandId: preparedCommand,
             LastLocalTimestampMicroseconds: null,
-            DisconnectObserved: false);
+            DisconnectObserved: false,
+            DiagnosticFlags: 0);
 
         Assert.IsNull(StartArmSessionGuard.Evaluate(
             "ESP01", frozen, baseSession, preparedCommand));
@@ -256,7 +258,8 @@ public sealed class StartPreparationTests
             TimerState: TimerState.Armed,
             CommandId: preparedCommand,
             LastLocalTimestampMicroseconds: null,
-            DisconnectObserved: false);
+            DisconnectObserved: false,
+            DiagnosticFlags: 0);
 
         Assert.IsNull(StartFinalBarrier.EvaluateParticipant(
             "ESP01", frozen, matching, preparedCommand, barrierStarted));
@@ -322,7 +325,8 @@ public sealed class StartPreparationTests
             TimerState: TimerState.Armed,
             CommandId: 0x9999,
             LastLocalTimestampMicroseconds: null,
-            DisconnectObserved: false);
+            DisconnectObserved: false,
+            DiagnosticFlags: 0);
 
         StartBlock? block = StartFinalBarrier.EvaluateParticipant(
             "ESP01", frozen, wrong, preparedCommand, Now);
@@ -508,7 +512,8 @@ public sealed class StartPreparationTests
             TimerState: TimerState.Ready,
             CommandId: resetCommandId,
             LastLocalTimestampMicroseconds: null,
-            DisconnectObserved: false);
+            DisconnectObserved: false,
+            DiagnosticFlags: 0);
         Assert.IsTrue(StartAbortConfirmation.IsParticipantCancellationConfirmed(
             resetReady, preparedCommandId, resetCommandId, started));
 
@@ -549,7 +554,8 @@ public sealed class StartPreparationTests
             CurrentSessionGeneration: 7,
             ReportedIpAddress: IPAddress.Parse("192.168.5.101"),
             ReportedState: TimerState.Ready,
-            ReportedCommandId: 0);
+            ReportedCommandId: 0,
+            ReportedDiagnosticFlags: 0);
 
     [TestMethod]
     public void GateRejectsParticipantWhoseRtcDisciplineIsNotLocked()

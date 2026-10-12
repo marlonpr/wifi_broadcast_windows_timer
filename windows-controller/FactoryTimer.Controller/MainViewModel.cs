@@ -42,6 +42,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private readonly StatusDiscoveryService statusDiscovery;
     private readonly NetworkInterfaceSelectionManager networkSelectionManager;
     private readonly ControllerClock clock = new();
+    private readonly string controllerSessionId = Guid.NewGuid().ToString("N");
     private readonly SemaphoreSlim sendLock = new(1, 1);
     private readonly ParticipantReservationManager reservationManager = new();
     private readonly object controllerTxTraceGate = new();
@@ -101,6 +102,18 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private bool initialized;
     private bool disposed;
     private bool timingQuietPeriodActive;
+    private QualificationWarmupProof? qualificationWarmupProof;
+    private readonly Dictionary<string, double> qualificationStart1Rates = new(StringComparer.Ordinal);
+    private string qualificationSecondStartRateText = "START #2 rate change: available after START #1 completes.";
+    public string QualificationSecondStartRateText
+    {
+        get => qualificationSecondStartRateText;
+        private set => SetProperty(ref qualificationSecondStartRateText, value);
+    }
+    private QualificationStartMode degradedQualificationMode;
+    private string qualificationGateText = "QUALIFICATION_START1_GATE=WAIT";
+    public string QualificationGateText { get => qualificationGateText; private set => SetProperty(ref qualificationGateText, value); }
+    private enum QualificationStartMode { Ordinary, First, Second, Preflight }
 
     public MainViewModel(DispatcherQueue dispatcherQueue)
     {
@@ -125,6 +138,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         udpService.PacketSent += UdpService_PacketSent;
         udpService.ReceiveError += UdpService_ReceiveError;
         statusDiscovery.DiscoveryError += StatusDiscovery_DiscoveryError;
+        statusDiscovery.PollStarted += StatusDiscovery_PollStarted;
         networkSelectionManager.StateChanged += NetworkSelectionManager_StateChanged;
     }
 
@@ -442,7 +456,23 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         uiTimer.Start();
     }
 
-    public Task SendStartAsync() => SendStartAtAsync();
+    public Task SendStartAsync() => SendStartAtAsync(QualificationStartMode.Ordinary);
+
+    public Task SendQualificationFirstStartAsync() => SendStartAtAsync(QualificationStartMode.First);
+
+    public Task SendQualificationSecondStartAsync() => SendStartAtAsync(QualificationStartMode.Second);
+
+    public Task SendShortPreflightAsync() => SendStartAtAsync(QualificationStartMode.Preflight);
+
+    public void RestartWarmup()
+    {
+        if (!CanSend || productionSilentRunActive) return;
+        qualificationWarmupProof = null;
+        qualificationStart1Rates.Clear();
+        QualificationSecondStartRateText = "START #2 rate change: available after START #1 completes.";
+        foreach (DeviceViewModel device in Devices) device.WarmupHistory.Reset();
+        StatusMessage = "Controller warm-up history cleared. Collecting STATUS every 16 s for all devices.";
+    }
 
     public Task SendDegradedStartAsync()
     {
@@ -454,7 +484,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         allowDegradedSyncStartOnce = true;
-        return SendStartAtAsync();
+        return SendStartAtAsync(degradedQualificationMode);
     }
 
     public Task PrepareManualStartAtTestAsync() => PrepareManualStartAtTestInternalAsync();
@@ -2884,7 +2914,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             devices
                 .Where(device => device.SynchronizationDegraded)
                 .Select(device =>
-                    $"{device.DeviceId}: ±{device.SynchronizationUncertaintyMicroseconds ?? 0} us " +
+                    $"{device.DeviceId}: estimated uncertainty ±{device.SynchronizationUncertaintyMicroseconds ?? 0} us " +
                     $"(final spread {device.ForwardTop3SpreadMicroseconds ?? 0} us, " +
                     $"delta {(device.ResidualErrorMicroseconds ?? 0):+#;-#;0} us)"));
     }
@@ -2903,7 +2933,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             }));
     }
 
-    private async Task SendStartAtAsync()
+    private async Task SendStartAtAsync(QualificationStartMode qualificationMode)
     {
         bool requestedDegradedConfirmation = allowDegradedSyncStartOnce;
         allowDegradedSyncStartOnce = false;
@@ -2922,6 +2952,17 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         if (!TryDuration(out uint duration))
         {
             StartSynchronizationResult = $"START BLOCKED — DURATION: {StatusMessage}";
+            return;
+        }
+
+        if (qualificationMode == QualificationStartMode.Preflight && duration != 30)
+        {
+            SetStartDiagnostic("PREFLIGHT requires a 30 s duration. Set 00:30; this action does not qualify START #1.");
+            return;
+        }
+        if (qualificationMode == QualificationStartMode.First && duration < 2400)
+        {
+            SetStartDiagnostic("Qualification START #1 requires a >=40-minute duration. Use 30 s PREFLIGHT for a short check.");
             return;
         }
 
@@ -2991,10 +3032,17 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     participants,
                     preflightAfterUtc,
                     CancellationToken.None,
-                    waitForRtcQualification: true);
+                    waitForRtcQualification: qualificationMode == QualificationStartMode.Preflight);
                 if (preflightBlocks.Count != 0)
                 {
                     ReportStartBlocks(preflightBlocks);
+                    return;
+                }
+
+                IReadOnlyList<StartBlock> warmupBlocks = ValidateQualificationWarmup(participants, qualificationMode);
+                if (warmupBlocks.Count != 0)
+                {
+                    ReportStartBlocks(warmupBlocks);
                     return;
                 }
 
@@ -3074,6 +3122,13 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     return;
                 }
 
+                warmupBlocks = ValidateQualificationWarmup(participants, qualificationMode);
+                if (warmupBlocks.Count != 0)
+                {
+                    ReportStartBlocks(warmupBlocks);
+                    return;
+                }
+
                 DateTimeOffset gateNowUtc = DateTimeOffset.UtcNow;
                 long targetCandidateUs = checked(
                     MasterClock.NowMicroseconds + ProductionStartLeadMicroseconds);
@@ -3096,6 +3151,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     .ToArray();
                 if (degradedDevices.Length != 0 && !requestedDegradedConfirmation)
                 {
+                    degradedQualificationMode = qualificationMode;
                     SetDegradedStartPending(participants);
                     string degradedSummary = BuildDegradedSyncSummary(degradedDevices);
                     string pairText = gateResult.WorstPairStartUncertaintyMicroseconds.HasValue
@@ -3142,11 +3198,13 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                         return new PreparedParticipant(device, address, frozenGate);
                     })
                     .ToArray();
-                var prepared = new PreparedStartRun(
-                    commandId,
-                    duration,
-                    targetCandidateUs,
-                    frozenParticipants);
+                QualificationWarmupProof? runWarmupProof = qualificationMode == QualificationStartMode.First
+                    ? new QualificationWarmupProof(commandId, targetCandidateUs, duration, participants.Select(device =>
+                        new QualificationWarmupDeviceProof(device.DeviceId, device.WarmupHistory.Evaluate(MasterClock.NowMicroseconds),
+                            device.WarmupHistory.Samples)).ToArray()) { ControllerSessionId = controllerSessionId }
+                    : qualificationMode == QualificationStartMode.Second ? qualificationWarmupProof : null;
+                var prepared = new PreparedStartRun(commandId, duration, targetCandidateUs, frozenParticipants,
+                    RequireWarmupHealth: qualificationMode is QualificationStartMode.First or QualificationStartMode.Second, WarmupProof: runWarmupProof);
                 preparedForAbort = prepared;
 
                 // Start a low-overhead in-memory TX trace before any START_AT
@@ -3161,7 +3219,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     prepared.Participants.Select(participant => participant.Address).ToArray(),
                     prepared.Participants.Select(participant => participant.Device.DeviceId).ToArray(),
                     productionSyncOrderLabel,
-                    BuildSyncQualityTraceSummary(prepared.Participants));
+                    BuildSyncQualityTraceSummary(prepared.Participants),
+                    runWarmupProof, qualificationMode.ToString().ToUpperInvariant(),
+                    qualificationMode == QualificationStartMode.Second
+                        ? new Dictionary<string, double>(qualificationStart1Rates, StringComparer.Ordinal) : null);
 
                 var command = new CommandPacket(
                     CommandType.StartAt,
@@ -3199,6 +3260,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 }
 
                 await StartProductionSilentRunAsync(prepared, CancellationToken.None);
+                qualificationWarmupProof = qualificationMode == QualificationStartMode.First ? runWarmupProof : null;
+                qualificationStart1Rates.Clear();
+                if (qualificationMode == QualificationStartMode.First)
+                    QualificationSecondStartRateText = "START #2 rate change: awaiting START #1 and run completion.";
+                if (qualificationMode == QualificationStartMode.Preflight)
+                    foreach (DeviceViewModel device in Devices) device.WarmupHistory.Reset();
                 RecordSuccessfulProductionSyncSeriesStart();
 
                 preparedForAbort = null;
@@ -3303,6 +3370,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     "Reconnect the device or deselect it."));
                 continue;
             }
+            StartBlock? diagnosticBlock = DiagnosticBuildGuard.Evaluate(device.DeviceId, session.DiagnosticFlags);
+            if (diagnosticBlock is not null)
+            {
+                blocks.Add(diagnosticBlock);
+                continue;
+            }
             if (session.TimerState is TimerState.Armed or TimerState.Running)
             {
                 blocks.Add(new StartBlock(
@@ -3369,6 +3442,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                         device.DeviceId,
                         "Device went offline while waiting for RTC qualification; reconnect it and press START again.")];
                 }
+                StartBlock? diagnosticBlock = DiagnosticBuildGuard.Evaluate(device.DeviceId, session.DiagnosticFlags);
+                if (diagnosticBlock is not null) return [diagnosticBlock];
+
                 if (session.TimerState is TimerState.Armed or TimerState.Running)
                 {
                     return [new StartBlock(
@@ -3422,6 +3498,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         DateTimeOffset requireStatusAfterUtc,
         CancellationToken cancellationToken)
     {
+        long postSyncPollStartUs = MasterClock.NowMicroseconds;
+        foreach (DeviceViewModel device in participants)
+            device.WarmupHistory.BeginPostSyncPoll(postSyncPollStartUs);
         await RequestFreshStatusesAsync(participants, cancellationToken);
         await WaitForFreshStatusesAsync(participants, requireStatusAfterUtc, cancellationToken);
 
@@ -3446,6 +3525,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     StartBlockReason.Offline,
                     device.DeviceId,
                     "Reconnect the device or deselect it."));
+                continue;
+            }
+            StartBlock? diagnosticBlock = DiagnosticBuildGuard.Evaluate(device.DeviceId, session.DiagnosticFlags);
+            if (diagnosticBlock is not null)
+            {
+                blocks.Add(diagnosticBlock);
                 continue;
             }
             if (session.TimerState is TimerState.Armed or TimerState.Running)
@@ -3715,6 +3800,15 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 prepared.CommandId,
                 requireStatusAfterUtc);
             if (block is not null) return block;
+            if (prepared.RequireWarmupHealth)
+            {
+                RtcWarmupSample? baseline = prepared.WarmupProof?.Devices.SingleOrDefault(d => d.DeviceId == deviceId)?.Readiness.Latest;
+                RtcWarmupSample? latest = participant.Device.WarmupHistory.Latest;
+                if (baseline is null || latest is null ||
+                    !QualificationWarmupProof.HealthyContinuation(baseline, latest, MasterClock.NowMicroseconds))
+                    return new(StartBlockReason.WarmupNotReady, deviceId,
+                        "Final pre-arm warm-up health changed: require the same session/build, LOCKED, flags=0, RMS<=1.0 us and continuous SQW counters.");
+            }
             pending.Remove(deviceId);
         }
 
@@ -4082,6 +4176,24 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    private IReadOnlyList<StartBlock> ValidateQualificationWarmup(IReadOnlyList<DeviceViewModel> participants, QualificationStartMode mode)
+    {
+        if (mode is QualificationStartMode.Preflight or QualificationStartMode.Ordinary) return [];
+        long now = MasterClock.NowMicroseconds;
+        if (mode == QualificationStartMode.Second)
+        {
+            if (qualificationWarmupProof is null)
+                return [new(StartBlockReason.WarmupNotReady, "fleet", "START #2 has no controller warm-up proof from START #1.")];
+            RtcWarmupSample[] current = participants.Select(d => d.WarmupHistory.Latest).OfType<RtcWarmupSample>().ToArray();
+            QualificationSecondStartRateText = string.Join(Environment.NewLine,
+                qualificationWarmupProof.RateChangesSinceFirstStart(qualificationStart1Rates, current).Select(row => row.Display()));
+            return qualificationWarmupProof.ValidateSecondStart(current, now);
+        }
+        return participants.Select(device => (Device: device, Gate: device.WarmupHistory.Evaluate(now)))
+            .Where(item => !item.Gate.Ready).Select(item => new StartBlock(StartBlockReason.WarmupNotReady, item.Device.DeviceId,
+                item.Gate.Display(item.Device.DeviceId) + ". Wait for every frozen participant to be READY.")).ToArray();
+    }
+
     private async Task SendResetInternalAsync()
     {
         if (SelectedNetworkInterface is null || !udpService.IsReady)
@@ -4100,6 +4212,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         if (!await sendLock.WaitAsync(0)) return;
 
         ClearDegradedStartPending();
+        qualificationWarmupProof = null;
+        qualificationStart1Rates.Clear();
+        QualificationSecondStartRateText = "START #2 rate change: available after START #1 completes.";
+        foreach (DeviceViewModel device in Devices) device.WarmupHistory.Reset();
         isSending = true;
         UpdateCanSend();
         try
@@ -4161,6 +4277,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         StartBlockReason.ParticipantBusy => "PARTICIPANT BUSY",
         StartBlockReason.RtcNotLocked => "RTC NOT LOCKED",
         StartBlockReason.RtcNotQualified => "RTC NOT QUALIFIED",
+        StartBlockReason.DiagnosticFirmware => "DIAGNOSTIC FIRMWARE ACTIVE",
+        StartBlockReason.DiagnosticFlagsUnavailable => "DIAGNOSTIC FLAGS UNAVAILABLE",
+        StartBlockReason.WarmupNotReady => "QUALIFICATION WARM-UP WAIT",
         StartBlockReason.SyncFailed => "SYNC FAILED",
         StartBlockReason.SyncInvalidated => "SYNC INVALIDATED",
         StartBlockReason.TimingBudgetExceeded => "TIMING BUDGET EXCEEDED",
@@ -4298,31 +4417,21 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         IReadOnlyList<DeviceViewModel> participants,
         string contextLabel)
     {
-        DeviceViewModel[] received = participants
-            .Where(device =>
-                device.LastStartedCommandId == commandId &&
-                device.LastStartErrorMicroseconds.HasValue)
-            .ToArray();
-        if (received.Length != participants.Count)
-        {
-            StartSynchronizationResult =
-                $"{contextLabel}: waiting for STARTED telemetry from frozen set " +
-                $"({received.Length}/{participants.Count} received)...";
-            return;
-        }
-
-        long[] errors = received
-            .Select(device => device.LastStartErrorMicroseconds!.Value)
-            .ToArray();
-        long worst = errors.Max(error => Math.Abs(error));
-        long spread = errors.Max() - errors.Min();
-        long worstSchedulerLatenessUs = received
-            .Max(device => Math.Abs(device.LastSchedulerLatenessMicroseconds ?? long.MaxValue));
-
-        StartSynchronizationResult =
-            $"{contextLabel}: worst |error| ≈ {worst / 1000d:F3} ms; " +
-            $"{participants.Count}-device start spread ≈ {spread / 1000d:F3} ms; " +
-            $"worst |scheduler lateness|={worstSchedulerLatenessUs} µs";
+        DeviceViewModel[] received = participants.Where(device =>
+            device.StartDiagnostics.StartErrorUs(commandId).HasValue &&
+            device.StartDiagnostics.SchedulerLatenessUs(commandId).HasValue).ToArray();
+        string reported = received.Length == participants.Count
+            ? $"worst board-reported |StartErrorUs|={received.Max(d => Math.Abs(d.StartDiagnostics.StartErrorUs(commandId)!.Value))} µs; " +
+              $"worst |SchedulerLatenessUs|={received.Max(d => Math.Abs(d.StartDiagnostics.SchedulerLatenessUs(commandId)!.Value))} µs"
+            : $"waiting for board-reported START STATUS ({received.Length}/{participants.Count})";
+        DeviceViewModel? uncertain = participants.Where(d => d.SynchronizationUncertaintyMicroseconds.HasValue)
+            .MaxBy(d => d.SynchronizationUncertaintyMicroseconds!.Value);
+        string uncertainty = uncertain is null ? "SyncUncertaintyUs=UNAVAILABLE (estimate)" :
+            $"SyncUncertaintyUs={uncertain.SynchronizationUncertaintyMicroseconds} µs ({uncertain.DeviceId}, estimate)";
+        string projection = string.Join(", ", participants.Select(d =>
+            $"{d.DeviceId}={d.StartDiagnostics.UncorrectedLocalClockPhaseAtTStarUs(commandId)?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "PENDING"}"));
+        StartSynchronizationResult = $"{contextLabel}: {reported}; {uncertainty}." + Environment.NewLine +
+            $"UncorrectedLocalClockPhaseAtTStarUs: {projection} µs (informational only; never gates START).";
     }
 
     private void RefreshSynchronizationResolution()
@@ -4375,6 +4484,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         if (selectionChanged || (selectedNetworkInterface is not null && !udpService.IsReady))
         {
             statusDiscovery.Stop();
+            qualificationWarmupProof = null;
+            qualificationStart1Rates.Clear();
+            QualificationSecondStartRateText = "START #2 rate change: available after START #1 completes.";
             foreach (DeviceViewModel device in Devices)
             {
                 device.MarkOffline();
@@ -4635,7 +4747,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         IReadOnlyList<IPAddress> statusUnicastTargets,
         IReadOnlyList<string> participantDeviceIds,
         string syncOrder,
-        string syncQualitySummary)
+        string syncQualitySummary,
+        QualificationWarmupProof? warmupProof = null,
+        string qualificationPhase = "NONE",
+        IReadOnlyDictionary<string, double>? firstStartRates = null)
     {
         var session = new ControllerTxTraceSession(
             commandId,
@@ -4644,7 +4759,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             statusUnicastTargets,
             participantDeviceIds,
             syncOrder,
-            syncQualitySummary);
+            syncQualitySummary, warmupProof, qualificationPhase, firstStartRates, controllerSessionId);
 
         lock (controllerTxTraceGate)
         {
@@ -4770,7 +4885,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 .ConfigureAwait(false);
             dispatcherQueue.TryEnqueue(() =>
             {
-                ControllerTxTracePath = $"TX trace: {txPath} | Health: {healthPath}";
+                ControllerTxTracePath = $"TX trace: {txPath} | Health: {healthPath}" +
+                    (session.WarmupProof is null ? "" : $" | Warm-up: {session.WarmupAuditPath}");
                 StatusMessage = $"Controller timing + fleet-health traces saved: {txPath}; {healthPath}";
             });
         }
@@ -4892,17 +5008,24 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             $"controller_health_{fileStamp}_{session.CommandId:X16}.csv");
 
         var builder = new StringBuilder();
-        builder.AppendLine(DeviceHealthSnapshot.CsvHeader);
+        builder.AppendLine(DeviceHealthSnapshot.CsvHeader + ",QualificationPhase,WarmupFirstCommandId,WarmupHistorySeconds,WarmupRateChangePpm,WarmupGoodFitPolls,WarmupReady,Start1RtcRatePpmVsRtc,RtcRateChangeSinceStart1Ppm,WarmupMaxRateChangePpm,WarmupRequiredFitPoints,ControllerSessionId");
         foreach (string deviceId in session.ParticipantDeviceIds.OrderBy(id => id, StringComparer.Ordinal))
         {
             startHealth.TryGetValue(deviceId, out DeviceHealthSnapshot? start);
             postRunHealth.TryGetValue(deviceId, out DeviceHealthSnapshot? post);
             builder.AppendLine(DeviceHealthSnapshot.ToCsv(
                 session.CommandId, session.TargetMasterMicroseconds, session.DurationSeconds,
-                deviceId, "START", start));
+                deviceId, "START", start) + WarmupHealthColumns(session, deviceId, start, start));
             builder.AppendLine(DeviceHealthSnapshot.ToCsv(
                 session.CommandId, session.TargetMasterMicroseconds, session.DurationSeconds,
-                deviceId, "POST_RUN", post));
+                deviceId, "POST_RUN", post) + WarmupHealthColumns(session, deviceId, post, start));
+        }
+
+        if (session.WarmupProof is not null)
+        {
+            session.WarmupAuditPath = Path.Combine(directory, $"controller_warmup_{fileStamp}_{session.CommandId:X16}.csv");
+            await File.WriteAllTextAsync(session.WarmupAuditPath, session.WarmupProof.ToCsv(),
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)).ConfigureAwait(false);
         }
 
         await File.WriteAllTextAsync(
@@ -4910,6 +5033,19 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             builder.ToString(),
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)).ConfigureAwait(false);
         return path;
+    }
+
+    private static string WarmupHealthColumns(ControllerTxTraceSession session, string deviceId,
+        DeviceHealthSnapshot? current, DeviceHealthSnapshot? firstRunStart)
+    {
+        QualificationWarmupDeviceProof? proof = session.WarmupProof?.Devices.SingleOrDefault(d => d.DeviceId == deviceId);
+        double? firstRate = session.QualificationPhase == "FIRST" ? firstRunStart?.RtcRatePpmVsRtc :
+            session.FirstStartRates.TryGetValue(deviceId, out double recorded) ? recorded : null;
+        var rates = new QualificationStartRateChange(deviceId, firstRate, current?.RtcRatePpmVsRtc);
+        return "," + session.QualificationPhase + "," + (session.WarmupProof?.FirstCommandId.ToString("X16") ?? "") + "," +
+            (proof is null ? ",,,0" : FormattableString.Invariant(
+                $"{proof.Readiness.HistorySeconds:R},{proof.Readiness.RateChangePpm:R},{proof.Readiness.GoodFitPolls},{(proof.Readiness.Ready ? 1 : 0)}")) +
+            FormattableString.Invariant($",{firstRate:R},{rates.ChangePpm:R},{RtcWarmupHistory.MaximumRateChangePpm:R},{RtcWarmupHistory.RequiredFitPoints},{session.ControllerSessionId}");
     }
 
     private static long PositiveModulo(long value, long modulus)
@@ -4955,8 +5091,13 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     break;
                 case StatusPacket status:
                     RecordControllerHealthSnapshot(status);
-                    device.Apply(status, e.RemoteEndPoint);
+                    device.Apply(status, e.RemoteEndPoint, e.MasterReceiveMicroseconds);
+                    ObserveQualificationStart1Rate(status);
                     ObserveProductionRunningStatus(status);
+                    StartTelemetryContext? statusContext = productionStartTelemetryContext;
+                    if (statusContext is not null && status.CommandId == statusContext.CommandId &&
+                        statusContext.Participants.Contains(device))
+                        RefreshStartSynchronizationResult(statusContext.CommandId, statusContext.Participants, "Production START");
                     break;
                 case StartedPacket started:
                     device.Apply(started, e.RemoteEndPoint);
@@ -4990,6 +5131,30 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     private void UdpService_ReceiveError(object? sender, string message) =>
         dispatcherQueue.TryEnqueue(() => StatusMessage = message);
 
+    private void ObserveQualificationStart1Rate(StatusPacket status)
+    {
+        QualificationWarmupProof? proof = qualificationWarmupProof;
+        if (proof is null || status.CommandId != proof.FirstCommandId ||
+            !proof.Devices.Any(device => device.DeviceId == status.DeviceId)) return;
+        if (status.State == TimerState.Running && status.RtcRatePpmVsRtc is double rate && double.IsFinite(rate))
+            qualificationStart1Rates.TryAdd(status.DeviceId, rate); // First START-adjacent RUNNING reading.
+        if (status.State == TimerState.Finished)
+        {
+            RtcWarmupSample[] current = proof.Devices.Select(participant => Devices.Single(d => d.DeviceId == participant.DeviceId))
+                .Select(device => device.WarmupHistory.Latest).OfType<RtcWarmupSample>()
+                .Where(sample => sample.Status.State == TimerState.Finished && sample.Status.CommandId == proof.FirstCommandId).ToArray();
+            QualificationSecondStartRateText = string.Join(Environment.NewLine,
+                proof.RateChangesSinceFirstStart(qualificationStart1Rates, current).Select(row => row.Display()));
+        }
+    }
+
+    private void StatusDiscovery_PollStarted(object? sender, StatusPollEventArgs e) =>
+        dispatcherQueue.TryEnqueue(() =>
+        {
+            if (e.NetworkInterface != SelectedNetworkInterface) return;
+            foreach (DeviceViewModel device in Devices) device.WarmupHistory.BeginPoll(e.Sequence, e.MasterMicroseconds);
+        });
+
     private void StatusDiscovery_DiscoveryError(object? sender, string message) =>
         dispatcherQueue.TryEnqueue(() => StatusMessage = message);
 
@@ -5012,6 +5177,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             device.UpdateEstimatedMasterTime(masterNowUs);
             device.UpdateRunningRemainingEstimate(now);
         }
+        foreach (DeviceViewModel device in Devices) device.RefreshWarmup(masterNowUs);
+        DeviceViewModel[] selected = Devices.Where(device => device.IsSelected).ToArray();
+        bool ready = selected.Length != 0 && selected.All(device => device.WarmupHistory.Evaluate(masterNowUs).Ready);
+        QualificationGateText = $"QUALIFICATION_START1_GATE={(ready ? "READY" : "WAIT")}  participants={selected.Length}  STATUS every 16 s; rateΔ limit={RtcWarmupHistory.MaximumRateChangePpm:F2} ppm/10 min; full fit={RtcWarmupHistory.RequiredFitPoints}";
         RefreshManualStartAtUi();
     }
 
@@ -5057,6 +5226,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         manualSession?.Dispose();
         uiTimer.Stop();
         statusDiscovery.DiscoveryError -= StatusDiscovery_DiscoveryError;
+        statusDiscovery.PollStarted -= StatusDiscovery_PollStarted;
         statusDiscovery.Dispose();
         networkSelectionManager.StateChanged -= NetworkSelectionManager_StateChanged;
         networkSelectionManager.Dispose();
@@ -5075,7 +5245,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         ulong CommandId,
         uint DurationSeconds,
         long TargetMasterMicroseconds,
-        IReadOnlyList<PreparedParticipant> Participants);
+        IReadOnlyList<PreparedParticipant> Participants,
+        bool RequireWarmupHealth = false,
+        QualificationWarmupProof? WarmupProof = null);
 
     private sealed record StartTelemetryContext(
         ulong CommandId,
@@ -5088,8 +5260,18 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         IReadOnlyList<IPAddress> statusUnicastTargets,
         IReadOnlyList<string> participantDeviceIds,
         string syncOrder,
-        string syncQualitySummary)
+        string syncQualitySummary,
+        QualificationWarmupProof? warmupProof,
+        string qualificationPhase,
+        IReadOnlyDictionary<string, double>? firstStartRates,
+        string controllerSessionId)
     {
+        public string ControllerSessionId { get; } = controllerSessionId;
+        public IReadOnlyDictionary<string, double> FirstStartRates { get; } =
+            firstStartRates ?? new Dictionary<string, double>(StringComparer.Ordinal);
+        public QualificationWarmupProof? WarmupProof { get; } = warmupProof;
+        public string QualificationPhase { get; } = qualificationPhase;
+        public string WarmupAuditPath { get; set; } = "";
         public ulong CommandId { get; } = commandId;
         public long TargetMasterMicroseconds { get; } = targetMasterMicroseconds;
         public uint DurationSeconds { get; } = durationSeconds;
@@ -5166,7 +5348,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         bool? Cpu0InterruptLevelMatch,
         uint? Cpu0MonitorMissedPeriods,
         string? FirmwareBuildId,
-        int StatusFieldCount)
+        int StatusFieldCount,
+        byte? DiagnosticFlags)
     {
         public RunDiagnosticPacket? RunDiagnostic { get; init; }
 
@@ -5180,7 +5363,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             "Cpu0MonitorMissedPeriods,Cpu0MonitorExpectedPeriods,FirmwareBuildId,StatusFieldCount," +
             "RunDiagnosticCaptured,RunDiagnosticValid,Cpu0MonitorPeriodUs,Cpu0MonitorThresholdUs," +
             "MonitorStartUs,TStarLocalUs,MonitorStartToTStarUs,MonitorEndUs,MonitorElapsedUs,FirstAlarmOffsetUs," +
-            "Cpu0EventsGe50Us,RtcDisciplineEventsGe50Us,WifiEventsGe50Us,UdpEventsGe50Us,CommitLateEvents,CommitGe300Us,MonitorRearmFailures";
+            "Cpu0EventsGe50Us,RtcDisciplineEventsGe50Us,WifiEventsGe50Us,UdpEventsGe50Us,CommitLateEvents,CommitGe300Us,MonitorRearmFailures,DiagnosticFlags";
 
         public static DeviceHealthSnapshot FromStatus(StatusPacket status, long capturedMasterMicroseconds)
         {
@@ -5231,7 +5414,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 status.Cpu0InterruptLevelMatch,
                 status.Cpu0MonitorMissedPeriods,
                 status.FirmwareBuildId,
-                status.StatusFieldCount);
+                status.StatusFieldCount,
+                status.DiagnosticFlags);
         }
 
         public static string ToCsv(
@@ -5325,7 +5509,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 UInt(health?.RunDiagnostic?.UdpEventsGe50),
                 UInt(health?.RunDiagnostic?.CommitLateEvents),
                 UInt(health?.RunDiagnostic?.CommitGe300),
-                UInt(health?.RunDiagnostic?.RearmFailures));
+                UInt(health?.RunDiagnostic?.RearmFailures),
+                health?.DiagnosticFlags is byte diagnosticFlags
+                    ? $"0x{diagnosticFlags:X2}" : string.Empty);
         }
     }
 

@@ -33,7 +33,7 @@ def write_health(folder, index, tstar, reported_rates):
             SyncEpochMasterMinusDisciplinedUs=q, RtcRatePpmVsRtc=0, RtcFitPoints=129, RtcFitRmsUs=0.5,
             RtcFitOutliers=0, RtcAcceptedEdges=1000 + (tstar + 100_000) // 1_000_000,
             RtcInferredMissingEdges=0, RtcHoldoverEntries=0, RtcQueueDrops=0, RtcTemperatureValid=1,
-            RtcTemperatureC=25, RtcSqwCore=1, HealthFlags=1))
+            RtcTemperatureC=25, RtcSqwCore=1, HealthFlags=1,DiagnosticFlags="0x00",FirmwareBuildId="production-build"))
     path = folder / f'start{index}.csv'
     with path.open('w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)

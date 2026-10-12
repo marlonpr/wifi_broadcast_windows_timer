@@ -13,10 +13,9 @@ mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 
-# 38 samples at 16 s cadence span 592 s, satisfying the default 95% coverage
-# requirement for a 600 s gate while matching firmware RTC_QUAL cadence.
+# 39 samples at 16 s cadence span 608 s; 592 s is no longer sufficient.
 samples = []
-for i in range(38):
+for i in range(39):
     samples.append(mod.Sample(
         local_us=i * 16_000_000,
         rate_ppm=4.0 + (0.004 * (i * 16 / 60)),  # +0.004 ppm/min
@@ -42,6 +41,8 @@ assert segment == [new1, new2]
 assert abs(0.005 * 40 - 0.20) < 1e-12
 assert 0.20 < 0.25
 
-print('PASS: default 600 s / 0.005 ppm-min / 0.05 ppm / 0.25 C readiness arithmetic')
-print('PASS: 16 s cadence provides sufficient 95% window coverage')
+assert mod.inspect_history(samples)['ready']
+assert not mod.inspect_history(samples[:-1])['ready']
+print('PASS: >=600 s, full fits, <=0.25 ppm and three good RMS polls; trend/temperature informational')
+print('PASS: 16 s cadence requires 608 s; 592 s cannot qualify')
 print('PASS: latest-boot monotonic segment isolation')

@@ -126,6 +126,13 @@
                                     IsEnabled="{Binding CanSend}" HorizontalAlignment="Stretch" />
                         </Grid>
 
+                        <TextBlock Text="{Binding QualificationGateText}" FontFamily="Consolas" TextWrapping="Wrap" />
+                        <Button Content="START #1 (QUALIFICATION)" Click="QualificationFirstStart_Click" IsEnabled="{Binding CanSend}" />
+                        <TextBlock Text="{Binding QualificationSecondStartRateText}" FontFamily="Consolas" TextWrapping="Wrap" />
+                        <Button Content="START #2 (AFTER LONG RUN)" Click="QualificationSecondStart_Click" IsEnabled="{Binding CanSend}" />
+                        <Button Content="30 s PREFLIGHT" Click="ShortPreflight_Click" IsEnabled="{Binding CanSend}" />
+                        <Button Content="RESTART WARM-UP HISTORY" Click="RestartWarmup_Click" IsEnabled="{Binding CanSend}" />
+
                         <Border Padding="10" CornerRadius="6"
                                 Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
                                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
@@ -183,6 +190,9 @@
                                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                             <TextBlock Grid.Column="3" Text="{Binding RemainingSeconds}" FontFamily="Consolas" />
                                         </Grid>
+                                        <TextBlock Text="{Binding WarmupText}" FontFamily="Consolas" TextWrapping="Wrap" />
+                                        <TextBlock Text="{Binding StartTimingError}" TextWrapping="Wrap"
+                                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                         <Grid ColumnSpacing="8">
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="Auto" />

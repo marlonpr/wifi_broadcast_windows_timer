@@ -43,6 +43,11 @@ public sealed partial class MainWindow : Window
 
     private async void Start_Click(object sender, RoutedEventArgs e) => await viewModel.SendStartAsync();
 
+    private async void QualificationFirstStart_Click(object sender, RoutedEventArgs e) => await viewModel.SendQualificationFirstStartAsync();
+    private async void QualificationSecondStart_Click(object sender, RoutedEventArgs e) => await viewModel.SendQualificationSecondStartAsync();
+    private async void ShortPreflight_Click(object sender, RoutedEventArgs e) => await viewModel.SendShortPreflightAsync();
+    private void RestartWarmup_Click(object sender, RoutedEventArgs e) => viewModel.RestartWarmup();
+
     private async void StartDegraded_Click(object sender, RoutedEventArgs e) =>
         await viewModel.SendDegradedStartAsync();
 

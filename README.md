@@ -1,4 +1,114 @@
-# Factory timer controller 6.22.14
+# Controller 6.22.18: qualification policy and continuity
+
+The current warm-up gate is full 129-point fits, three normal RMS<=1 us polls,
+>=600 s of controller history and <=0.25 ppm ten-minute rate movement on every
+frozen participant. Saved CSVs include the frozen policy and controller session.
+Production START shows board-reported StartErrorUs and SchedulerLatenessUs;
+sync uncertainty is labeled an estimate and raw local phase informational only.
+
+The logger disables modem control/flow control before opening and can validate
+accepted-edge continuity with --accepted-before-open. Both qualification tools
+reject changed/missing firmware builds, controller restarts, counter faults,
+incomplete modern proof and partial fits. START #2 local-crystal rate movement
+is informational only. The analyzer raw comparison remains <=0.05 ppm.
+
+See [V6_22_18_QUALIFICATION_POLICY.md](V6_22_18_QUALIFICATION_POLICY.md) for commands,
+port-open continuity checks and the frozen long-run procedure. Firmware binary
+source remains 6.23.19; Analyzer remains 10.1. Build/run .NET tests and validate
+actual serial adapters on the PC before the qualification run.
+
+The revision notes below describe historical policies. This section and the
+6.22.18 policy guide supersede the older 0.05 ppm warm-up and START2 rate gate.
+
+# Controller 6.22.17: review fixes before qualification
+
+The explicit post-sync STATUS request registers a foreground history window
+before sending. Its replies enter history without advancing the three-good-RMS
+poll streak or sharing discovery's sequence counter. Slow synchronization no
+longer depends on an immediate discovery reply to avoid HISTORY_PENDING. The
+24 s freshness and 48 s history-gap limits remain active, as do all health,
+diagnostic and continuity guards.
+
+START #2 displays actual START #1's first RUNNING rate, current rate and signed
+movement for every frozen participant. Missing data is UNAVAILABLE; >0.25 ppm
+warns without changing the START #2 gate. Health CSVs append Start1RtcRatePpmVsRtc
+and RtcRateChangeSinceStart1Ppm, computed from each captured endpoint. The batch
+validator keeps its independent 0.25 ppm rule.
+
+The firmware tools' monitor_board.py now verifies live RTC_QUAL device identity,
+including split/CRLF lines. It withholds output and log creation until a match,
+aborts wrong/changed identity or a 35 s timeout with exit 2, and preserves DTR/RTS
+low before open. --check-only still verifies only the local build/ELF.
+
+Three good periodic RMS polls delay READY after one bad poll; they do not avoid
+WAIT or provide three independent fit measurements. RtcQueueDrops must remain
+zero since boot. Warm-up still proves idle stability and cannot promise the
+same rate under countdown load. >=2400 s START #1 and the 120 s continuation
+window are unchanged. Firmware remains 6.23.19 and Analyzer remains 10.1.
+
+Portable logger tests execute split-line/mismatch/timeout cases and main() with
+serial mocks, including no wrong-board file and correct port cleanup. Five new
+.NET scenario tests cover slow sync, overlapping polls, streak/continuity guards,
+boot queue drops and START #2 rate audit; they require the .NET SDK on the test PC.
+
+# Controller 6.22.16: fleet warm-up qualification gate
+
+STATUS is polled every 16 s for the controller roster. Every selected/frozen
+participant, including ESP02 and ESP05, must satisfy a full >=600 s controller
+history, |ten-minute rate movement|<=0.05 ppm, LOCKED, DiagnosticFlags=0, and
+latest RMS<=1.0 us with three consecutive good polls. Per-device WAIT/READY
+reasons and QUALIFICATION_START1_GATE appear in the UI. No serial logs feed this
+gate. A bad latest fit blocks immediately; duplicate/manual STATUS cannot add
+extra good polls. Existing RTC health guards remain active.
+
+Use START #1 (QUALIFICATION) with >=40:00 after all five are READY. It rechecks
+before synchronization, after synchronization, and at the final ARM barrier.
+Use START #2 (AFTER LONG RUN) immediately after completion, with the same fleet,
+without RESET. The controller carries the frozen first proof across the quiet
+run and verifies live FINISHED health/session/build/counters; it does not poll
+during RUNNING or require another ten minutes. Continuation expires after 120 s.
+Ordinary START remains available; ORDINARY/PREFLIGHT files cannot pass the modern
+qualification proof guards even with --warm-confirmed. Completed runs save raw
+controller_warmup CSV samples and readiness metadata in the health CSV.
+
+30 s PREFLIGHT clears earlier history on successful arming. RESTART WARM-UP
+HISTORY clears it explicitly after any external short run/reflash. A controller
+restart or network/interface change also requires fresh history. The bundle
+README describes the exact endpoint and board-specific monitor-only commands.
+
+Portable saved-file/integration checks pass. New .NET tests cover thresholds,
+three-poll accounting, five-device blocking, resets/staleness and START #2 reuse;
+they still need `dotnet test` on the test PC. Firmware stays 6.23.19 and Analyzer
+stays 10.1. There is no STATUS protocol or firmware binary change for this gate.
+
+# Factory timer controller 6.22.15
+
+6.22.15 adds the 45-field STATUS parser and explicit diagnostic-build guards.
+Every frozen participant must report `DiagnosticFlags=0x00`. Missing flags from
+older firmware and every nonzero byte (including reserved bits) are rejected.
+Checks run in the initial fresh STATUS/RTC wait before synchronization, the
+post-sync pass before START_AT, the ARM session guard and the final STATUS
+barrier. Rejection names the device, hex byte and active flags, for example:
+
+```text
+ESP01 rejected: diagnostic firmware active. DiagnosticFlags=0x04 (START_TASK_DELAY_TEST).
+```
+
+Legacy STATUS forms remain parseable for viewing; they cannot qualify without
+flags. `RtcQueueDrops` is hex only in the new 45-field form. Health CSV adds one
+`DiagnosticFlags` column (`0xNN`); HealthFlags is unchanged. Both endpoint
+qualification tools enforce zero flags, and the fleet summarizer excludes
+missing/invalid/nonzero flags from clean exposure. Task/ISR canaries are detected
+from their flags even when a natural event owns the worst-task slot.
+
+The archived serial warm-up tool accepts endpoint rate movement <=0.05 ppm; the 40-minute raw analyzer comparison remains <=0.05 ppm. See the
+bundle README for the production reflash, short-run checks and warm-up sequence.
+
+New parser/guard MSTest cases are included. .NET build and tests must be run on
+the PC; portable checks here exercise firmware packets/build flags and Python
+qualification paths, not execution of the C# controller.
+
+## 6.22.14
 
 6.22.14 changes Python tooling only; the Windows controller and protocol are
 unchanged from 6.22.13.

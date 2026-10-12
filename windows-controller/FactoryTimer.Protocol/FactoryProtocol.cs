@@ -98,6 +98,7 @@ public enum ProtocolParseError
     Cpu0InterruptLevelMatch,
     Cpu0MonitorMissedPeriods,
     FirmwareBuildId,
+    DiagnosticFlags,
     Brightness,
 }
 
@@ -171,9 +172,10 @@ public sealed record StatusPacket(
     bool? Cpu0InterruptLevelMatch = null,
     uint? Cpu0MonitorMissedPeriods = null,
     string? FirmwareBuildId = null,
-    int StatusFieldCount = 0) : InboundPacket(DeviceId);
+    int StatusFieldCount = 0,
+    byte? DiagnosticFlags = null) : InboundPacket(DeviceId);
 
-// Separate post-run diagnostics keep the production 44-field STATUS stable.
+// Separate post-run diagnostics keep monitor counters out of production STATUS.
 public sealed record RunDiagnosticPacket(
     string DeviceId, ulong CommandId, bool Valid, uint PeriodMicroseconds,
     uint ThresholdMicroseconds, long MonitorStartMicroseconds, long TStarLocalMicroseconds,
@@ -529,8 +531,9 @@ public static class FactoryProtocol
         // v6.23.4 appends three RTC continuity counters (31 fields), and
         // v6.23.11 appends eleven compact CPU0-monitor fields (42 fields);
         // v6.23.15 appends missed-period count and ELF-SHA8 build identity (44 fields).
+        // v6.23.19 appends a diagnostic-build byte (45 fields); queue drops use hex only in that form.
         if ((fields.Length == 9 || fields.Length == 10 || fields.Length == 14 ||
-             fields.Length == 28 || fields.Length == 31 || fields.Length == 42 || fields.Length == 44) &&
+             fields.Length == 28 || fields.Length == 31 || fields.Length == 42 || fields.Length == 44 || fields.Length == 45) &&
             fields[0] == Version2 && fields[1] == "STATUS")
         {
             if (!ValidDeviceId(fields[2]))
@@ -606,6 +609,7 @@ public static class FactoryProtocol
             bool? cpu0InterruptLevelMatch = null;
             uint? cpu0MonitorMissedPeriods = null;
             string? firmwareBuildId = null;
+            byte? diagnosticFlags = null;
 
             if (fields.Length >= 10 && !TryRtcDisciplineState(fields[9], out rtcState))
             {
@@ -625,7 +629,8 @@ public static class FactoryProtocol
                     error = ProtocolParseError.RtcFitRms;
                     return false;
                 }
-                if (!uint.TryParse(fields[12], NumberStyles.None, CultureInfo.InvariantCulture, out uint queueDrops))
+                if (!uint.TryParse(fields[12], fields.Length == 45 ? NumberStyles.HexNumber : NumberStyles.None,
+                    CultureInfo.InvariantCulture, out uint queueDrops))
                 {
                     error = ProtocolParseError.RtcQueueDrops;
                     return false;
@@ -641,7 +646,7 @@ public static class FactoryProtocol
                 rtcTemperatureValid = fields[13] == "1";
             }
 
-            if (fields.Length == 28 || fields.Length == 31 || fields.Length == 42 || fields.Length == 44)
+            if (fields.Length == 28 || fields.Length == 31 || fields.Length == 42 || fields.Length == 44 || fields.Length == 45)
             {
                 if (!double.TryParse(fields[14], NumberStyles.Float, CultureInfo.InvariantCulture, out double ratePpm) ||
                     !double.IsFinite(ratePpm) || ratePpm is < -1_000_000d or > 1_000_000d)
@@ -649,7 +654,7 @@ public static class FactoryProtocol
                     error = ProtocolParseError.RtcRate;
                     return false;
                 }
-                NumberStyles healthCounterStyle = fields.Length == 44 ? NumberStyles.HexNumber : NumberStyles.None;
+                NumberStyles healthCounterStyle = fields.Length >= 44 ? NumberStyles.HexNumber : NumberStyles.None;
                 if (!ulong.TryParse(fields[15], healthCounterStyle, CultureInfo.InvariantCulture, out ulong fitOutliers))
                 {
                     error = ProtocolParseError.RtcFitOutliers;
@@ -719,9 +724,9 @@ public static class FactoryProtocol
                     return false;
                 }
 
-                if (fields.Length == 31 || fields.Length == 42 || fields.Length == 44)
+                if (fields.Length == 31 || fields.Length == 42 || fields.Length == 44 || fields.Length == 45)
                 {
-                    NumberStyles continuityCounterStyle = fields.Length == 44 ? NumberStyles.HexNumber : NumberStyles.None;
+                    NumberStyles continuityCounterStyle = fields.Length >= 44 ? NumberStyles.HexNumber : NumberStyles.None;
                     if (!ulong.TryParse(fields[28], continuityCounterStyle, CultureInfo.InvariantCulture, out ulong acceptedEdges))
                     {
                         error = ProtocolParseError.RtcAcceptedEdges;
@@ -742,7 +747,7 @@ public static class FactoryProtocol
                     rtcHoldoverEntries = holdoverEntries;
                 }
 
-                if (fields.Length == 42 || fields.Length == 44)
+                if (fields.Length == 42 || fields.Length == 44 || fields.Length == 45)
                 {
                     if (fields[31] != "0" && fields[31] != "1")
                     {
@@ -812,7 +817,7 @@ public static class FactoryProtocol
                     cpu0MonitorOverflow = monitorOverflow;
                     cpu0InterruptLevelMatch = fields[41] == "1";
 
-                    if (fields.Length == 44)
+                    if (fields.Length == 44 || fields.Length == 45)
                     {
                         if (!uint.TryParse(fields[42], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint missedPeriods))
                         {
@@ -855,6 +860,18 @@ public static class FactoryProtocol
                 }
             }
 
+            if (fields.Length == 45)
+            {
+                string buildFlags = fields[44];
+                if (buildFlags.Length != 2 || !buildFlags.All(Uri.IsHexDigit) ||
+                    !byte.TryParse(buildFlags, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out byte parsedFlags))
+                {
+                    error = ProtocolParseError.DiagnosticFlags;
+                    return false;
+                }
+                diagnosticFlags = parsedFlags;
+            }
+
             packet = new StatusPacket(
                 fields[2], commandId, state, remaining, rssi, channel, fields[8], rtcState,
                 rtcFitPoints, rtcFitRmsUs, rtcQueueDrops, rtcTemperatureValid,
@@ -867,7 +884,7 @@ public static class FactoryProtocol
                 cpu0MonitorWorstUs, cpu0MonitorWorstTask, cpu0CommitLateCount,
                 cpu0CommitWorstUs, cpu0CommitOverlap, cpu0WrongCoreCallbacks,
                 cpu0MonitorOverflow, cpu0InterruptLevelMatch, cpu0MonitorMissedPeriods,
-                firmwareBuildId, fields.Length);
+                firmwareBuildId, fields.Length, diagnosticFlags);
             return true;
         }
 

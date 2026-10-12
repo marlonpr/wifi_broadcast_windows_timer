@@ -19,7 +19,7 @@ def main():
     if not rows: raise SystemExit(f'No POST_RUN row for {args.device}')
     r=rows[-1]
     checks={
-        'STATUS_FIELD_COUNT_44': i(r,'StatusFieldCount')==44,
+        'STATUS_FIELD_COUNT_44_OR_45': i(r,'StatusFieldCount') in (44,45),
         'MONITOR_VALID': (r.get('Cpu0MonitorValid') or '').strip()=='1',
         'EVENT_COUNT_1': i(r,'Cpu0MonitorEventCount')==1,
         'WORST_350_TO_700_US': i(r,'Cpu0MonitorWorstUs') is not None and 350 <= i(r,'Cpu0MonitorWorstUs') <= 700,

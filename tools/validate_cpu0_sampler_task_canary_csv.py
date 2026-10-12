@@ -20,7 +20,7 @@ def main() -> int:
     r=rows[-1]
     build=(r.get('FirmwareBuildId') or '').strip()
     checks={
-        'STATUS_FIELD_COUNT_44': iv(r,'StatusFieldCount')==44,
+        'STATUS_FIELD_COUNT_44_OR_45': iv(r,'StatusFieldCount') in (44,45),
         'MONITOR_VALID': (r.get('Cpu0MonitorValid') or '').strip()=='1',
         'EVENT_COUNT_1': iv(r,'Cpu0MonitorEventCount')==1,
         'WORST_AT_LEAST_749_US': (iv(r,'Cpu0MonitorWorstUs') or 0)>=749,

@@ -11,6 +11,9 @@ public enum StartBlockReason
     ParticipantBusy,
     RtcNotLocked,
     RtcNotQualified,
+    DiagnosticFirmware,
+    DiagnosticFlagsUnavailable,
+    WarmupNotReady,
     SyncFailed,
     SyncInvalidated,
     TimingBudgetExceeded,
@@ -44,7 +47,8 @@ public sealed record StartParticipantGateInput(
     double? ReportedRtcFitRmsMicroseconds = 0d,
     uint? ReportedRtcQueueDrops = 0,
     bool? ReportedRtcTemperatureValid = true,
-    long? SynchronizationUncertaintyMicroseconds = null);
+    long? SynchronizationUncertaintyMicroseconds = null,
+    byte? ReportedDiagnosticFlags = null);
 
 public sealed record StartGateResult(
     bool Accepted,
@@ -54,6 +58,38 @@ public sealed record StartGateResult(
 {
     public static StartGateResult Blocked(params StartBlock[] blocks) =>
         new(false, blocks, null, new Dictionary<string, long>());
+}
+
+public static class DiagnosticBuildGuard
+{
+    public static StartBlock? Evaluate(string deviceId, byte? diagnosticFlags)
+    {
+        if (!diagnosticFlags.HasValue)
+        {
+            return new StartBlock(
+                StartBlockReason.DiagnosticFlagsUnavailable,
+                deviceId,
+                $"{deviceId} rejected: DiagnosticFlags unavailable; flash v6.23.19-or-newer production firmware before qualification.");
+        }
+        if (diagnosticFlags.Value == 0) return null;
+        return new StartBlock(
+            StartBlockReason.DiagnosticFirmware,
+            deviceId,
+            $"{deviceId} rejected: diagnostic firmware active. DiagnosticFlags=0x{diagnosticFlags.Value:X2} " +
+            $"({Describe(diagnosticFlags.Value)}). Reflash with diagnostic options disabled before qualification.");
+    }
+
+    public static string Describe(byte flags)
+    {
+        var names = new List<string>();
+        if ((flags & 0x01) != 0) names.Add("TASK_CANARY_ENABLED");
+        if ((flags & 0x02) != 0) names.Add("ISR_CANARY_ENABLED");
+        if ((flags & 0x04) != 0) names.Add("START_TASK_DELAY_TEST");
+        if ((flags & 0x08) != 0) names.Add("GPIO_PROBE / timing diagnostic");
+        if ((flags & 0x10) != 0) names.Add("MONITOR_OFF_A_B");
+        if ((flags & 0xE0) != 0) names.Add($"UNKNOWN(0x{flags & 0xE0:X2})");
+        return names.Count == 0 ? "NONE" : string.Join(", ", names);
+    }
 }
 
 public static class RtcStartQualification
@@ -177,6 +213,14 @@ public static class StartReadinessGate
                     StartBlockReason.Offline,
                     participant.DeviceId,
                     "Reconnect the device or deselect it."));
+                continue;
+            }
+
+            StartBlock? diagnosticBlock = DiagnosticBuildGuard.Evaluate(
+                participant.DeviceId, participant.ReportedDiagnosticFlags);
+            if (diagnosticBlock is not null)
+            {
+                blocks.Add(diagnosticBlock);
                 continue;
             }
 
@@ -334,6 +378,9 @@ public static class StartArmSessionGuard
                 "Device session changed during ARMING. Press START again.");
         }
 
+        StartBlock? diagnosticBlock = DiagnosticBuildGuard.Evaluate(deviceId, current.DiagnosticFlags);
+        if (diagnosticBlock is not null) return diagnosticBlock;
+
         StartBlock? rtcBlock = RtcStartQualification.Evaluate(
             deviceId, current.RtcState, current.RtcFitPoints, current.RtcFitRmsMicroseconds,
             current.RtcQueueDrops, current.RtcTemperatureValid, "RTC during ARMING");
@@ -422,6 +469,9 @@ public static class StartFinalBarrier
                 deviceId,
                 "Device session changed before final ARM verification; press START again.");
         }
+
+        StartBlock? diagnosticBlock = DiagnosticBuildGuard.Evaluate(deviceId, current.DiagnosticFlags);
+        if (diagnosticBlock is not null) return diagnosticBlock;
 
         StartBlock? rtcBlock = RtcStartQualification.Evaluate(
             deviceId, current.RtcState, current.RtcFitPoints, current.RtcFitRmsMicroseconds,
@@ -566,7 +616,8 @@ public sealed record ParticipantSessionSnapshot(
     ushort? RtcFitPoints = 129,
     double? RtcFitRmsMicroseconds = 0d,
     uint? RtcQueueDrops = 0,
-    bool? RtcTemperatureValid = true);
+    bool? RtcTemperatureValid = true,
+    byte? DiagnosticFlags = null);
 
 public sealed class ParticipantSessionTracker
 {
@@ -585,6 +636,7 @@ public sealed class ParticipantSessionTracker
     private double? rtcFitRmsMicroseconds;
     private uint? rtcQueueDrops;
     private bool? rtcTemperatureValid;
+    private byte? diagnosticFlags;
 
     public ParticipantSessionSnapshot Snapshot
     {
@@ -604,7 +656,8 @@ public sealed class ParticipantSessionTracker
                     rtcFitPoints,
                     rtcFitRmsMicroseconds,
                     rtcQueueDrops,
-                    rtcTemperatureValid);
+                    rtcTemperatureValid,
+                    diagnosticFlags);
             }
         }
     }
@@ -632,6 +685,7 @@ public sealed class ParticipantSessionTracker
             rtcFitRmsMicroseconds = status.RtcFitRmsMicroseconds;
             rtcQueueDrops = status.RtcQueueDrops;
             rtcTemperatureValid = status.RtcTemperatureValid;
+            diagnosticFlags = status.DiagnosticFlags;
         }
     }
 
@@ -710,6 +764,7 @@ public sealed class ParticipantSessionTracker
             rtcFitRmsMicroseconds = null;
             rtcQueueDrops = null;
             rtcTemperatureValid = null;
+            diagnosticFlags = null;
         }
     }
 }

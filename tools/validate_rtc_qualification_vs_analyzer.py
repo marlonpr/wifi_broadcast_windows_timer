@@ -103,7 +103,8 @@ def main():
         help='Explicit physical mapping for older slot-labelled captures; otherwise labels must match --devices')
     ap.add_argument('--tolerance-ppm',type=float,default=0.05)
     ap.add_argument('--warm-confirmed',action='store_true')
-    ap.add_argument('--max-rate-change-ppm',type=float,default=0.25)
+    ap.add_argument('--max-rate-change-ppm',type=float,default=0.25,
+        help='Informational local-crystal rate band only; never gates qualification')
     ap.add_argument('--fit-lag-seconds',type=float,default=64.0)
     ap.add_argument('--min-interval-seconds',type=float,default=DEFAULT_MIN_INTERVAL_SECONDS,
         help='Minimum master interval between the two STARTs (default 2400 s; bracket the long train)')
@@ -123,13 +124,19 @@ def main():
     if len(set(args.devices))!=3: ap.error('--devices must name three distinct timers')
     first=read_start_rows(args.first_health_csv);second=read_start_rows(args.second_health_csv)
     rows={}
-    for dev in args.devices:
-        if dev not in first or dev not in second: raise SystemExit(f'Missing START health for {dev}')
+    if set(first)!=set(second): raise SystemExit('Frozen participant sets differ between STARTs')
+    if not set(args.devices)<=set(first): raise SystemExit('Missing START health for analyzer devices')
+    for dev in sorted(first):
         rows[dev]=build_pair_row(first[dev],second[dev],min_interval_seconds=args.min_interval_seconds,
             same_boot_tolerance_ppm=100.0,accepted_edge_tolerance=2.0,warm_confirmed=True,
             max_rate_change_ppm=args.max_rate_change_ppm,fit_lag_seconds=args.fit_lag_seconds)
         if not rows[dev]['QualificationValid']:
+            if not rows[dev]['DiagnosticBuildOK']:
+                raise SystemExit(f"{dev}: diagnostic build guard failed: "
+                    f"{rows[dev]['FirstDiagnosticDescription']}; {rows[dev]['SecondDiagnosticDescription']}")
             reason=' (interval shorter than --min-interval-seconds)' if not rows[dev]['IntervalOK'] else ''
+            if not rows[dev]['BuildUnchangedOK']: reason+=' (firmware build ID missing/changed)'
+            if not rows[dev]['ControllerSessionOK']: reason+=' (controller session missing/changed)'
             raise SystemExit(f'{dev}: two-START validity guards failed{reason}')
     capture=load_capture(args.analyzer_log,prefer_qualified=True)
     if capture.dropped or capture.missing or capture.errors:

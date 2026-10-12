@@ -16,9 +16,10 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from diagnostic_flags import parse_flags
 
 EXPECTED_SAMPLE_RATE_HZ = 1_000_000.0 / 251.0
-CURRENT_STATUS_FIELD_COUNT = 44
+CURRENT_STATUS_FIELD_COUNT = 45
 SEVERE_EVENT_US = 300
 ZERO_EVENT_95_COUNT = -math.log(0.05)
 
@@ -43,6 +44,8 @@ class DeviceSummary:
     legacy_status_rows: int = 0
     sample_rate_warn_rows: int = 0
     canary_contamination_rows: int = 0
+    diagnostic_build_rows: int = 0
+    diagnostic_flags_unavailable_rows: int = 0
     build_id_warn_rows: int = 0
     monitor_elapsed_us: int = 0
     clean_monitor_elapsed_us: int = 0
@@ -125,6 +128,18 @@ def main() -> int:
                 legacy = field_count < CURRENT_STATUS_FIELD_COUNT
                 if legacy: out.legacy_status_rows += 1
 
+                try:
+                    diagnostic_flags = parse_flags(row.get("DiagnosticFlags"))
+                except ValueError:
+                    diagnostic_flags = None
+                diagnostic_clean = diagnostic_flags == 0
+                if diagnostic_flags is None: out.diagnostic_flags_unavailable_rows += 1
+                elif diagnostic_flags != 0: out.diagnostic_build_rows += 1
+                canary = (diagnostic_flags is not None and (diagnostic_flags & 0x03) != 0) or \
+                    (row.get("Cpu0MonitorWorstTask") or "").strip() == "lat_canary"
+                if canary: out.canary_contamination_rows += 1
+
+
                 valid = as_bool(row, "Cpu0MonitorValid")
                 if valid is not True:
                     out.invalid_monitor_rows += 1
@@ -168,9 +183,7 @@ def main() -> int:
                 events = as_int(row, "Cpu0MonitorEventCount")
                 worst = as_int(row, "Cpu0MonitorWorstUs")
                 task = (row.get("Cpu0MonitorWorstTask") or "NONE").strip() or "NONE"
-                canary = task == "lat_canary"
-                if canary: out.canary_contamination_rows += 1
-                else:
+                if not canary and diagnostic_clean:
                     out.monitor_events += events
 
                 if worst > out.worst_monitor_us:
@@ -180,7 +193,7 @@ def main() -> int:
                 out.worst_commit_us = max(out.worst_commit_us, commit_worst)
                 commit_ge300 = as_int(row, "CommitGe300Us")
                 out.commit_ge300_events += commit_ge300
-                if not canary and (commit_ge300 > 0 or commit_worst >= SEVERE_EVENT_US):
+                if not canary and diagnostic_clean and (commit_ge300 > 0 or commit_worst >= SEVERE_EVENT_US):
                     out.severe_ge300_observed = True
                 if as_bool(row, "Cpu0CommitOverlap") is True: out.overlap_runs += 1
 
@@ -190,7 +203,7 @@ def main() -> int:
                 else: out.build_id_warn_rows += 1
 
                 row_clean = (
-                    not legacy and not canary and not rate_warn and missed == 0 and level_ok and
+                    diagnostic_clean and not legacy and not canary and not rate_warn and missed == 0 and level_ok and
                     wrong == 0 and build_ok
                 )
                 if row_clean:
@@ -202,7 +215,7 @@ def main() -> int:
         "WORST_MON_US,WORST_TASK,GE300_OBSERVED,ZERO_GE300_95_UPPER_PER_HOUR,"
         "ZERO_GE300_95_LOWER_MEAN_HOURS,COMMIT_LATE,WORST_COMMIT_US,OVERLAP_RUNS,"
         "WRONG_CORE,OVERFLOW,INVALID,LEVEL_MISMATCH,LEGACY_STATUS,SAMPLE_RATE_WARN,"
-        "LAT_CANARY_ROWS,MISSED_PERIOD_ROWS,BUILD_ID_WARN,BUILD_IDS")
+        "LAT_CANARY_ROWS,MISSED_PERIOD_ROWS,BUILD_ID_WARN,BUILD_IDS,DIAGNOSTIC_BUILD_ROWS,DIAGNOSTIC_FLAGS_UNAVAILABLE_ROWS")
     print(header)
 
     totals = DeviceSummary()
@@ -214,6 +227,7 @@ def main() -> int:
             'commit_late_events','overlap_runs','wrong_core_callbacks','overflows',
             'invalid_monitor_rows','level_mismatch_rows','legacy_status_rows',
             'sample_rate_warn_rows','canary_contamination_rows','build_id_warn_rows',
+            'diagnostic_build_rows','diagnostic_flags_unavailable_rows',
             'monitor_elapsed_us','clean_monitor_elapsed_us','expected_periods','commit_ge300_events'):
             setattr(totals, name, getattr(totals, name) + getattr(s, name))
         fleet_severe |= s.severe_ge300_observed
@@ -231,11 +245,13 @@ def main() -> int:
             f"{s.worst_commit_us},{s.overlap_runs},{s.wrong_core_callbacks},{s.overflows},"
             f"{s.invalid_monitor_rows},{s.level_mismatch_rows},{s.legacy_status_rows},"
             f"{s.sample_rate_warn_rows},{s.canary_contamination_rows},{s.missed_period_rows},{s.build_id_warn_rows},"
-            f"{'|'.join(sorted(s.build_ids)) if s.build_ids else 'NONE'}")
+            f"{'|'.join(sorted(s.build_ids)) if s.build_ids else 'NONE'},"
+            f"{s.diagnostic_build_rows},{s.diagnostic_flags_unavailable_rows}")
 
     clean_hours = totals.clean_monitor_elapsed_us / 3_600_000_000.0
     fleet_upper, fleet_mean = zero_event_bound(clean_hours, not fleet_severe)
     telemetry_clean = (
+        totals.diagnostic_build_rows == 0 and totals.diagnostic_flags_unavailable_rows == 0 and
         totals.legacy_status_rows == 0 and totals.sample_rate_warn_rows == 0 and
         totals.canary_contamination_rows == 0 and totals.missed_period_rows == 0 and totals.invalid_monitor_rows == 0 and
         totals.level_mismatch_rows == 0 and totals.wrong_core_callbacks == 0 and
@@ -243,7 +259,8 @@ def main() -> int:
     )
     watch = by_device.get(args.watch_device)
     watch_hours = watch.clean_monitor_elapsed_us / 3_600_000_000.0 if watch else 0.0
-    watch_clean = bool(watch) and not watch.severe_ge300_observed and watch.canary_contamination_rows == 0
+    watch_clean = bool(watch) and not watch.severe_ge300_observed and watch.canary_contamination_rows == 0 and \
+        watch.diagnostic_build_rows == 0 and watch.diagnostic_flags_unavailable_rows == 0
     closure_pass = (
         telemetry_clean and not fleet_severe and clean_hours >= args.closure_fleet_hours and
         watch_clean and watch_hours >= args.watch_device_min_hours
@@ -268,6 +285,9 @@ def main() -> int:
     print(f"FLEET_LEGACY_STATUS_ROWS={totals.legacy_status_rows}")
     print(f"FLEET_SAMPLE_RATE_WARN_ROWS={totals.sample_rate_warn_rows}")
     print(f"FLEET_LAT_CANARY_ROWS={totals.canary_contamination_rows}")
+    print(f"FLEET_DIAGNOSTIC_BUILD_ROWS={totals.diagnostic_build_rows}")
+    print(f"FLEET_DIAGNOSTIC_FLAGS_UNAVAILABLE_ROWS={totals.diagnostic_flags_unavailable_rows}")
+    print(f"FLEET_DIAGNOSTIC_BUILD_GUARD={'PASS' if totals.diagnostic_build_rows == 0 and totals.diagnostic_flags_unavailable_rows == 0 else 'FAIL'}")
     print(f"FLEET_MISSED_PERIOD_ROWS={totals.missed_period_rows}")
     print(f"FLEET_BUILD_ID_WARN_ROWS={totals.build_id_warn_rows}")
     print(f"FLEET_INVALID_MONITOR_ROWS={totals.invalid_monitor_rows}")

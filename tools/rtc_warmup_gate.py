@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
-"""Objective START #1 readiness gate for DS3231 qualification.
+"""Inspect serial RTC warm-up history; controller STATUS gates the frozen fleet.
 
-The gate is intentionally stricter than the later two-START validity guard.  Its
-job is to predict that the existing |START2 rate - START1 rate| <= 0.25 ppm guard
-will still hold after a roughly 40 minute qualification cycle.
-
-Default readiness requirements over the latest 10 minute monotonic-boot window:
-  * RTC state LOCKED for every retained sample;
-  * 129-point fit available throughout the retained window;
-  * fit RMS <= 3 us, zero fit outliers, zero inferred-missing edges,
-    zero holdover entries, zero SQW queue drops, valid temperature, SQW core 1;
-  * |OLS rate trend| <= 0.005 ppm/min;
-  * |last rate - first rate| <= 0.05 ppm;
-  * DS3231 package-temperature range <= 0.25 C (one register LSB);
-  * at least 95% of the requested window covered and at least 30 samples.
-
-The input is one or more ESP-IDF serial-monitor text logs containing RTC_QUAL
-records.  Multiple files may be supplied; the latest monotonic local-time segment
-for each device is used so an older boot cannot make a restarted device look warm.
+The serial check uses full 129-point fits, a >=600 s continuous history,
+<=0.25 ppm endpoint movement and three latest RMS readings <=1 us. Trend and
+package-temperature span are informational. RTC_QUAL has no DiagnosticFlags or
+controller-session evidence, so this tool cannot authorize qualification START.
 """
 from __future__ import annotations
 
@@ -80,7 +67,7 @@ def latest_monotonic_segment(rows: list[Sample]) -> list[Sample]:
     start = 0
     previous = rows[0].local_us
     for index, row in enumerate(rows[1:], start=1):
-        if row.local_us < previous:
+        if row.local_us < previous or row.accepted < rows[index - 1].accepted:
             start = index
         previous = row.local_us
     return rows[start:]
@@ -112,172 +99,91 @@ def parse_logs(paths: list[Path]) -> dict[str, list[Sample]]:
     return {device: latest_monotonic_segment(rows) for device, rows in data.items()}
 
 
+def inspect_history(rows, *, window_seconds=600.0, rate_limit=0.25, rms_limit=1.0,
+                    fit_points=129, min_samples=3):
+    # A lock/full-fit loss, SQW fault, reboot or >=48 s gap starts a new segment.
+    segment = []
+    previous = None
+    for row in rows:
+        if previous is not None and (
+            row.local_us < previous.local_us or row.local_us - previous.local_us >= 48_000_000
+            or row.accepted < previous.accepted
+            or row.inferred_missing != previous.inferred_missing
+            or row.holdover_entries != previous.holdover_entries):
+            segment.clear()
+        if row.state != 'LOCKED' or row.points != fit_points:
+            segment.clear()
+        else:
+            segment.append(row)
+        previous = row
+    latest = rows[-1]
+    cutoff = latest.local_us - int(window_seconds * 1_000_000)
+    anchors = [r for r in segment if r.local_us <= cutoff]
+    anchor = anchors[-1] if anchors else None
+    window = [r for r in segment if anchor is None or r.local_us >= anchor.local_us]
+    span = (latest.local_us - segment[0].local_us) / 1e6 if segment else 0.0
+    delta = latest.rate_ppm - anchor.rate_ppm if anchor is not None else math.nan
+    reasons = []
+    if latest.state != 'LOCKED': reasons.append('NOT_LOCKED')
+    if latest.points != fit_points: reasons.append('FIT_NOT_FULL')
+    if anchor is None or len(window) < min_samples: reasons.append('HISTORY_PENDING')
+    if not math.isfinite(delta) or abs(delta) > rate_limit + 1e-12:
+        reasons.append(f'10-min dRate {delta:+.6f} ppm requires <= ±{rate_limit:.6f}')
+    # Past RMS excursions keep the history; three consecutive good readings recover.
+    if len(segment) < 3 or any(not math.isfinite(r.rms_us) or not 0 <= r.rms_us <= rms_limit
+                                for r in segment[-3:]):
+        reasons.append('FIT_UNSTABLE/FIT_POLLS_PENDING')
+    if latest.queue_drops != 0: reasons.append('RTC_QUEUE_DROPS')
+    if not latest.temp_valid: reasons.append('TEMPERATURE_UNAVAILABLE')
+    if latest.sqw_core != 1: reasons.append('SQW_CORE')
+    return dict(ready=not reasons, reasons=reasons, window=window, history_seconds=span,
+                rate_delta=delta, trend=fit_slope_ppm_per_min([(r.local_us, r.rate_ppm) for r in window]))
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="Gate DS3231 qualification START #1 on 10-minute rate and temperature stability."
-    )
-    ap.add_argument("logs", nargs="+", type=Path)
-    ap.add_argument("--window-seconds", type=float, default=600.0)
-    ap.add_argument("--max-rate-trend-ppm-per-min", type=float, default=0.005)
-    ap.add_argument("--max-endpoint-rate-change-ppm", type=float, default=0.05)
-    ap.add_argument("--max-temperature-span-c", type=float, default=0.25)
-    ap.add_argument("--min-window-coverage", type=float, default=0.95)
-    ap.add_argument("--min-samples", type=int, default=30)
-    ap.add_argument("--required-fit-points", type=int, default=129)
-    ap.add_argument("--max-fit-rms-us", type=float, default=3.0)
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('logs', nargs='+', type=Path)
+    ap.add_argument('--window-seconds', type=float, default=600.0)
+    ap.add_argument('--max-endpoint-rate-change-ppm', type=float, default=0.25)
+    ap.add_argument('--required-fit-points', type=int, default=129)
+    ap.add_argument('--max-fit-rms-us', type=float, default=1.0)
+    ap.add_argument('--min-samples', type=int, default=3)
+    # Compatibility options describe telemetry; neither overrides the controller gate.
+    ap.add_argument('--max-rate-trend-ppm-per-min', type=float, default=0.005,
+                    help='Informational trend band only; does not gate readiness')
+    ap.add_argument('--max-temperature-span-c', type=float, default=0.25,
+                    help='Informational temperature span only; does not gate readiness')
+    ap.add_argument('--min-window-coverage', type=float, default=1.0,
+                    help='Compatibility option: full requested window is always required')
     args = ap.parse_args()
-
-    if args.window_seconds <= 0:
-        ap.error("--window-seconds must be > 0")
-    if args.max_rate_trend_ppm_per_min <= 0:
-        ap.error("--max-rate-trend-ppm-per-min must be > 0")
-    if args.max_endpoint_rate_change_ppm <= 0:
-        ap.error("--max-endpoint-rate-change-ppm must be > 0")
-    if args.max_temperature_span_c < 0:
-        ap.error("--max-temperature-span-c must be >= 0")
-    if not (0 < args.min_window_coverage <= 1):
-        ap.error("--min-window-coverage must be in (0, 1]")
-    if args.min_samples < 2:
-        ap.error("--min-samples must be >= 2")
-    if args.required_fit_points < 1:
-        ap.error("--required-fit-points must be >= 1")
-    if args.max_fit_rms_us <= 0:
-        ap.error("--max-fit-rms-us must be > 0")
-
+    for key in ('window_seconds', 'max_endpoint_rate_change_ppm', 'max_fit_rms_us',
+                'max_rate_trend_ppm_per_min'):
+        if not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0:
+            ap.error(f'{key} must be finite and > 0')
+    if not math.isfinite(args.max_temperature_span_c) or args.max_temperature_span_c < 0:
+        ap.error('--max-temperature-span-c must be finite and >= 0')
+    if not 0 < args.min_window_coverage <= 1: ap.error('--min-window-coverage must be in (0,1]')
+    if args.required_fit_points < 1 or args.min_samples < 3:
+        ap.error('--required-fit-points must be positive and --min-samples >=3')
     data = parse_logs(args.logs)
-    if not data:
-        raise SystemExit("No RTC_QUAL records found")
-
+    if not data: raise SystemExit('No RTC_QUAL records found')
     all_ready = True
-    for device in sorted(data):
-        rows = data[device]
-        if not rows:
-            continue
-        latest_us = rows[-1].local_us
-        cutoff = latest_us - int(args.window_seconds * 1_000_000)
-        window = [r for r in rows if r.local_us >= cutoff]
-
-        points = [(r.local_us, r.rate_ppm) for r in window]
-        slope = fit_slope_ppm_per_min(points)
-        coverage_seconds = (
-            (window[-1].local_us - window[0].local_us) / 1_000_000.0
-            if len(window) >= 2
-            else 0.0
-        )
-        required_coverage_seconds = args.window_seconds * args.min_window_coverage
-        endpoint_rate_delta = (
-            window[-1].rate_ppm - window[0].rate_ppm if len(window) >= 2 else math.nan
-        )
-        rate_span = (
-            max(r.rate_ppm for r in window) - min(r.rate_ppm for r in window)
-            if window
-            else math.nan
-        )
-        temp_span = (
-            max(r.temp_c for r in window) - min(r.temp_c for r in window)
-            if window and all(r.temp_valid for r in window)
-            else math.nan
-        )
-
-        enough_samples = len(window) >= args.min_samples
-        enough_coverage = coverage_seconds >= required_coverage_seconds
-        locked = bool(window) and all(r.state == "LOCKED" for r in window)
-        fit_points_ok = bool(window) and all(r.points >= args.required_fit_points for r in window)
-        fit_rms_ok = bool(window) and all(
-            math.isfinite(r.rms_us) and r.rms_us <= args.max_fit_rms_us for r in window
-        )
-        fit_outliers_ok = bool(window) and all(r.fit_outliers == 0 for r in window)
-        missing_ok = bool(window) and all(r.inferred_missing == 0 for r in window)
-        holdover_ok = bool(window) and all(r.holdover_entries == 0 for r in window)
-        zero_drops = bool(window) and all(r.queue_drops == 0 for r in window)
-        temp_valid = bool(window) and all(r.temp_valid for r in window)
-        sqw_core_ok = bool(window) and all(r.sqw_core == 1 for r in window)
-        trend_ok = (
-            math.isfinite(slope)
-            and abs(slope) <= args.max_rate_trend_ppm_per_min
-        )
-        endpoint_rate_ok = (
-            math.isfinite(endpoint_rate_delta)
-            and abs(endpoint_rate_delta) <= args.max_endpoint_rate_change_ppm
-        )
-        temp_stable = (
-            math.isfinite(temp_span)
-            and temp_span <= args.max_temperature_span_c + 1e-12
-        )
-
-        ready = all(
-            (
-                enough_samples,
-                enough_coverage,
-                locked,
-                fit_points_ok,
-                fit_rms_ok,
-                fit_outliers_ok,
-                missing_ok,
-                holdover_ok,
-                zero_drops,
-                temp_valid,
-                sqw_core_ok,
-                trend_ok,
-                endpoint_rate_ok,
-                temp_stable,
-            )
-        )
-        all_ready &= ready
-
-        failures: list[str] = []
-        if not enough_samples:
-            failures.append(f"samples {len(window)}/{args.min_samples}")
-        if not enough_coverage:
-            failures.append(
-                f"coverage {coverage_seconds:.1f}/{required_coverage_seconds:.1f}s"
-            )
-        if not locked:
-            failures.append("RTC not continuously LOCKED")
-        if not fit_points_ok:
-            failures.append(f"fit points < {args.required_fit_points}")
-        if not fit_rms_ok:
-            failures.append(f"fit RMS > {args.max_fit_rms_us:.1f} us")
-        if not fit_outliers_ok:
-            failures.append("fit_outliers != 0")
-        if not missing_ok:
-            failures.append("inferred_missing != 0")
-        if not holdover_ok:
-            failures.append("holdover_entries != 0")
-        if not zero_drops:
-            failures.append("queue_drops != 0")
-        if not temp_valid:
-            failures.append("temperature invalid")
-        if not sqw_core_ok:
-            failures.append("SQW core != 1")
-        if not trend_ok:
-            failures.append(
-                f"rate trend {slope:+.6f} ppm/min exceeds ±{args.max_rate_trend_ppm_per_min:.6f}"
-            )
-        if not endpoint_rate_ok:
-            failures.append(
-                f"10-min dRate {endpoint_rate_delta:+.6f} ppm exceeds ±{args.max_endpoint_rate_change_ppm:.6f}"
-            )
-        if not temp_stable:
-            failures.append(
-                f"temperature span {temp_span:.2f} C exceeds {args.max_temperature_span_c:.2f} C"
-            )
-
-        print(
-            f"{device}: {'READY' if ready else 'WAIT'} "
-            f"samples={len(window)} coverage_s={coverage_seconds:.1f} "
-            f"trend={slope:+.6f}ppm/min "
-            f"dRate={endpoint_rate_delta:+.6f}ppm rate_span={rate_span:.6f}ppm "
-            f"temp_span={temp_span:.2f}C temp_now={window[-1].temp_c if window else math.nan:.2f}C "
-            f"points_min={min((r.points for r in window), default=0)} "
-            f"rms_max={max((r.rms_us for r in window), default=math.nan):.3f}us"
-        )
-        if failures:
-            print("  WAIT: " + "; ".join(failures))
-
-    print("QUALIFICATION_START1_GATE=" + ("READY" if all_ready else "WAIT"))
+    for device, rows in sorted(data.items()):
+        result = inspect_history(rows, window_seconds=args.window_seconds,
+            rate_limit=args.max_endpoint_rate_change_ppm, rms_limit=args.max_fit_rms_us,
+            fit_points=args.required_fit_points, min_samples=args.min_samples)
+        window = result['window']
+        temp_span = max((r.temp_c for r in window), default=math.nan) - min((r.temp_c for r in window), default=math.nan)
+        ready = result['ready']; all_ready &= ready
+        print(f"{device}: {'READY' if ready else 'WAIT'} history_s={result['history_seconds']:.1f} "
+              f"samples={len(window)} dRate={result['rate_delta']:+.6f}ppm "
+              f"RMS={rows[-1].rms_us:.3f}us points={rows[-1].points} "
+              f"trend_info={result['trend']:+.6f}ppm/min temp_span_info={temp_span:.2f}C")
+        if result['reasons']: print('  WAIT: ' + '; '.join(result['reasons']))
+    print('SERIAL_WARMUP_CHECK=' + ('READY' if all_ready else 'WAIT'))
+    print('QUALIFICATION_START1_GATE=USE_CONTROLLER_STATUS (all frozen devices, DiagnosticFlags and session evidence)')
     return 0 if all_ready else 2
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

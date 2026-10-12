@@ -1,3 +1,5 @@
+> Historical policy: superseded by [6.22.18 qualification policy](V6_22_18_QUALIFICATION_POLICY.md). Current warm-up is <=0.25 ppm/600 s using full fits; START2 local-crystal movement is informational only.
+
 # v6.22.7 — Analyzer-vs-qualification validation
 
 Use warm ESP01/ESP02 with Analyzer_v8 attached. Start a 30:00 countdown for START #1, keep Analyzer_v8 running through all 1801 COMMIT boundaries, and take START #2 immediately after the run.

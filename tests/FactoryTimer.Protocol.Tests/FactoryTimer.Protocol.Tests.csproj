@@ -13,5 +13,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\windows-controller\FactoryTimer.Protocol\FactoryTimer.Protocol.csproj" />
+    <None Update="fixtures\status_v62319_max_width.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

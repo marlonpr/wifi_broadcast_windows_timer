@@ -10,6 +10,13 @@ namespace FactoryTimer.Controller.Core.Tests;
 public sealed class StatusDiscoveryTests
 {
     [TestMethod]
+    public void PollingCadenceAndOfflineTimeoutPermitThreeSixteenSecondPolls()
+    {
+        Assert.AreEqual(TimeSpan.FromSeconds(16), StatusDiscoveryService.DiscoveryInterval);
+        Assert.AreEqual(TimeSpan.FromSeconds(48), DeviceStatusTracker.OfflineTimeout);
+    }
+
+    [TestMethod]
     public async Task DiscoveryBeginsImmediatelyWithoutButtonInteraction()
     {
         var transport = new RecordingStatusTransport();
@@ -105,7 +112,7 @@ public sealed class StatusDiscoveryTests
     }
 
     [TestMethod]
-    public void DeviceIsSearchingThenOnlineOnlyAfterStatusAndOfflineAfterSixSeconds()
+    public void DeviceIsSearchingThenOnlineOnlyAfterStatusAndOfflineAfterThreeMissedSixteenSecondPolls()
     {
         var tracker = new DeviceStatusTracker();
         DateTimeOffset started = new(2026, 9, 2, 12, 0, 0, TimeSpan.Zero);
@@ -114,17 +121,17 @@ public sealed class StatusDiscoveryTests
         Assert.AreEqual(DeviceAvailability.Searching, tracker.GetAvailability(started));
         Assert.AreEqual(
             DeviceAvailability.Offline,
-            tracker.GetAvailability(started + TimeSpan.FromSeconds(6)));
+            tracker.GetAvailability(started + TimeSpan.FromSeconds(48)));
 
         DateTimeOffset statusReceived = started + TimeSpan.FromSeconds(7);
         tracker.RecordValidStatus(statusReceived);
         Assert.AreEqual(DeviceAvailability.Online, tracker.GetAvailability(statusReceived));
         Assert.AreEqual(
             DeviceAvailability.Online,
-            tracker.GetAvailability(statusReceived + TimeSpan.FromMilliseconds(5999)));
+            tracker.GetAvailability(statusReceived + TimeSpan.FromMilliseconds(47999)));
         Assert.AreEqual(
             DeviceAvailability.Offline,
-            tracker.GetAvailability(statusReceived + TimeSpan.FromSeconds(6)));
+            tracker.GetAvailability(statusReceived + TimeSpan.FromSeconds(48)));
     }
 
     [TestMethod]

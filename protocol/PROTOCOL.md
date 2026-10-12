@@ -232,3 +232,44 @@ the controller health CSV. `FirmwareElfSha8` is the first eight hexadecimal
 characters reported by `esp_app_get_elf_sha256()` and ties every STATUS row to
 the exact flashed ELF. The controller remains backward-compatible with the
 42-field v6.23.11 form.
+
+
+## v6.23.19 diagnostic-build STATUS field
+
+The current STATUS has **45 fields**. The index-43 ELF SHA8 is followed by
+index 44, `DiagnosticFlagsHex`, exactly two hex digits without `0x`:
+
+```text
+...|Cpu0MonitorMissedPeriodsHex|FirmwareElfSha8|DiagnosticFlagsHex
+```
+
+| Bit | Value | Meaning |
+|---:|---:|---|
+| 0 | 01 | TASK_CANARY_ENABLED |
+| 1 | 02 | ISR_CANARY_ENABLED |
+| 2 | 04 | START_TASK_DELAY_TEST (nonzero configured delay) |
+| 3 | 08 | GPIO_PROBE / timing diagnostic |
+| 4 | 10 | MONITOR_OFF_A_B (classic ESP32 monitor disabled) |
+
+Bit 3 covers timing probe, timing mechanism injection, flash-guard tracing,
+post-run diagnostic timing dump, and a nonzero analyzer presentation offset.
+Observation-only COMMIT/refresh markers do not set it. Bits 5..7 are reserved;
+parsers accept them, and qualification rejects them along with every nonzero
+byte. No flags field in a legacy STATUS means unknown, never zero.
+
+Only in the 45-field layout, index 12 (`RtcQueueDrops`) changes from unsigned
+decimal to unsigned hex without a prefix. Other existing field positions are
+unchanged. Legacy 14/28/31/42/44-field queue drops stay decimal. The 44/45-field
+fit-outlier and continuity counters stay hex. The health CSV exports queue drops
+as decimal and DiagnosticFlags as `0xNN`.
+
+Appending the byte to the old maximum-width layout would need 513 bytes.
+Hex queue drops reduce its uint32 maximum from 10 to 8 characters, so the new
+maximum valid-width serialization is exactly **511 bytes**, including a full
+`FF` byte. Epoch fields 20/21 are nonnegative int64, as required by the parser;
+signed offsets/errors retain their full negative int64 widths. No fields are
+clamped for the size check. RUN_DIAG remains 21 fields / 243 maximum bytes.
+
+The controller requires DiagnosticFlags == 0 for every frozen participant in
+its initial qualification/preparation pass before synchronization and in its
+post-sync/pre-arm/final-barrier passes. Runtime `HealthFlags` remains independent.

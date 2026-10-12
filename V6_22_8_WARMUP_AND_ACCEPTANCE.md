@@ -1,3 +1,5 @@
+> Historical policy: superseded by [6.22.18 qualification policy](V6_22_18_QUALIFICATION_POLICY.md). Current warm-up is <=0.25 ppm/600 s using full fits; START2 local-crystal movement is informational only.
+
 # v6.22.8 — START #1 warm-up gate and module acceptance
 
 Controller synchronization/runtime behavior remains unchanged from v6.22.7. This

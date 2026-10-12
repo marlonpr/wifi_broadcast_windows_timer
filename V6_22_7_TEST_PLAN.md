@@ -1,3 +1,5 @@
+> Historical policy: superseded by [6.22.18 qualification policy](V6_22_18_QUALIFICATION_POLICY.md). Current warm-up is <=0.25 ppm/600 s using full fits; START2 local-crystal movement is informational only.
+
 # v6.22.7 / v6.23.4 qualification validation plan
 
 Firmware remains v6.23.4. Controller runtime synchronization remains v6.22.4 pooled med3; v6.22.7 changes only qualification tooling/version labeling.

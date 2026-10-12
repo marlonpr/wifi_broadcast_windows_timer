@@ -111,6 +111,11 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
     public long? ForwardTop3SpreadMicroseconds => forwardTop3SpreadMicroseconds;
     public bool SynchronizationDegraded => synchronizationDegraded;
     public ParticipantSessionSnapshot SessionSnapshot => sessionTracker.Snapshot;
+    public RtcWarmupHistory WarmupHistory { get; } = new();
+    public StartTimingDiagnostics StartDiagnostics { get; } = new();
+    private string warmupText = "WAIT  NO_STATUS";
+    public string WarmupText { get => warmupText; private set => SetProperty(ref warmupText, value); }
+    public void RefreshWarmup(long now) => WarmupText = WarmupHistory.Evaluate(now).Display(DeviceId);
 
 
     private static string BuildDisplayName(string deviceId)
@@ -150,7 +155,8 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
             session.RtcFitRmsMicroseconds,
             session.RtcQueueDrops,
             session.RtcTemperatureValid,
-            synchronizationUncertaintyMicroseconds);
+            synchronizationUncertaintyMicroseconds,
+            session.DiagnosticFlags);
     }
 
     public bool TryGetIpAddress(out IPAddress? address) =>
@@ -188,6 +194,7 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
 
     public void ClearStartMeasurement()
     {
+        StartDiagnostics.Clear();
         lastStartErrorMicroseconds = null;
         lastSchedulerLatenessMicroseconds = null;
         lastActualStartMasterMicroseconds = null;
@@ -201,6 +208,8 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         IpAddress = endpoint.Address.ToString();
         LastCommandId = FactoryProtocol.FormatCommandId(started.CommandId);
 
+        // Retain the raw projection for controlled benchmark/manual experiments.
+        // Production UI uses StartDiagnostics and the board-reported STATUS metrics.
         // The firmware's EstimatedMasterStart uses the same applied offset that
         // scheduled START_AT. Under an asymmetric SYNC experiment that can look
         // perfectly self-consistent even when the physical start is biased. Use
@@ -216,14 +225,20 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         lastActualStartMasterMicroseconds = estimatedActualMasterStart;
         lastStartedCommandId = started.CommandId;
         ActualStartMasterTime = $"{estimatedActualMasterStart:N0} µs";
-        StartTimingError = FormatSignedMilliseconds(lastStartErrorMicroseconds.Value);
+        StartDiagnostics.Observe(started, verificationOffsetMicroseconds);
+        StartTimingError = StartDiagnostics.Display(started.CommandId);
     }
 
-    public void Apply(StatusPacket status, IPEndPoint endpoint)
+    public void Apply(StatusPacket status, IPEndPoint endpoint, long? masterReceiveMicroseconds = null)
     {
+        StartDiagnostics.Observe(status);
+        if (status.State is TimerState.Running or TimerState.Finished)
+            StartTimingError = StartDiagnostics.Display(status.CommandId);
         DateTimeOffset now = DateTimeOffset.UtcNow;
         statusTracker.RecordValidStatus(now);
         sessionTracker.ObserveStatus(status, endpoint.Address, now);
+        WarmupHistory.Observe(status, sessionTracker.Snapshot.Generation, masterReceiveMicroseconds ?? MasterClock.NowMicroseconds);
+        RefreshWarmup(MasterClock.NowMicroseconds);
         IpAddress = endpoint.Address.ToString();
         LastCommandId = FactoryProtocol.FormatCommandId(status.CommandId);
         uint remainingMinutes = status.RemainingSeconds / 60u;
@@ -364,7 +379,7 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
             : "QUALITY RETRY";
         SynchronizationQuality = accepted
             ? (degraded
-                ? $"DEGRADED {attempt}/{maxAttempts}; uncertainty ±{synchronizationUncertaintyMicroseconds} µs"
+                ? $"DEGRADED {attempt}/{maxAttempts}; estimated uncertainty ±{synchronizationUncertaintyMicroseconds} µs"
                 : $"PASS {attempt}/{maxAttempts}; deviation {FormatSignedMilliseconds(qualityDeviationMicroseconds)}")
             : $"RETRY {attempt}/{maxAttempts}; deviation {FormatSignedMilliseconds(qualityDeviationMicroseconds)}";
         ClockError = FormatSignedMilliseconds(residualMicroseconds);
@@ -454,6 +469,7 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
 
     public void BeginSearching()
     {
+        WarmupHistory.Reset();
         sessionTracker.InvalidateControllerSession();
         DateTimeOffset now = DateTimeOffset.UtcNow;
         statusTracker.BeginSearching(now);
@@ -462,6 +478,7 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
 
     public void MarkOffline()
     {
+        WarmupHistory.Reset();
         sessionTracker.InvalidateControllerSession();
         statusTracker.MarkOffline();
         OnlineText = "OFFLINE";

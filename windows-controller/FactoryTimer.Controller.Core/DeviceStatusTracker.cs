@@ -9,7 +9,7 @@ public enum DeviceAvailability
 
 public sealed class DeviceStatusTracker
 {
-    public static readonly TimeSpan OfflineTimeout = TimeSpan.FromSeconds(6);
+    public static readonly TimeSpan OfflineTimeout = TimeSpan.FromSeconds(48);
 
     private DateTimeOffset searchStartedAt;
     private DateTimeOffset lastStatusAt;

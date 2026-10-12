@@ -43,9 +43,16 @@ public sealed class SystemStatusDiscoveryDelay : IStatusDiscoveryDelay
         Task.Delay(interval, cancellationToken);
 }
 
+public sealed class StatusPollEventArgs(ControllerNetworkInterface networkInterface, long sequence, long masterMicroseconds) : EventArgs
+{
+    public ControllerNetworkInterface NetworkInterface { get; } = networkInterface;
+    public long Sequence { get; } = sequence;
+    public long MasterMicroseconds { get; } = masterMicroseconds;
+}
+
 public sealed class StatusDiscoveryService : IDisposable
 {
-    public static readonly TimeSpan DiscoveryInterval = TimeSpan.FromSeconds(2);
+    public static readonly TimeSpan DiscoveryInterval = TimeSpan.FromSeconds(16);
 
     private readonly object gate = new();
     private readonly IStatusRequestTransport transport;
@@ -54,6 +61,7 @@ public sealed class StatusDiscoveryService : IDisposable
     private CancellationTokenSource? cancellation;
     private Task completion = Task.CompletedTask;
     private long generation;
+    private long pollSequence;
     private bool disposed;
 
     public StatusDiscoveryService(
@@ -67,6 +75,7 @@ public sealed class StatusDiscoveryService : IDisposable
     }
 
     public event EventHandler<string>? DiscoveryError;
+    public event EventHandler<StatusPollEventArgs>? PollStarted;
 
     public bool IsRunning
     {
@@ -180,6 +189,7 @@ public sealed class StatusDiscoveryService : IDisposable
 
                 if (unicastTargets.Length != 0)
                 {
+                    PollStarted?.Invoke(this, new(selectedInterface, Interlocked.Increment(ref pollSequence), MasterClock.NowMicroseconds));
                     foreach (IPAddress target in unicastTargets)
                     {
                         ulong commandId = commandIdGenerator.NextCommandId();
@@ -204,6 +214,7 @@ public sealed class StatusDiscoveryService : IDisposable
                     }
                     else
                     {
+                        PollStarted?.Invoke(this, new(selectedInterface, Interlocked.Increment(ref pollSequence), MasterClock.NowMicroseconds));
                         ulong commandId = commandIdGenerator.NextCommandId();
                         if (commandId == 0)
                         {

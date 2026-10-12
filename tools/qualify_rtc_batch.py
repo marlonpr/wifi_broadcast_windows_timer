@@ -14,18 +14,11 @@ The raw Master-minus-esp_timer offset is intentionally NOT used as the
 qualification rate because its slope measures the ESP32 crystal, not the RTC-
 disciplined countdown timebase.
 
-v6.22.8 validity guards reject a two-START interval when:
-  * the raw local epoch is inconsistent with the master interval (probable reboot),
-  * the RTC discipline entered HOLDOVER,
-  * inferred-missing SQW edges increased,
-  * accepted SQW edge count does not advance at approximately 1 Hz,
-  * either endpoint is not a healthy LOCKED RTC state,
-  * the fitted local-vs-RTC rate changes too much between the STARTs, or
-  * the operator has not confirmed that the fleet was thermally warm/stable.
-
-The rate-stability guard bounds fit-window lag.  The 128 s discipline fit is
-approximately centered 64 s in the past, so a rate change dr across an interval
-T can bias the two-START slope by roughly 64/T * dr ppm.
+Qualification rejects discontinuous board/controller sessions, changed builds,
+unhealthy full-fit endpoints, SQW counter faults, or missing warm-up evidence.
+The warm-up limit is frozen at 0.25 ppm per 600 s, with a 129-point fit and
+three normal polls with RMS <=1 us. START #2's local-crystal rate movement and
+the approximate 64 s fit-lag bias are informational, never acceptance gates.
 """
 from __future__ import annotations
 
@@ -35,6 +28,7 @@ import math
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
+from diagnostic_flags import parse_flags, describe_flags
 
 
 @dataclass(frozen=True)
@@ -59,6 +53,17 @@ class StartHealth:
     temperature_c: float | None
     sqw_core: int | None
     health_flags: int | None
+    diagnostic_flags: int | None = None
+    firmware_build_id: str | None = None
+    controller_session_id: str | None = None
+    warmup_max_rate_change_ppm: float | None = None
+    warmup_required_fit_points: int | None = None
+    qualification_phase: str | None = None
+    warmup_first_command_id: str | None = None
+    warmup_history_seconds: float | None = None
+    warmup_rate_change_ppm: float | None = None
+    warmup_good_fit_polls: int | None = None
+    warmup_ready: bool | None = None
 
 
 def _optional_int(text: str | None) -> int | None:
@@ -118,9 +123,13 @@ def read_start_rows(path: Path) -> dict[str, StartHealth]:
         if row.get("Phase", "").upper() != "START":
             continue
         if row.get("StatusCaptured") != "1":
+            if "QualificationPhase" in row:
+                raise ValueError(f"{path}: frozen participant {row.get('DeviceId', '?')} has no captured START STATUS")
             continue
         device = row.get("DeviceId", "").strip()
         if not device:
+            if "QualificationPhase" in row:
+                raise ValueError(f"{path}: frozen participant DeviceId is missing")
             continue
         if device in result:
             raise ValueError(f"{path}: duplicate captured START row for {device}")
@@ -155,20 +164,39 @@ def read_start_rows(path: Path) -> dict[str, StartHealth]:
             temperature_c=_optional_float(row.get("RtcTemperatureC")),
             sqw_core=_optional_int(row.get("RtcSqwCore")),
             health_flags=_optional_int(row.get("HealthFlags")),
+            diagnostic_flags=parse_flags(row.get("DiagnosticFlags")),
+            firmware_build_id=(row.get("FirmwareBuildId") or "").strip() or None,
+            controller_session_id=(row.get("ControllerSessionId") or "").strip() or None,
+            warmup_max_rate_change_ppm=_optional_float(row.get("WarmupMaxRateChangePpm")),
+            warmup_required_fit_points=_optional_int(row.get("WarmupRequiredFitPoints")),
+            qualification_phase=row.get("QualificationPhase"),
+            warmup_first_command_id=row.get("WarmupFirstCommandId"),
+            warmup_history_seconds=_optional_float(row.get("WarmupHistorySeconds")),
+            warmup_rate_change_ppm=_optional_float(row.get("WarmupRateChangePpm")),
+            warmup_good_fit_polls=_optional_int(row.get("WarmupGoodFitPolls")),
+            warmup_ready=_optional_bool(row.get("WarmupReady")),
         )
 
     if not result:
         raise ValueError(f"{path}: no captured START health rows")
+    modern = [row for row in result.values() if row.qualification_phase is not None]
+    if modern:
+        session = modern[0].controller_session_id
+        for row in modern[1:]:
+            if row.controller_session_id != session:
+                raise ValueError(f"{path}: {row.device} has an inconsistent controller session within the frozen fleet")
     return result
 
 
 def endpoint_health_ok(row: StartHealth) -> bool:
     return (
-        row.rtc_state == "LOCKED"
+        row.diagnostic_flags == 0
+        and row.rtc_state == "LOCKED"
         and row.rtc_fit_points is not None
-        and row.rtc_fit_points >= 64
+        and row.rtc_fit_points == 129
         and row.rtc_fit_rms_us is not None
-        and row.rtc_fit_rms_us <= 3.0
+        and 0 <= row.rtc_fit_rms_us <= (1.0 if row.qualification_phase is not None else 3.0)
+        and bool(row.firmware_build_id)
         and row.queue_drops == 0
         and row.temperature_valid is True
         and row.sqw_core == 1
@@ -178,6 +206,25 @@ def endpoint_health_ok(row: StartHealth) -> bool:
         and row.inferred_missing_edges is not None
         and row.holdover_entries is not None
     )
+
+
+def controller_warmup_proof_ok(a: StartHealth, b: StartHealth) -> bool:
+    """The modern controller gate cannot be bypassed by --warm-confirmed."""
+    if a.qualification_phase != "FIRST" or b.qualification_phase != "SECOND":
+        return False
+    try:
+        first_id = int(a.command_id, 16)
+        proof_matches = all(int(row.warmup_first_command_id or "", 16) == first_id for row in (a, b))
+    except ValueError:
+        return False
+    return proof_matches and all(
+        row.warmup_ready is True
+        and row.warmup_history_seconds is not None and row.warmup_history_seconds >= 600
+        and row.warmup_rate_change_ppm is not None and abs(row.warmup_rate_change_ppm) <= 0.25 + 1e-12
+        and row.warmup_good_fit_polls is not None and row.warmup_good_fit_polls >= 3
+        and row.warmup_max_rate_change_ppm == 0.25
+        and row.warmup_required_fit_points == 129
+        for row in (a, b))
 
 
 def build_pair_row(
@@ -191,6 +238,8 @@ def build_pair_row(
     max_rate_change_ppm: float = 0.25,
     fit_lag_seconds: float = 64.0,
 ) -> dict[str, object]:
+    modern_warmup = a.qualification_phase is not None or b.qualification_phase is not None
+    warmup_ok = controller_warmup_proof_ok(a, b) if modern_warmup else warm_confirmed
     master_dt_us = b.master_epoch_us - a.master_epoch_us
     local_dt_us = b.local_epoch_us - a.local_epoch_us
     captured_dt_us = b.captured_master_us - a.captured_master_us
@@ -241,7 +290,11 @@ def build_pair_row(
 
     first_health_ok = endpoint_health_ok(a)
     second_health_ok = endpoint_health_ok(b)
-    continuity_ok = accepted_count_ok and no_inferred_missing_ok and no_holdover_ok
+    no_queue_drops_ok = a.queue_drops == b.queue_drops == 0
+    build_unchanged_ok = bool(a.firmware_build_id) and a.firmware_build_id == b.firmware_build_id
+    controller_session_ok = (bool(a.controller_session_id) and a.controller_session_id == b.controller_session_id) if modern_warmup else True
+    continuity_ok = (accepted_count_ok and no_inferred_missing_ok and no_holdover_ok
+                     and no_queue_drops_ok and build_unchanged_ok and controller_session_ok)
 
     rate_delta_ppm = math.nan
     rate_stability_ok = False
@@ -274,8 +327,7 @@ def build_pair_row(
         and first_health_ok
         and second_health_ok
         and continuity_ok
-        and rate_stability_ok
-        and warm_confirmed
+        and warmup_ok
     )
 
     return {
@@ -311,13 +363,28 @@ def build_pair_row(
         "DeltaMasterMinusDisciplinedUs": dq_us,
         "MasterMinusDisciplinedSlopePpm": q_slope_ppm,
         "DisciplinedMinusMasterPpm": device_vs_master_ppm,
+        "FirstDiagnosticFlags": a.diagnostic_flags,
+        "SecondDiagnosticFlags": b.diagnostic_flags,
+        "FirstDiagnosticDescription": describe_flags(a.diagnostic_flags),
+        "SecondDiagnosticDescription": describe_flags(b.diagnostic_flags),
+        "DiagnosticBuildOK": a.diagnostic_flags == 0 and b.diagnostic_flags == 0,
         "FirstHealthOK": first_health_ok,
         "SecondHealthOK": second_health_ok,
-        "WarmConfirmed": warm_confirmed,
+        "WarmConfirmed": warmup_ok,
+        "ControllerWarmupProof": controller_warmup_proof_ok(a, b),
+        "ControllerWarmupRequired": modern_warmup,
         "ContinuityOK": continuity_ok,
-        "RateStabilityOK": rate_stability_ok,
+        "FirstFirmwareBuildId": a.firmware_build_id,
+        "SecondFirmwareBuildId": b.firmware_build_id,
+        "BuildUnchangedOK": build_unchanged_ok,
+        "FirstControllerSessionId": a.controller_session_id,
+        "SecondControllerSessionId": b.controller_session_id,
+        "ControllerSessionOK": controller_session_ok,
+        "NoQueueDropsOK": no_queue_drops_ok,
+        "RateChangeWithinInformationalBand": rate_stability_ok,
+        "RateChangeInformationalOnly": True,
         "RtcRateDeltaPpm": rate_delta_ppm,
-        "MaxRateChangePpm": max_rate_change_ppm,
+        "InformationalRateChangeBandPpm": max_rate_change_ppm,
         "FitLagSeconds": fit_lag_seconds,
         "EstimatedFitLagPhaseBiasUs": estimated_fit_lag_phase_bias_us,
         "EstimatedFitLagSlopeBiasPpm": estimated_fit_lag_slope_bias_ppm,
@@ -360,13 +427,13 @@ def main() -> int:
     parser.add_argument(
         "--warm-confirmed",
         action="store_true",
-        help="Confirm both STARTs were taken after the devices were thermally warm/stable. Required for a valid qualification result.",
+        help="Confirm warm state for legacy health files. Modern files require the saved controller warm-up proof regardless of this flag.",
     )
     parser.add_argument(
         "--min-interval-seconds",
         type=float,
-        default=1200.0,
-        help="Minimum master interval for qualification (default: 1200 s; 1800 s recommended).",
+        default=2400.0,
+        help="Minimum master interval for qualification (default: 2400 s; bracket the >=40-minute train).",
     )
     parser.add_argument(
         "--same-boot-tolerance-ppm",
@@ -384,7 +451,7 @@ def main() -> int:
         "--max-rate-change-ppm",
         type=float,
         default=0.25,
-        help="Maximum |RtcRatePpmVsRtc(second)-RtcRatePpmVsRtc(first)| for the automatic warm/rate-stability guard (default: 0.25 ppm).",
+        help="Informational endpoint local-crystal rate band only; never changes qualification validity (default: 0.25 ppm).",
     )
     parser.add_argument(
         "--fit-lag-seconds",
@@ -489,7 +556,7 @@ def main() -> int:
             row["RateWarning"] = False
 
     print(
-        "Device   interval_s   D-master_ppm   delta_median   dRate_ppm   lagBias_ppm   boot   SQW   rate   endpoints   warm   validity   acceptance"
+        "Device   interval_s   D-master_ppm   delta_median   dRate_ppm   lagBias_ppm   boot   continuity   rate_info   endpoints   warm   validity   acceptance"
     )
     for row in calculations:
         dmaster = float(row["DisciplinedMinusMasterPpm"])
@@ -506,13 +573,16 @@ def main() -> int:
             f"{float(row['RtcRateDeltaPpm']):>+9.4f}   "
             f"{float(row['EstimatedFitLagSlopeBiasPpm']):>+11.6f}   "
             f"{'OK' if row['SameBootOK'] else 'BAD':<4}   "
-            f"{'OK' if row['ContinuityOK'] else 'BAD':<3}   "
-            f"{'OK' if row['RateStabilityOK'] else 'BAD':<4}   "
+            f"{'OK' if row['ContinuityOK'] else 'BAD':<10}   "
+            f"{'INFO':<9}   "
             f"{endpoint_text:<9}   "
             f"{'YES' if row['WarmConfirmed'] else 'NO':<4}   {validity:<8}   {acceptance}"
         )
         if not row["QualificationValid"]:
             reasons=[]
+            if not row["DiagnosticBuildOK"]:
+                reasons.append("diagnostic build guard failed: " +
+                    str(row["FirstDiagnosticDescription"]) + "; " + str(row["SecondDiagnosticDescription"]))
             if not row["IntervalOK"]: reasons.append("interval too short")
             if not row["SameBootOK"]: reasons.append(
                 f"same-boot mismatch {float(row['LocalVsMasterIntervalMismatchPpm']):+.1f} ppm"
@@ -526,19 +596,13 @@ def main() -> int:
             if not row["NoHoldoverOK"]: reasons.append(
                 f"holdover-entry delta {row['HoldoverEntriesDelta']}"
             )
-            if not row["RateStabilityOK"]:
-                if math.isfinite(float(row["RtcRateDeltaPpm"])):
-                    reasons.append(
-                        f"rate changed {float(row['RtcRateDeltaPpm']):+.3f} ppm "
-                        f"(limit {float(row['MaxRateChangePpm']):.3f} ppm; "
-                        f"estimated lag bias {float(row['EstimatedFitLagSlopeBiasPpm']):+.4f} ppm)"
-                    )
-                else:
-                    reasons.append("RTC rate telemetry missing")
+            if not row["NoQueueDropsOK"]: reasons.append("queue drops nonzero/increased")
+            if not row["BuildUnchangedOK"]: reasons.append("firmware build ID missing/changed")
+            if not row["ControllerSessionOK"]: reasons.append("controller session missing/changed; keep controller running between STARTs")
             if not row["FirstHealthOK"] or not row["SecondHealthOK"]:
                 reasons.append("endpoint health/LOCKED guard failed")
             if not row["WarmConfirmed"]:
-                reasons.append("warm state not confirmed")
+                reasons.append("controller warm-up proof invalid/missing" if row["ControllerWarmupRequired"] else "warm state not confirmed")
             print("  INVALID: " + "; ".join(reasons))
 
     if math.isfinite(median_rate):
@@ -546,7 +610,8 @@ def main() -> int:
     else:
         print("BATCH_MEDIAN_DISCIPLINED_MINUS_MASTER_PPM=UNAVAILABLE")
     print(
-        "NOTE: qualification validity and module acceptance are separate. "
+        "NOTE: START #2 local-crystal rate movement and lag-bias estimates are informational only. "
+        "Qualification validity and module acceptance are separate. "
         "Absolute D-master ppm includes controller/master clock rate; DeltaFromBatchMedianPpm removes that common-mode term, "
         "and only valid pairs contribute to the median. Default module disposition is ACCEPT within ±1 ppm, INSPECT from >1 to ±2 ppm, REJECT beyond ±2 ppm."
     )

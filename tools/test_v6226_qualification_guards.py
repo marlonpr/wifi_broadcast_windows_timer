@@ -16,7 +16,7 @@ def row(dev, master, local, q, captured, accepted, missing=0, hold=0, state='LOC
         rtc_state=state, rtc_rate_ppm_vs_rtc=0.0, rtc_fit_points=129,
         rtc_fit_rms_us=0.5, fit_outliers=0, accepted_edges=accepted,
         inferred_missing_edges=missing, holdover_entries=hold, queue_drops=0,
-        temperature_valid=True, temperature_c=25.0, sqw_core=1, health_flags=1)
+        temperature_valid=True, temperature_c=25.0, sqw_core=1, health_flags=1, diagnostic_flags=0, firmware_build_id="production-build")
 
 DT=1_800_000_000
 # +5 ppm disciplined-vs-master => Q decreases 9000 us.
