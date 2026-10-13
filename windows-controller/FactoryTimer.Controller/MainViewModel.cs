@@ -8,7 +8,7 @@ using Microsoft.UI.Dispatching;
 
 namespace FactoryTimer.Controller;
 
-internal sealed class MainViewModel : ObservableObject, IDisposable
+internal sealed partial class MainViewModel : ObservableObject, IDisposable
 {
     private const int StartLeadTimeMilliseconds = 2000; // benchmark only
     private const long ProductionStartLeadMicroseconds = 5_000_000;
@@ -140,6 +140,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         statusDiscovery.DiscoveryError += StatusDiscovery_DiscoveryError;
         statusDiscovery.PollStarted += StatusDiscovery_PollStarted;
         networkSelectionManager.StateChanged += NetworkSelectionManager_StateChanged;
+        LoadProductionProgram();
     }
 
     public DeviceViewModel Esp01 { get; } = new("ESP01");
@@ -456,7 +457,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         uiTimer.Start();
     }
 
-    public Task SendStartAsync() => SendStartAtAsync(QualificationStartMode.Ordinary);
+    public Task SendStartAsync() => StartRepetitionProgramAsync();
 
     public Task SendQualificationFirstStartAsync() => SendStartAtAsync(QualificationStartMode.First);
 
@@ -494,7 +495,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
 
     public Task CancelManualStartAtTestAsync() => CancelManualStartAtTestInternalAsync();
 
-    public Task SendResetAsync() => SendResetInternalAsync();
+    public Task SendResetAsync() => productionProgram?.State.Active == true ? StopRepetitionProgramAsync() : SendResetInternalAsync();
 
     public Task SendBrightnessAsync() => SendBrightnessInternalAsync();
 
@@ -930,9 +931,11 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             initialResidualMicroseconds ?? residual);
     }
 
-    private static bool ForwardSyncNeedsRetry(ForwardSyncAttemptCandidate candidate) =>
+    private long ActiveForwardSpreadLimitUs => productionSegmentContext is null ? ForwardTop3SpreadRetryLimitMicroseconds : 1500;
+
+    private bool ForwardSyncNeedsRetry(ForwardSyncAttemptCandidate candidate) =>
         candidate.FinalConsensus.TopSampleSpreadMicroseconds >
-            ForwardTop3SpreadRetryLimitMicroseconds;
+            ActiveForwardSpreadLimitUs;
 
     private void RecordForwardSyncCandidate(
         DeviceViewModel device,
@@ -1161,7 +1164,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                         $"START: {device.DeviceId} pooled RETRY {attempt}/{MaxSynchronizationAttempts} — " +
                         $"pool={cal.Count + ver.Count} samples, pooled top3 spread=" +
                         $"{candidate.FinalConsensus.TopSampleSpreadMicroseconds} us " +
-                        $"(retry >{ForwardTop3SpreadRetryLimitMicroseconds}); " +
+                        $"(retry >{ActiveForwardSpreadLimitUs}); " +
                         $"pooled cal/verify delta={candidate.ResidualMicroseconds:+#;-#;0} us " +
                         $"(diagnostic/uncertainty only; reference " +
                         $"{ForwardCalibrationVerificationDeltaReferenceMicroseconds} us), " +
@@ -1296,12 +1299,13 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         DeviceViewModel? observedDevice = Devices.FirstOrDefault(device =>
             string.Equals(device.DeviceId, expectedDeviceId, StringComparison.Ordinal));
         observedDevice?.ObserveSyncLocalTimestamp(reply.LocalT3Microseconds);
+        RecordProgramSyncSample(expectedDeviceId, syncId, reply, sample);
         return new SyncMeasurement(
             syncId,
             sample,
             received.ActualMasterToDeviceArtificialDelayMicroseconds,
             reply.ActualArtificialReplyDelayMicroseconds,
-            reply.IngressLocalMicroseconds);
+            reply.IngressLocalMicroseconds, Bssid: reply.Bssid ?? "UNKNOWN");
     }
 
     private async Task RunBenchmarkInternalAsync()
@@ -2123,7 +2127,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 attemptAccepted,
                 attemptOutcome,
                 failureKind,
-                failureMessage));
+                failureMessage, measurement.Bssid));
         }
     }
 
@@ -2933,8 +2937,13 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             }));
     }
 
-    private async Task SendStartAtAsync(QualificationStartMode qualificationMode)
+    private async Task SendStartAtAsync(QualificationStartMode qualificationMode, ProgramSegment? programSegment = null)
     {
+        if (programSegment is null && (productionProgram?.State.Active == true || productionProgramLoadError is not null))
+        {
+            SetStartDiagnostic("An existing production program must be completed, reconciled, or stopped first.");
+            return;
+        }
         bool requestedDegradedConfirmation = allowDegradedSyncStartOnce;
         allowDegradedSyncStartOnce = false;
 
@@ -2949,7 +2958,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 "START BLOCKED — NETWORK: Select an active physical network interface before sending a command.");
             return;
         }
-        if (!TryDuration(out uint duration))
+        uint duration = programSegment?.DurationSeconds ?? 0;
+        if (programSegment is null && !TryDuration(out duration))
         {
             StartSynchronizationResult = $"START BLOCKED — DURATION: {StatusMessage}";
             return;
@@ -2966,7 +2976,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        DeviceViewModel[] participants = Devices.Where(device => device.IsSelected).ToArray();
+        DeviceViewModel[] participants = Devices.Where(device => programSegment is null ? device.IsSelected :
+            productionProgram!.State.Program.Participants.Contains(device.DeviceId)).ToArray();
         if (participants.Length == 0)
         {
             ReportStartBlocks([
@@ -3133,12 +3144,18 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 long targetCandidateUs = checked(
                     MasterClock.NowMicroseconds + ProductionStartLeadMicroseconds);
                 StartParticipantGateInput[] gateInputs = participants
-                    .Select(device => device.BuildStartGateInput(gateNowUtc))
+                    .Select(device => device.BuildStartGateInput(gateNowUtc) with {
+                        ProductionMode = programSegment is not null,
+                        RtcRecoveredEdges = device.SessionSnapshot.RtcRecoveredEdges,
+                        BootId = device.SessionSnapshot.BootId })
                     .ToArray();
+                if (programSegment is not null)
+                    productionProgram!.ResolveFleetRateEvidence(CurrentProgramObservations(postSyncStatusAfterUtc).Values.ToArray());
                 StartGateResult gateResult = StartReadinessGate.Evaluate(
                     gateInputs,
                     gateNowUtc,
-                    targetCandidateUs);
+                    targetCandidateUs, programSegment is null ? StartReadinessGate.FleetPairBudgetMicroseconds :
+                        ProductionTimingBudget.StartAllowanceUs(programSegment.Duration, productionProgram!.State.MeasuredPairRatePpm));
                 if (!gateResult.Accepted)
                 {
                     ClearDegradedStartPending();
@@ -3149,7 +3166,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 DeviceViewModel[] degradedDevices = participants
                     .Where(device => device.SynchronizationDegraded)
                     .ToArray();
-                if (degradedDevices.Length != 0 && !requestedDegradedConfirmation)
+                if (programSegment is null && degradedDevices.Length != 0 && !requestedDegradedConfirmation)
                 {
                     degradedQualificationMode = qualificationMode;
                     SetDegradedStartPending(participants);
@@ -3204,7 +3221,11 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                             device.WarmupHistory.Samples)).ToArray()) { ControllerSessionId = controllerSessionId }
                     : qualificationMode == QualificationStartMode.Second ? qualificationWarmupProof : null;
                 var prepared = new PreparedStartRun(commandId, duration, targetCandidateUs, frozenParticipants,
-                    RequireWarmupHealth: qualificationMode is QualificationStartMode.First or QualificationStartMode.Second, WarmupProof: runWarmupProof);
+                    RequireWarmupHealth: qualificationMode is QualificationStartMode.First or QualificationStartMode.Second, WarmupProof: runWarmupProof,
+                    PlanId: programSegment is null ? 0 : productionProgram!.State.Program.PlanId,
+                    SegmentIndex: programSegment?.Index ?? 0, RepeatCount: programSegment?.RepeatCount ?? 1,
+                    FirstRepeat: programSegment?.FirstRepeat ?? 1,
+                    TotalRepeats: programSegment is null ? 1 : productionProgram!.State.Program.TotalRepeats);
                 preparedForAbort = prepared;
 
                 // Start a low-overhead in-memory TX trace before any START_AT
@@ -3215,7 +3236,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 BeginControllerTxTrace(
                     prepared.CommandId,
                     prepared.TargetMasterMicroseconds,
-                    prepared.DurationSeconds,
+                    prepared.SegmentDurationSeconds,
                     prepared.Participants.Select(participant => participant.Address).ToArray(),
                     prepared.Participants.Select(participant => participant.Device.DeviceId).ToArray(),
                     productionSyncOrderLabel,
@@ -3229,7 +3250,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     prepared.CommandId,
                     prepared.DurationSeconds,
                     0,
-                    prepared.TargetMasterMicroseconds);
+                    prepared.TargetMasterMicroseconds, PlanId: prepared.PlanId,
+                    SegmentIndex: prepared.SegmentIndex, RepeatCount: prepared.RepeatCount,
+                    FirstRepeat: prepared.FirstRepeat, TotalRepeats: prepared.TotalRepeats);
+                if (programSegment is not null)
+                    productionProgram!.RecordArm(prepared.CommandId, prepared.TargetMasterMicroseconds,
+                        controllerSessionId, CurrentProgramObservations().Values.ToArray());
 
                 foreach (PreparedParticipant participant in prepared.Participants)
                 {
@@ -3237,7 +3263,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     participant.Device.ClearStartMeasurement();
                 }
 
-                clock.ArmAt(prepared.DurationSeconds, prepared.TargetMasterMicroseconds);
+                clock.ArmSegmentAt(prepared.DurationSeconds, prepared.RepeatCount, prepared.TargetMasterMicroseconds,
+                    prepared.FirstRepeat, prepared.TotalRepeats);
                 SetStartDiagnostic(
                     $"START: ARMING {prepared.Participants.Count} selected timer(s); waiting for ACKs and final STATUS barrier...");
 
@@ -3255,10 +3282,16 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     clock.Reset(prepared.DurationSeconds);
                     RefreshClockProperties();
                     ReportPreparedRunAbort(armFailure, abort);
+                    if (programSegment is not null) ApplyProductionAbortResult(abort);
                     preparedForAbort = null;
                     return;
                 }
 
+                if (programSegment is not null) {
+                    productionProgram!.MarkRunning();
+                    programArmSucceeded = true;
+                    UpdateProductionProgramText();
+                }
                 await StartProductionSilentRunAsync(prepared, CancellationToken.None);
                 qualificationWarmupProof = qualificationMode == QualificationStartMode.First ? runWarmupProof : null;
                 qualificationStart1Rates.Clear();
@@ -3286,7 +3319,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             }
             catch (Exception exception)
             {
-                if (startAtMayHaveBeenSent && preparedForAbort is not null)
+                if ((startAtMayHaveBeenSent || (programSegment is not null && productionProgram?.State.CurrentCommandId != 0)) && preparedForAbort is not null)
                 {
                     Volatile.Write(ref activeArmAcknowledgementTracker, null);
                     AbortConfirmationResult abort = await ConfirmPreparedRunAbortAsync(
@@ -3300,6 +3333,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                             "controller",
                             $"START prepare raised an exception after ARMING began: {exception.Message}"),
                         abort);
+                    if (programSegment is not null) ApplyProductionAbortResult(abort);
                     preparedForAbort = null;
                 }
                 else
@@ -3352,6 +3386,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         foreach (DeviceViewModel device in participants)
         {
             ParticipantSessionSnapshot session = device.SessionSnapshot;
+            if (UseExecutionEvidence && !HasFreshExecutionReply(device.DeviceId, requireStatusAfterUtc))
+            {
+                blocks.Add(new(StartBlockReason.StatusStale, device.DeviceId,
+                    "No request-matched execution STATUS. Flash the segmented production firmware or check the device link."));
+                continue;
+            }
             if (session.LastStatusAtUtc.HasValue &&
                 (session.LastStatusAtUtc.Value < requireStatusAfterUtc ||
                  now - session.LastStatusAtUtc.Value >= StartReadinessGate.MaximumStatusAge))
@@ -3386,7 +3426,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             }
             StartBlock? rtcBlock = RtcStartQualification.Evaluate(
                 device.DeviceId, session.RtcState, session.RtcFitPoints, session.RtcFitRmsMicroseconds,
-                session.RtcQueueDrops, session.RtcTemperatureValid);
+                session.RtcQueueDrops, session.RtcTemperatureValid,
+                    production: productionSegmentContext is not null, recoveredEdges: session.RtcRecoveredEdges);
             if (rtcBlock is not null) blocks.Add(rtcBlock);
         }
         return blocks;
@@ -3396,7 +3437,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         IReadOnlyList<DeviceViewModel> participants,
         CancellationToken cancellationToken)
     {
-        DateTimeOffset deadlineUtc = DateTimeOffset.UtcNow + RtcQualificationWaitTimeout;
+        TimeSpan waitTimeout = productionSegmentContext is null ? RtcQualificationWaitTimeout : TimeSpan.FromSeconds(180);
+        DateTimeOffset deadlineUtc = DateTimeOffset.UtcNow + waitTimeout;
 
         // One explicit refresh at entry. After this, observe the normal pre-run
         // discovery stream instead of generating one STATUS request per second;
@@ -3455,7 +3497,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
 
                 StartBlock? rtcBlock = RtcStartQualification.Evaluate(
                     device.DeviceId, session.RtcState, session.RtcFitPoints, session.RtcFitRmsMicroseconds,
-                    session.RtcQueueDrops, session.RtcTemperatureValid);
+                    session.RtcQueueDrops, session.RtcTemperatureValid,
+                    production: productionSegmentContext is not null, recoveredEdges: session.RtcRecoveredEdges);
                 if (rtcBlock is not null)
                 {
                     // Missing v6.21 metrics and queue drops cannot become healthy merely
@@ -3463,7 +3506,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     bool metricsUnavailable = session.RtcState == RtcDisciplineState.Locked &&
                         (!session.RtcFitPoints.HasValue || !session.RtcFitRmsMicroseconds.HasValue ||
                          !session.RtcQueueDrops.HasValue || !session.RtcTemperatureValid.HasValue);
-                    if (metricsUnavailable || session.RtcQueueDrops is > 0) return [rtcBlock];
+                    if (metricsUnavailable || (productionSegmentContext is null && session.RtcQueueDrops is > 0)) return [rtcBlock];
                     rtcBlocks.Add(rtcBlock);
                 }
             }
@@ -3479,7 +3522,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             {
                 return rtcBlocks.Select(block => block with
                 {
-                    Remedy = $"RTC qualification timed out after {RtcQualificationWaitTimeout.TotalSeconds:F0} s. {block.Remedy}"
+                    Remedy = $"RTC qualification timed out after {waitTimeout.TotalSeconds:F0} s. {block.Remedy}"
                 }).ToArray();
             }
 
@@ -3509,6 +3552,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         foreach (DeviceViewModel device in participants)
         {
             ParticipantSessionSnapshot session = device.SessionSnapshot;
+            if (UseExecutionEvidence && !HasFreshExecutionReply(device.DeviceId, requireStatusAfterUtc))
+            {
+                blocks.Add(new(StartBlockReason.StatusStale, device.DeviceId,
+                    "No request-matched execution STATUS. Flash the segmented production firmware or check the device link."));
+                continue;
+            }
             if (session.LastStatusAtUtc.HasValue &&
                 (session.LastStatusAtUtc.Value < requireStatusAfterUtc ||
                  now - session.LastStatusAtUtc.Value >= StartReadinessGate.MaximumStatusAge))
@@ -3543,7 +3592,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             }
             StartBlock? rtcBlock = RtcStartQualification.Evaluate(
                 device.DeviceId, session.RtcState, session.RtcFitPoints, session.RtcFitRmsMicroseconds,
-                session.RtcQueueDrops, session.RtcTemperatureValid, "Post-SYNC RTC");
+                session.RtcQueueDrops, session.RtcTemperatureValid, "Post-SYNC RTC",
+                productionSegmentContext is not null, session.RtcRecoveredEdges);
             if (rtcBlock is not null)
             {
                 blocks.Add(rtcBlock);
@@ -3569,15 +3619,14 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         {
             if (device.TryGetIpAddress(out IPAddress? address) && address is not null)
             {
-                await udpService.SendStatusRequestAsync(
-                    CreateCommandId(),
-                    address,
-                    cancellationToken);
+                ulong requestId = CreateCommandId();
+                if (UseExecutionEvidence) expectedExecutionReplies[device.DeviceId] = requestId;
+                await udpService.SendStatusRequestAsync(requestId, address, cancellationToken);
             }
         }
     }
 
-    private static async Task WaitForFreshStatusesAsync(
+    private async Task WaitForFreshStatusesAsync(
         IReadOnlyList<DeviceViewModel> participants,
         DateTimeOffset requireStatusAfterUtc,
         CancellationToken cancellationToken)
@@ -3587,7 +3636,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         {
             if (participants.All(device =>
                     device.SessionSnapshot.LastStatusAtUtc is DateTimeOffset statusAt &&
-                    statusAt >= requireStatusAfterUtc))
+                    statusAt >= requireStatusAfterUtc &&
+                    (!UseExecutionEvidence || HasFreshExecutionReply(device.DeviceId, requireStatusAfterUtc))))
             {
                 return;
             }
@@ -3637,7 +3687,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                     : new StartBlock(
                         StartBlockReason.ArmAckMissing,
                         rejection.Key,
-                        "Firmware rejected START_AT as Late. Press START again for a new target.");
+                        $"Firmware rejected START_AT as {rejection.Value}. Resolve the active/invalid command before retrying.");
             }
 
             if (!ackTracker.AllArmed)
@@ -3646,10 +3696,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 foreach (PreparedParticipant participant in prepared.Participants)
                 {
                     if (!missing.Contains(participant.Device.DeviceId)) continue;
-                    await udpService.SendCommandUnicastOnceAsync(
-                        command,
-                        participant.Address,
-                        cancellationToken);
+                    CommandPacket wireCommand = prepared.PlanId == 0 ? command : command with {
+                        ExpectedBootId = participant.GateSnapshot.BootId!.Value,
+                        ExpectedPreviousCommandId = participant.GateSnapshot.ReportedCommandId ?? 0 };
+                    await udpService.SendCommandUnicastOnceAsync(wireCommand, participant.Address, cancellationToken);
                 }
             }
             else if (MasterClock.NowMicroseconds >= finalBarrierStartMasterUs)
@@ -3734,10 +3784,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         {
             foreach (PreparedParticipant participant in pending.Values.ToArray())
             {
-                await udpService.SendStatusRequestAsync(
-                    CreateCommandId(),
-                    participant.Address,
-                    cancellationToken);
+                ulong requestId = CreateCommandId();
+                if (prepared.PlanId != 0) expectedExecutionReplies[participant.Device.DeviceId] = requestId;
+                await udpService.SendStatusRequestAsync(requestId, participant.Address, cancellationToken);
             }
 
             long normalArmDeadlineMasterUs = checked(
@@ -3778,7 +3827,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             "No fresh final STATUS arrived before the T* - 2.5 s normal ARM deadline; cancelling the frozen run.");
     }
 
-    private static StartBlock? EvaluateFinalBarrierReplies(
+    private StartBlock? EvaluateFinalBarrierReplies(
         PreparedStartRun prepared,
         DateTimeOffset requireStatusAfterUtc,
         Dictionary<string, PreparedParticipant> pending)
@@ -3793,6 +3842,17 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 continue;
             }
 
+            if (prepared.PlanId != 0 && !HasFreshExecutionReply(deviceId, requireStatusAfterUtc)) continue;
+            if (prepared.PlanId != 0) {
+                ExecutionStatusPacket execution = matchedExecutionReplies[deviceId].Packet;
+                if (execution.PlanId != prepared.PlanId || execution.SegmentIndex != prepared.SegmentIndex ||
+                    execution.CommandId != prepared.CommandId || execution.State != TimerState.Armed ||
+                    execution.DurationSeconds != prepared.DurationSeconds || execution.RepeatCount != prepared.RepeatCount ||
+                    execution.FirstRepeat != prepared.FirstRepeat || execution.TotalRepeats != prepared.TotalRepeats ||
+                    execution.TargetMasterMicroseconds != prepared.TargetMasterMicroseconds ||
+                    execution.BootId != participant.GateSnapshot.BootId)
+                    return new(StartBlockReason.SyncInvalidated, deviceId, "Final execution metadata does not match the persisted segment.");
+            }
             StartBlock? block = StartFinalBarrier.EvaluateParticipant(
                 deviceId,
                 participant.GateSnapshot,
@@ -3865,15 +3925,14 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                             participant.Address,
                             cancellationToken);
                     }
-                    else if (pendingStatus.ContainsKey(deviceId))
+                    if (pendingStatus.ContainsKey(deviceId) && (prepared.PlanId != 0 || !missingAck.Contains(deviceId)))
                     {
                         // ACK proves RESET command processing, while this explicit
                         // STATUS request recovers independently if the RESET's
                         // immediate STATUS datagram was the packet that got lost.
-                        await udpService.SendStatusRequestAsync(
-                            CreateCommandId(),
-                            participant.Address,
-                            cancellationToken);
+                        ulong requestId = CreateCommandId();
+                        if (prepared.PlanId != 0) expectedExecutionReplies[deviceId] = requestId;
+                        await udpService.SendStatusRequestAsync(requestId, participant.Address, cancellationToken);
                     }
                 }
 
@@ -3888,7 +3947,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                         true,
                         resetCommandId,
                         [],
-                        []);
+                        [],
+                        prepared.PlanId == 0 ? null : CurrentProgramObservations(requireStatusAfterUtc),
+                        MasterClock.NowMicroseconds);
                 }
 
                 long remainingUs = confirmationDeadlineMasterUs - MasterClock.NowMicroseconds;
@@ -3910,7 +3971,9 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                         true,
                         resetCommandId,
                         [],
-                        []);
+                        [],
+                        prepared.PlanId == 0 ? null : CurrentProgramObservations(requireStatusAfterUtc),
+                        MasterClock.NowMicroseconds);
                 }
             }
 
@@ -3969,7 +4032,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private static void EvaluateAbortConfirmationStatuses(
+    private void EvaluateAbortConfirmationStatuses(
         PreparedStartRun prepared,
         ulong resetCommandId,
         DateTimeOffset requireStatusAfterUtc,
@@ -3978,6 +4041,12 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         foreach (string deviceId in pendingStatus.Keys.ToArray())
         {
             ParticipantSessionSnapshot current = pendingStatus[deviceId].Device.SessionSnapshot;
+            if (prepared.PlanId != 0)
+            {
+                if (!HasFreshExecutionReply(deviceId, requireStatusAfterUtc)) continue;
+                ExecutionStatusPacket execution = matchedExecutionReplies[deviceId].Packet;
+                if (execution.CommandId != resetCommandId || execution.State != TimerState.Ready) continue;
+            }
             if (StartAbortConfirmation.IsParticipantCancellationConfirmed(
                 current,
                 prepared.CommandId,
@@ -4032,7 +4101,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         bool Confirmed,
         ulong ResetCommandId,
         IReadOnlyList<string> MissingResetAcknowledgements,
-        IReadOnlyList<string> MissingSafeStatuses);
+        IReadOnlyList<string> MissingSafeStatuses,
+        IReadOnlyDictionary<string, ProgramDeviceObservation>? SafeExecution = null, long ConfirmedAtMasterUs = 0);
 
     private async Task RefreshSelectedStatusInternalAsync()
     {
@@ -4598,7 +4668,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         {
             long resumeUs = checked(
                 prepared.TargetMasterMicroseconds +
-                (long)prepared.DurationSeconds * 1_000_000L +
+                (long)prepared.SegmentDurationSeconds * 1_000_000L +
                 500_000L);
             await WaitUntilMasterTimeAsync(resumeUs, cancellationToken)
                 .ConfigureAwait(false);
@@ -4623,6 +4693,15 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         // Keep qualification/manual-test workflows behaviorally unchanged.
         if (IsBenchmarkRunning || isPreparingManualStartAtTest || manualStartAtSession is not null) return;
 
+        if (productionProgram?.State.Active == true) {
+            if (status.State == TimerState.Running && !productionSilentRunActive) {
+                productionSilentRunActive = true;
+                productionSilentRunOwnsExactWindow = false;
+                statusDiscovery.Stop();
+                foreach (DeviceViewModel device in Devices) device.BeginIntentionalStatusPause();
+            }
+            return;
+        }
         if (status.State == TimerState.Running)
         {
             if (productionSilentRunActive)
@@ -4724,9 +4803,10 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
 
     private void UpdateCanSend()
     {
-        CanSend = !isSending && manualStartAtSession is null &&
+        CanSend = !programManagementBusy && !isSending && productionProgram?.State.Active != true && productionProgramLoadError is null && manualStartAtSession is null &&
             SelectedNetworkInterface is not null && udpService.IsReady;
         OnPropertyChanged(nameof(CanStartDegraded));
+        OnPropertyChanged(nameof(CanManageProgram));
         RefreshManualStartAtButtonStates();
     }
 
@@ -5089,7 +5169,11 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
                 case RunDiagnosticPacket diagnostic:
                     RecordRunDiagnostic(diagnostic);
                     break;
+                case ExecutionStatusPacket execution:
+                    ObserveProgramExecution(device, execution, e.RemoteEndPoint.Address);
+                    break;
                 case StatusPacket status:
+                    latestProgramHealth[status.DeviceId] = (status, DateTimeOffset.UtcNow);
                     RecordControllerHealthSnapshot(status);
                     device.Apply(status, e.RemoteEndPoint, e.MasterReceiveMicroseconds);
                     ObserveQualificationStart1Rate(status);
@@ -5160,6 +5244,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
 
     private void UiTimer_Tick(DispatcherQueueTimer sender, object args)
     {
+        UpdateProductionProgramText();
         clock.Update();
         RefreshClockProperties();
         DateTimeOffset now = DateTimeOffset.UtcNow;
@@ -5213,6 +5298,8 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
     {
         if (disposed) return;
         disposed = true;
+        programCancellation?.Cancel();
+        programAwakeLease?.Dispose();
         benchmarkCancellation?.Cancel();
         benchmarkCancellation?.Dispose();
         benchmarkCancellation = null;
@@ -5247,7 +5334,11 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         long TargetMasterMicroseconds,
         IReadOnlyList<PreparedParticipant> Participants,
         bool RequireWarmupHealth = false,
-        QualificationWarmupProof? WarmupProof = null);
+        QualificationWarmupProof? WarmupProof = null, ulong PlanId = 0, uint SegmentIndex = 0,
+        uint RepeatCount = 1, uint FirstRepeat = 1, uint TotalRepeats = 1)
+    {
+        public uint SegmentDurationSeconds => checked(DurationSeconds * RepeatCount);
+    }
 
     private sealed record StartTelemetryContext(
         ulong CommandId,
@@ -5781,7 +5872,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         bool? AttemptAccepted,
         string AttemptOutcome,
         string FailureKind,
-        string FailureMessage)
+        string FailureMessage, string Bssid = "UNKNOWN")
     {
         public const string EstimatorName = "LOW_RTT_INV_RTT2_BEST3";
 
@@ -5790,7 +5881,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             "PathForwardDelayMs,PathReverseDelayMs,ActualForwardDelayUs,ActualReverseDelayUs,MasterT1Us,DeviceT2Us,DeviceT3Us,MasterT4Us," +
             "RttUs,OffsetUs,SelectedLowRtt,ConsensusRepresentative,Estimator,ConsensusOffsetUs,BestRttUs," +
             "ResidualErrorUs,ExpectedBiasUs,DeviationUs,ThresholdUs,AttemptAccepted,AttemptOutcome," +
-            "FailureKind,FailureMessage";
+            "FailureKind,FailureMessage,Bssid";
 
         public static SyncSampleDiagnosticCsvRow CreateFailureMarker(
             int trial,
@@ -5878,7 +5969,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
             AttemptAccepted.HasValue ? (AttemptAccepted.Value ? "1" : "0") : string.Empty,
             Csv(AttemptOutcome),
             Csv(FailureKind),
-            Csv(FailureMessage));
+            Csv(FailureMessage), Csv(Bssid));
 
         private static string Number(long? value) => value?.ToString(
             System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
@@ -5908,7 +5999,7 @@ internal sealed class MainViewModel : ObservableObject, IDisposable
         long IngressLocalUs,
         int ForwardAttempt = 0,
         ForwardSyncPhase ForwardPhase = ForwardSyncPhase.Unspecified,
-        int ForwardRound = -1);
+        int ForwardRound = -1, string Bssid = "UNKNOWN");
 
     private sealed record ForwardSyncConsensus(
         ulong RepresentativeSyncId,

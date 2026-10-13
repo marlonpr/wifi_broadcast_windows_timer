@@ -653,7 +653,7 @@ public sealed class StartPreparationTests
         tracker.ObserveStatus(ready, address, Now + TimeSpan.FromMinutes(10) + TimeSpan.FromSeconds(1));
         Assert.AreEqual(generation, tracker.Snapshot.Generation);
 
-        tracker.EndIntentionalStatusPause();
+        tracker.EndIntentionalStatusPause(Now + TimeSpan.FromMinutes(10) + TimeSpan.FromSeconds(1));
         tracker.ObserveConnectivity(
             Now + TimeSpan.FromMinutes(11),
             TimeSpan.FromSeconds(6),

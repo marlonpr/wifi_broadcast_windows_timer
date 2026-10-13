@@ -15,6 +15,7 @@ public sealed class DeviceStatusTracker
     private DateTimeOffset lastStatusAt;
     private bool forcedOffline = true;
     private bool intentionalStatusPauseActive;
+    private DateTimeOffset? pauseEndedAt;
 
     public void BeginSearching(DateTimeOffset now)
     {
@@ -22,6 +23,7 @@ public sealed class DeviceStatusTracker
         lastStatusAt = default;
         forcedOffline = false;
         intentionalStatusPauseActive = false;
+        pauseEndedAt = null;
     }
 
     public void RecordValidStatus(DateTimeOffset now)
@@ -37,6 +39,7 @@ public sealed class DeviceStatusTracker
         lastStatusAt = default;
         forcedOffline = true;
         intentionalStatusPauseActive = false;
+        pauseEndedAt = null;
     }
 
     public void BeginIntentionalStatusPause()
@@ -47,7 +50,11 @@ public sealed class DeviceStatusTracker
         }
     }
 
-    public void EndIntentionalStatusPause() => intentionalStatusPauseActive = false;
+    public void EndIntentionalStatusPause(DateTimeOffset? resumedAt = null)
+    {
+        if (intentionalStatusPauseActive) pauseEndedAt = resumedAt ?? DateTimeOffset.UtcNow;
+        intentionalStatusPauseActive = false;
+    }
 
     public DeviceAvailability GetAvailability(DateTimeOffset now)
     {
@@ -56,6 +63,8 @@ public sealed class DeviceStatusTracker
         {
             return DeviceAvailability.Online;
         }
+        if (pauseEndedAt.HasValue && lastStatusAt != default && now - pauseEndedAt.Value < OfflineTimeout)
+            return DeviceAvailability.Online;
         if (lastStatusAt != default)
         {
             return now - lastStatusAt < OfflineTimeout

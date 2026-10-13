@@ -1,3 +1,10 @@
+# Controller 6.23.2 — persistent segmented programs
+
+See [production implementation and validation](../SEGMENTED_REPETITIONS.md).
+Ordinary START runs the selected repetition program. Qualification START controls
+retain their separate strict gates. The app must be rebuilt and its included
+.NET tests run on Windows before deployment.
+
 # Controller 6.22.18: qualification policy and continuity
 
 The current warm-up gate is full 129-point fits, three normal RMS<=1 us polls,
@@ -407,3 +414,7 @@ The production START button now automatically waits up to 90 seconds for every s
 ## v6.22 forward-only production START synchronization
 
 Production START uses the mean of the three fastest forward-ingress offset samples across the existing 8+8 exchange set and sends the estimator's local epoch with `SYNC_SET`. Paired v6.22 firmware propagates that epoch to `T*` through DS3231-disciplined time. Benchmark/manual synchronization remains on the previous four-timestamp estimator. See `V6_22_FORWARD_SYNC_CONTROLLER.md`.
+
+## 6.23.2 review corrections
+
+See `../REVIEW_FIXES_6_23_2.md`. Matching fleet spread survives new programs; fresh post-sync identities activate it before the first ARM. Drift-step confirmation avoids a permanently latched innovation classification.

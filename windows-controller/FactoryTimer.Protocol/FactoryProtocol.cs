@@ -26,6 +26,8 @@ public enum AckResult
     Duplicate,
     NotSynced,
     Late,
+    Busy,
+    Invalid,
 }
 
 public enum RtcDisciplineState
@@ -108,7 +110,15 @@ public sealed record CommandPacket(
     uint DurationSeconds,
     uint StartDelayMilliseconds,
     long StartAtMasterMicroseconds = 0,
-    byte BrightnessPercent = 0);
+    byte BrightnessPercent = 0,
+    ulong PlanId = 0,
+    uint SegmentIndex = 0,
+    uint RepeatCount = 1,
+    uint FirstRepeat = 1,
+    uint TotalRepeats = 1, ulong ExpectedBootId = 0, ulong ExpectedPreviousCommandId = 0)
+{
+    public uint SegmentDurationSeconds => checked(DurationSeconds * RepeatCount);
+}
 
 public sealed record SyncRequestPacket(
     ulong SyncId,
@@ -195,7 +205,17 @@ public sealed record SyncReplyPacket(
     long LocalT2Microseconds,
     long LocalT3Microseconds,
     uint ActualArtificialReplyDelayMicroseconds = 0,
-    long IngressLocalMicroseconds = 0) : InboundPacket(DeviceId);
+    long IngressLocalMicroseconds = 0, string? Bssid = null) : InboundPacket(DeviceId);
+
+public sealed record ExecutionStatusPacket(
+    string DeviceId, ulong ResponseId, ulong BootId, ulong PlanId, uint SegmentIndex,
+    ulong CommandId, TimerState State, uint DurationSeconds, uint RepeatCount,
+    uint FirstRepeat, uint TotalRepeats, uint CurrentRepeat, uint ElapsedSegmentSeconds,
+    long TargetMasterMicroseconds, long TStarLocalMicroseconds, ushort RtcRecoveredEdges, long ElapsedSegmentMicroseconds = 0)
+    : InboundPacket(DeviceId)
+{
+    public uint SegmentDurationSeconds => checked(DurationSeconds * RepeatCount);
+}
 
 public sealed record SyncAppliedPacket(
     string DeviceId,
@@ -217,6 +237,8 @@ public static class FactoryProtocol
     public const string Version2 = "FCT2";
     public const int MaximumPacketLength = 511;
     public const uint MinimumDurationSeconds = 1;
+    public const uint MaximumRepeatDurationSeconds = 5999;
+    public const uint MaximumSegmentDurationSeconds = 6000;
     public const uint MaximumDurationSeconds = 86_400;
     public const uint MinimumStartDelayMilliseconds = 100;
     public const uint MaximumStartDelayMilliseconds = 10_000;
@@ -226,6 +248,9 @@ public static class FactoryProtocol
     public static string SerializeCommand(CommandPacket packet)
     {
         ValidateCommand(packet);
+        if (packet.PlanId != 0)
+            return FormattableString.Invariant(
+                $"{Version2}|CMD|START_AT|{packet.CommandId:X16}|{packet.DurationSeconds}|{packet.StartAtMasterMicroseconds}|{packet.PlanId:X16}|{packet.SegmentIndex}|{packet.RepeatCount}|{packet.FirstRepeat}|{packet.TotalRepeats}|{packet.ExpectedBootId:X16}|{packet.ExpectedPreviousCommandId:X16}");
         return packet.CommandType switch
         {
             CommandType.Start => FormattableString.Invariant(
@@ -289,6 +314,28 @@ public static class FactoryProtocol
         packet = null;
         if (!ValidateEnvelope(text, out error)) return false;
         string[] fields = text.Split('|', StringSplitOptions.None);
+        if (fields.Length == 13)
+        {
+            if (fields[0] != Version2 || fields[1] != "CMD" || fields[2] != "START_AT" ||
+                !TryParseCommand(string.Join("|", fields.Take(6)), out CommandPacket? basis, out error) || basis is null)
+                return false;
+            if (!TryCommandId(fields[6], false, out ulong planId) ||
+                !TryUInt(fields[7], 1, uint.MaxValue, out uint segmentIndex) ||
+                !TryUInt(fields[8], 1, uint.MaxValue, out uint repeats) ||
+                !TryUInt(fields[9], 1, uint.MaxValue, out uint first) ||
+                !TryUInt(fields[10], 1, uint.MaxValue, out uint total) ||
+                !TryCommandId(fields[11], false, out ulong boot) ||
+                !TryCommandId(fields[12], true, out ulong previous) ||
+                !ValidSegment(basis.DurationSeconds, repeats, first, total, segmentIndex))
+            {
+                error = ProtocolParseError.Duration;
+                return false;
+            }
+            packet = basis with { PlanId = planId, SegmentIndex = segmentIndex,
+                RepeatCount = repeats, FirstRepeat = first, TotalRepeats = total,
+                ExpectedBootId = boot, ExpectedPreviousCommandId = previous };
+            return true;
+        }
         if (fields.Length != 6)
         {
             error = ProtocolParseError.FieldCount;
@@ -403,6 +450,9 @@ public static class FactoryProtocol
         if (!ValidateEnvelope(text, out error)) return false;
         string[] fields = text.Split('|', StringSplitOptions.None);
 
+        if (fields.Length >= 2 && fields[0] == Version2 && fields[1] == "EXEC_STATUS")
+            return TryParseExecutionStatus(fields, out packet, out error);
+
         if (fields.Length >= 2 && fields[0] == Version2 && fields[1] == "RUN_DIAG")
         {
             return TryParseRunDiagnostic(fields, out packet, out error);
@@ -413,7 +463,7 @@ public static class FactoryProtocol
             // Legacy forms have 7 fields (no reverse-hold diagnostic) or 8 fields
             // (reverse-hold only). v6.22 appends the earliest matched device ingress
             // timestamp as field 9; an optional S3 die-temperature field may follow.
-            if (fields.Length is not (7 or 8 or 9 or 10))
+            if (fields.Length is not (7 or 8 or 9 or 10 or 11))
             {
                 error = ProtocolParseError.FieldCount;
                 return false;
@@ -452,8 +502,14 @@ public static class FactoryProtocol
                 return false;
             }
 
+            string? bssid = fields.Length == 11 ? fields[10] : null;
+            if (bssid is not null && !ValidBssid(bssid))
+            {
+                error = ProtocolParseError.Bssid;
+                return false;
+            }
             packet = new SyncReplyPacket(
-                fields[2], syncId, t1, t2, t3, actualReplyDelayUs, ingressLocalUs);
+                fields[2], syncId, t1, t2, t3, actualReplyDelayUs, ingressLocalUs, bssid);
             return true;
         }
 
@@ -949,6 +1005,14 @@ public static class FactoryProtocol
 
     private static void ValidateCommand(CommandPacket packet)
     {
+        if (packet.PlanId != 0 && (packet.CommandType != CommandType.StartAt || packet.ExpectedBootId == 0 ||
+            !ValidSegment(packet.DurationSeconds, packet.RepeatCount, packet.FirstRepeat,
+                          packet.TotalRepeats, packet.SegmentIndex)))
+            throw new ArgumentOutOfRangeException(nameof(packet), "Invalid segment geometry.");
+        if (packet.PlanId == 0 && (packet.RepeatCount != 1 || packet.FirstRepeat != 1 ||
+            packet.TotalRepeats != 1 || packet.SegmentIndex != 0 || packet.ExpectedBootId != 0 || packet.ExpectedPreviousCommandId != 0))
+            throw new ArgumentOutOfRangeException(nameof(packet), "Segment fields require PlanId.");
+
         if (packet.CommandId == 0)
         {
             throw new ArgumentOutOfRangeException(nameof(packet), "Command ID cannot be zero.");
@@ -1005,6 +1069,49 @@ public static class FactoryProtocol
         {
             throw new ArgumentOutOfRangeException(nameof(packet), "RESET timing fields must be zero.");
         }
+    }
+
+    public static bool ValidSegment(uint duration, uint repeats, uint first, uint total, uint segment) =>
+        duration is >= 1 and <= MaximumRepeatDurationSeconds && repeats >= 1 && first >= 1 &&
+        total >= 1 && segment >= 1 && (ulong)duration * repeats <= MaximumSegmentDurationSeconds &&
+        (ulong)first + repeats - 1 <= total;
+
+    private static bool TryParseExecutionStatus(string[] f, out InboundPacket? packet,
+                                               out ProtocolParseError error)
+    {
+        packet = null;
+        error = ProtocolParseError.FieldCount;
+        if (f.Length != 19) return false;
+        error = ProtocolParseError.PacketType;
+        if (!ValidDeviceId(f[2]) || !TryCommandId(f[3], true, out ulong response) ||
+            !TryCommandId(f[4], false, out ulong boot) || !TryCommandId(f[5], true, out ulong plan) ||
+            !TryUInt(f[6], 0, uint.MaxValue, out uint segment) ||
+            !TryCommandId(f[7], true, out ulong command) || !TryState(f[8], out TimerState state) ||
+            !TryUInt(f[9], 1, MaximumDurationSeconds, out uint duration) ||
+            !TryUInt(f[10], 1, uint.MaxValue, out uint repeats) ||
+            !TryUInt(f[11], 1, uint.MaxValue, out uint first) ||
+            !TryUInt(f[12], 1, uint.MaxValue, out uint total) ||
+            !TryUInt(f[13], 1, uint.MaxValue, out uint current) ||
+            !TryUInt(f[14], 0, MaximumDurationSeconds, out uint elapsed) ||
+            !TryLong(f[15], true, out long target) || !TryLong(f[16], true, out long local) ||
+            !TryUInt(f[17], 0, 129, out uint recovery) ||
+            !TryLong(f[18], false, out long phase)) return false;
+        if (plan != 0 && (!ValidSegment(duration, repeats, first, total, segment) ||
+            command == 0 || target == 0 || local == 0)) return false;
+        if (plan == 0 && (segment != 0 || repeats != 1 || first != 1 || total != 1)) return false;
+        ulong length = (ulong)duration * repeats;
+        if ((state == TimerState.Ready && elapsed != 0) ||
+            (state == TimerState.Armed && phase > 0) ||
+            (state != TimerState.Armed && (phase < 0 || phase / 1_000_000 != elapsed)) ||
+            phase > (long)length * 1_000_000 ||
+            elapsed > length || current != first + Math.Min(elapsed / duration, repeats - 1) ||
+            (state == TimerState.Armed && elapsed != 0) ||
+            (state == TimerState.Running && elapsed >= length) ||
+            (state == TimerState.Finished && elapsed != length)) return false;
+        packet = new ExecutionStatusPacket(f[2], response, boot, plan, segment, command, state,
+            duration, repeats, first, total, current, elapsed, target, local, (ushort)recovery, phase);
+        error = ProtocolParseError.None;
+        return true;
     }
 
     private static bool TryParseRunDiagnostic(
@@ -1147,9 +1254,11 @@ public static class FactoryProtocol
             "DUPLICATE" => AckResult.Duplicate,
             "NOT_SYNCED" => AckResult.NotSynced,
             "LATE" => AckResult.Late,
+            "BUSY" => AckResult.Busy,
+            "INVALID" => AckResult.Invalid,
             _ => default,
         };
-        return value is "ACCEPTED" or "DUPLICATE" or "NOT_SYNCED" or "LATE";
+        return value is "ACCEPTED" or "DUPLICATE" or "NOT_SYNCED" or "LATE" or "BUSY" or "INVALID";
     }
 
     private static bool TryState(string value, out TimerState state)

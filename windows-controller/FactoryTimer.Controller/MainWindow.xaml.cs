@@ -41,6 +41,10 @@ public sealed partial class MainWindow : Window
 
     private void Content_Loaded(object sender, RoutedEventArgs e) => viewModel.Initialize();
 
+    private async void ReconcileProgram_Click(object sender, RoutedEventArgs e) => await viewModel.ReconcileProductionProgramAsync();
+    private async void ResumeProgram_Click(object sender, RoutedEventArgs e) => await viewModel.ResumeProductionProgramAsync();
+    private async void StopProgram_Click(object sender, RoutedEventArgs e) => await viewModel.StopRepetitionProgramAsync();
+
     private async void Start_Click(object sender, RoutedEventArgs e) => await viewModel.SendStartAsync();
 
     private async void QualificationFirstStart_Click(object sender, RoutedEventArgs e) => await viewModel.SendQualificationFirstStartAsync();

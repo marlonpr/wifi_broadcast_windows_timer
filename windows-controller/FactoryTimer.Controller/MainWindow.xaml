@@ -64,6 +64,20 @@
                                        SpinButtonPlacementMode="Inline" />
                         </Grid>
 
+                        <NumberBox Header="Repetitions" Value="{Binding RepetitionsInput, Mode=TwoWay}"
+                                   Minimum="1" Maximum="1000000" SmallChange="1" IsEnabled="{Binding CanSend}"
+                                   SpinButtonPlacementMode="Inline" />
+                        <NumberBox Header="Resync limit (seconds)" Value="{Binding SegmentCapSecondsInput, Mode=TwoWay}"
+                                   Minimum="1" Maximum="6000" SmallChange="1" IsEnabled="{Binding CanSend}"
+                                   SpinButtonPlacementMode="Inline" />
+                        <TextBlock Text="{Binding ProductionProgramText}" TextWrapping="Wrap" />
+                        <TextBlock Text="Production readiness is checked before each segment. Qualification warm-up is separate."
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <Button Content="RECONCILE SAVED PROGRAM" Click="ReconcileProgram_Click" IsEnabled="{Binding CanManageProgram}" />
+                        <TextBlock Text="Resume acknowledges repeats missed by a failed or rebooted board; completed segments are never replayed." TextWrapping="Wrap" />
+                        <Button Content="RESUME HELD PROGRAM" Click="ResumeProgram_Click" IsEnabled="{Binding CanManageProgram}" />
+                        <Button Content="STOP PROGRAM / RESET FROZEN FLEET" Click="StopProgram_Click" IsEnabled="{Binding CanManageProgram}" />
+
                         <TextBlock Text="Panel brightness" FontWeight="SemiBold" Margin="0,5,0,0" />
                         <Grid ColumnSpacing="10">
                             <Grid.ColumnDefinitions>

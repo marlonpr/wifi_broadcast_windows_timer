@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../windows-controller/FactoryTimer.Controller.Core/FactoryTimer.Controller.Core.csproj" />
+    <Content Include="../../tests/FactoryTimer.Protocol.Tests/fixtures/status_v62319_max_width.txt" Link="status_v62319_max_width.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="../../windows-controller/FactoryTimer.Controller/ControllerClock.cs" Link="ControllerClock.cs" />
+  </ItemGroup>
+</Project>

@@ -361,9 +361,11 @@ public sealed class StatusDiscoveryTests
         Assert.AreEqual(DeviceAvailability.Online,
             tracker.GetAvailability(now + TimeSpan.FromMinutes(10)));
 
-        tracker.EndIntentionalStatusPause();
+        tracker.EndIntentionalStatusPause(now + TimeSpan.FromMinutes(10));
+        Assert.AreEqual(DeviceAvailability.Online,
+            tracker.GetAvailability(now + TimeSpan.FromMinutes(10) + TimeSpan.FromSeconds(47)));
         Assert.AreEqual(DeviceAvailability.Offline,
-            tracker.GetAvailability(now + TimeSpan.FromMinutes(10)));
+            tracker.GetAvailability(now + TimeSpan.FromMinutes(10) + TimeSpan.FromSeconds(48)));
     }
 
 }

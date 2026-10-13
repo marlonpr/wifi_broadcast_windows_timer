@@ -133,6 +133,15 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
     public bool IsOnlineAt(DateTimeOffset now) =>
         statusTracker.GetAvailability(now) == DeviceAvailability.Online;
 
+    private ExecutionStatusPacket? executionStatus;
+    private DateTimeOffset executionObservedAt;
+    public void ApplyExecution(ExecutionStatusPacket status)
+    {
+        sessionTracker.ObserveExecution(status);
+        executionStatus = status;
+        executionObservedAt = DateTimeOffset.UtcNow;
+    }
+
     public StartParticipantGateInput BuildStartGateInput(DateTimeOffset now)
     {
         ParticipantSessionSnapshot session = sessionTracker.Snapshot;
@@ -276,6 +285,16 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
             return;
         }
 
+        if (executionStatus is { PlanId: not 0, State: TimerState.Running } execution &&
+            execution.CommandId == sessionTracker.Snapshot.CommandId)
+        {
+            double phase = Math.Max(0, execution.ElapsedSegmentMicroseconds / 1_000_000d +
+                (nowUtc - executionObservedAt).TotalSeconds);
+            uint elapsed = (uint)Math.Min(execution.SegmentDurationSeconds, Math.Floor(phase));
+            uint value = elapsed >= execution.SegmentDurationSeconds ? 0 : execution.DurationSeconds - elapsed % execution.DurationSeconds;
+            RemainingSeconds = $"{value / 60u:00}:{value % 60u:00}";
+            return;
+        }
         double elapsedSeconds = Math.Max(0d, (nowUtc - lastStatusAtUtc.Value).TotalSeconds);
         uint elapsedWholeSeconds = elapsedSeconds >= uint.MaxValue
             ? uint.MaxValue
@@ -297,8 +316,9 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
 
     public void EndIntentionalStatusPause()
     {
-        sessionTracker.EndIntentionalStatusPause();
-        statusTracker.EndIntentionalStatusPause();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        sessionTracker.EndIntentionalStatusPause(now);
+        statusTracker.EndIntentionalStatusPause(now);
     }
 
     public void MarkSynchronizing()

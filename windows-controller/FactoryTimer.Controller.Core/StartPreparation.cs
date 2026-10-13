@@ -48,7 +48,10 @@ public sealed record StartParticipantGateInput(
     uint? ReportedRtcQueueDrops = 0,
     bool? ReportedRtcTemperatureValid = true,
     long? SynchronizationUncertaintyMicroseconds = null,
-    byte? ReportedDiagnosticFlags = null);
+    byte? ReportedDiagnosticFlags = null,
+    bool ProductionMode = false,
+    ushort? RtcRecoveredEdges = null,
+    ulong? BootId = null);
 
 public sealed record StartGateResult(
     bool Accepted,
@@ -104,7 +107,7 @@ public static class RtcStartQualification
         double? fitRmsMicroseconds,
         uint? queueDrops,
         bool? temperatureValid,
-        string context = "RTC")
+        string context = "RTC", bool production = false, ushort? recoveredEdges = null)
     {
         if (state != RtcDisciplineState.Locked)
         {
@@ -123,12 +126,16 @@ public static class RtcStartQualification
                 $"{context} qualification metrics are unavailable; flash v6.21-or-newer firmware.");
         }
 
-        if (fitPoints.Value < MinimumFitPoints)
+        ushort minimum = production ? (ushort)128 : MinimumFitPoints;
+        if (production && (!recoveredEdges.HasValue || recoveredEdges.Value < 129))
+            return new(StartBlockReason.RtcNotQualified, deviceId,
+                $"{context} recovering: requires 129 accepted SQW edges after the latest discontinuity.");
+        if (fitPoints.Value < minimum)
         {
             return new StartBlock(
                 StartBlockReason.RtcNotQualified,
                 deviceId,
-                $"{context} fit has {fitPoints.Value}/{MinimumFitPoints} points; waiting for qualification.");
+                $"{context} fit has {fitPoints.Value}/{minimum} points; waiting for qualification.");
         }
 
         if (!double.IsFinite(fitRmsMicroseconds.Value) ||
@@ -140,7 +147,7 @@ public static class RtcStartQualification
                 $"{context} fit RMS is {fitRmsMicroseconds.Value:F3} us; requires <= {MaximumFitRmsMicroseconds:F1} us.");
         }
 
-        if (queueDrops.Value != 0)
+        if (!production && queueDrops.Value != 0)
         {
             return new StartBlock(
                 StartBlockReason.RtcNotQualified,
@@ -169,8 +176,11 @@ public static class StartReadinessGate
     public static StartGateResult Evaluate(
         IReadOnlyList<StartParticipantGateInput> participants,
         DateTimeOffset nowUtc,
-        long targetMasterMicroseconds)
+        long targetMasterMicroseconds,
+        long fleetPairBudgetMicroseconds = FleetPairBudgetMicroseconds)
     {
+        if (fleetPairBudgetMicroseconds <= 0 || fleetPairBudgetMicroseconds > 30_000)
+            throw new ArgumentOutOfRangeException(nameof(fleetPairBudgetMicroseconds));
         ArgumentNullException.ThrowIfNull(participants);
         if (targetMasterMicroseconds <= 0) throw new ArgumentOutOfRangeException(nameof(targetMasterMicroseconds));
 
@@ -239,7 +249,8 @@ public static class StartReadinessGate
                 participant.ReportedRtcFitPoints,
                 participant.ReportedRtcFitRmsMicroseconds,
                 participant.ReportedRtcQueueDrops,
-                participant.ReportedRtcTemperatureValid);
+                participant.ReportedRtcTemperatureValid, production: participant.ProductionMode,
+                recoveredEdges: participant.RtcRecoveredEdges);
             if (rtcBlock is not null)
             {
                 blocks.Add(rtcBlock);
@@ -325,7 +336,7 @@ public static class StartReadinessGate
         // estimator's effective epoch up to T*. Countdown duration is deliberately
         // absent from this gate: once T* is reached, the devices run autonomously.
         // Therefore an exact 20 ms pair bound passes; only a value above 20 ms blocks.
-        if (startPairUs > FleetPairBudgetMicroseconds)
+        if (startPairUs > fleetPairBudgetMicroseconds)
         {
             return new StartGateResult(
                 false,
@@ -334,7 +345,7 @@ public static class StartReadinessGate
                     "fleet",
                     "Press START again to obtain fresher/lower-error synchronization before T*.",
                     startPairUs,
-                    FleetPairBudgetMicroseconds)],
+                    fleetPairBudgetMicroseconds)],
                 startPairUs,
                 startUncertaintyByDevice);
         }
@@ -370,6 +381,8 @@ public static class StartArmSessionGuard
         ParticipantSessionSnapshot current,
         ulong preparedCommandId)
     {
+        if (frozenGate.ProductionMode && (!current.BootId.HasValue || current.BootId != frozenGate.BootId))
+            return new(StartBlockReason.SyncInvalidated, deviceId, "Device boot identity changed during preparation.");
         if (current.Generation != frozenGate.CurrentSessionGeneration)
         {
             return new StartBlock(
@@ -383,7 +396,8 @@ public static class StartArmSessionGuard
 
         StartBlock? rtcBlock = RtcStartQualification.Evaluate(
             deviceId, current.RtcState, current.RtcFitPoints, current.RtcFitRmsMicroseconds,
-            current.RtcQueueDrops, current.RtcTemperatureValid, "RTC during ARMING");
+            current.RtcQueueDrops, current.RtcTemperatureValid, "RTC during ARMING",
+            frozenGate.ProductionMode, current.RtcRecoveredEdges);
         if (rtcBlock is not null) return rtcBlock;
 
         if (current.TimerState is TimerState.Armed or TimerState.Running &&
@@ -462,6 +476,8 @@ public static class StartFinalBarrier
                 "Final ARM verification did not receive a fresh STATUS before cutoff; press START again.");
         }
 
+        if (frozenGate.ProductionMode && (!current.BootId.HasValue || current.BootId != frozenGate.BootId))
+            return new(StartBlockReason.SyncInvalidated, deviceId, "Device boot identity changed during preparation.");
         if (current.Generation != frozenGate.CurrentSessionGeneration)
         {
             return new StartBlock(
@@ -475,7 +491,8 @@ public static class StartFinalBarrier
 
         StartBlock? rtcBlock = RtcStartQualification.Evaluate(
             deviceId, current.RtcState, current.RtcFitPoints, current.RtcFitRmsMicroseconds,
-            current.RtcQueueDrops, current.RtcTemperatureValid, "Final STATUS RTC");
+            current.RtcQueueDrops, current.RtcTemperatureValid, "Final STATUS RTC",
+            frozenGate.ProductionMode, current.RtcRecoveredEdges);
         if (rtcBlock is not null) return rtcBlock;
 
         if (current.TimerState is TimerState.Armed &&
@@ -617,7 +634,7 @@ public sealed record ParticipantSessionSnapshot(
     double? RtcFitRmsMicroseconds = 0d,
     uint? RtcQueueDrops = 0,
     bool? RtcTemperatureValid = true,
-    byte? DiagnosticFlags = null);
+    byte? DiagnosticFlags = null, ushort? RtcRecoveredEdges = null, ulong? BootId = null);
 
 public sealed class ParticipantSessionTracker
 {
@@ -637,6 +654,9 @@ public sealed class ParticipantSessionTracker
     private uint? rtcQueueDrops;
     private bool? rtcTemperatureValid;
     private byte? diagnosticFlags;
+    private ushort? rtcRecoveredEdges;
+    private ulong? bootId;
+    private DateTimeOffset? pauseEndedAtUtc;
 
     public ParticipantSessionSnapshot Snapshot
     {
@@ -657,7 +677,7 @@ public sealed class ParticipantSessionTracker
                     rtcFitRmsMicroseconds,
                     rtcQueueDrops,
                     rtcTemperatureValid,
-                    diagnosticFlags);
+                    diagnosticFlags, rtcRecoveredEdges, bootId);
             }
         }
     }
@@ -689,6 +709,16 @@ public sealed class ParticipantSessionTracker
         }
     }
 
+    public void ObserveExecution(ExecutionStatusPacket status)
+    {
+        lock (gate)
+        {
+            if (bootId.HasValue && bootId != status.BootId) generation++;
+            bootId = status.BootId;
+            rtcRecoveredEdges = status.RtcRecoveredEdges;
+        }
+    }
+
     public void ObserveLocalTimestamp(long localTimestampMicroseconds)
     {
         if (localTimestampMicroseconds < 0)
@@ -715,6 +745,7 @@ public sealed class ParticipantSessionTracker
         lock (gate)
         {
             if (disconnectInferenceSuppressed) return;
+            if (pauseEndedAtUtc.HasValue && nowUtc - pauseEndedAtUtc.Value < offlineTimeout) return;
             if (lastStatusAtUtc.HasValue && nowUtc - lastStatusAtUtc.Value >= offlineTimeout)
             {
                 disconnectObserved = true;
@@ -732,10 +763,11 @@ public sealed class ParticipantSessionTracker
         }
     }
 
-    public void EndIntentionalStatusPause()
+    public void EndIntentionalStatusPause(DateTimeOffset? resumedAtUtc = null)
     {
         lock (gate)
         {
+            if (intentionalStatusPauseActive) pauseEndedAtUtc = resumedAtUtc ?? DateTimeOffset.UtcNow;
             intentionalStatusPauseActive = false;
             disconnectInferenceSuppressed = false;
         }
@@ -755,6 +787,9 @@ public sealed class ParticipantSessionTracker
             disconnectInferenceSuppressed = false;
             intentionalStatusPauseActive = false;
             lastStatusAtUtc = null;
+            pauseEndedAtUtc = null;
+            bootId = null;
+            rtcRecoveredEdges = null;
             ipAddress = null;
             timerState = null;
             commandId = null;
@@ -798,7 +833,7 @@ public sealed class ArmAcknowledgementTracker
         .ToArray();
 
     public IReadOnlyDictionary<string, AckResult> Rejections => results
-        .Where(pair => pair.Value is AckResult.NotSynced or AckResult.Late)
+        .Where(pair => pair.Value is AckResult.NotSynced or AckResult.Late or AckResult.Busy or AckResult.Invalid)
         .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
 
     public bool AllArmed => participants.All(id =>
