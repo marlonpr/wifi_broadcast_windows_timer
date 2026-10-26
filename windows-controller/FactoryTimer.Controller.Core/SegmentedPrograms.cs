@@ -89,7 +89,8 @@ public sealed record ProgramExecutionState(RepetitionProgram Program, ProgramSta
     long TargetMasterMicroseconds, string ControllerSessionId,
     IReadOnlyDictionary<string, ulong> BootIds, IReadOnlyDictionary<string, string> FirmwareBuildIds,
     string Message, bool RequiresOperator = false, int SegmentStartAttempts = 0,
-    DateTimeOffset? ReadinessWaitStartedAtUtc = null, double? MeasuredPairRatePpm = null, FleetRateEvidence? FleetRate = null)
+    DateTimeOffset? ReadinessWaitStartedAtUtc = null, double? MeasuredPairRatePpm = null, FleetRateEvidence? FleetRate = null,
+    IReadOnlyList<string>? PendingMissingParticipants = null, IReadOnlyDictionary<string, uint>? AutomaticRecoveryCounts = null)
 {
     public uint CompletedRepeatCount => (uint)Program.Segments.Where(s => s.Index < NextSegmentIndex).Aggregate(0UL, (sum, s) => sum + s.RepeatCount);
     public bool Active => Stage is not (ProgramStage.Completed or ProgramStage.Stopped);
@@ -265,16 +266,30 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
         State.BootIds.TryGetValue(x.Execution.DeviceId, out ulong boot) && boot == x.Execution.BootId &&
         State.FirmwareBuildIds.TryGetValue(x.Execution.DeviceId, out string? build) && build == x.Health.FirmwareBuildId;
 
+    // FINISHED is meaningful only when the last scheduled repeat and exact
+    // segment end are both reflected by the command-scoped EXEC payload.
+    private bool ConfirmedCurrentCompletion(ProgramDeviceObservation x)
+    {
+        ProgramSegment? segment = State.CurrentSegment;
+        return segment is not null && SameBoot(x) && Matches(x) &&
+            x.Execution.State == TimerState.Finished &&
+            x.Execution.CurrentRepeat == segment.LastRepeat &&
+            x.Execution.ElapsedSegmentSeconds == segment.Duration &&
+            x.Execution.ElapsedSegmentMicroseconds == checked((long)segment.Duration * 1_000_000) &&
+            x.Health.RemainingSeconds == 0;
+    }
+
     private void CompleteCurrent()
     {
         uint next = checked(State.CurrentSegmentIndex + 1);
         bool done = next > State.Program.Segments.Count;
         Commit(State with { NextSegmentIndex = next, Stage = done ? ProgramStage.Completed : ProgramStage.BetweenSegments,
             Message = done ? "Program complete." : "At 00:00; synchronizing the next segment.", RequiresOperator = false,
-            SegmentStartAttempts = 0, ReadinessWaitStartedAtUtc = null });
+            SegmentStartAttempts = 0, ReadinessWaitStartedAtUtc = null, PendingMissingParticipants = null });
     }
 
-    public ProgramReconciliation Reconcile(IReadOnlyDictionary<string, ProgramDeviceObservation> fresh, DateTimeOffset? observedAtUtc = null)
+    public ProgramReconciliation Reconcile(IReadOnlyDictionary<string, ProgramDeviceObservation> fresh,
+        DateTimeOffset? observedAtUtc = null, bool plannedSegmentEnded = false)
     {
         if (!State.Active) return new(ReconcileAction.Complete, State.Message);
         ProgramDeviceObservation[] present = State.Program.Participants.Where(fresh.ContainsKey).Select(id => fresh[id]).ToArray();
@@ -287,6 +302,27 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
                 Hold("Unknown active command or changed boot identity; observe the boards and resolve before resuming.");
                 return new(ReconcileAction.Hold, State.Message);
             }
+            // A fresh reply can still contain a snapshot frozen by an older
+            // firmware's disconnected CommandTask. Once our own same-session
+            // deadline has passed, do not trust its RemainingSeconds as a new
+            // countdown duration. Keep probing for exact FINISHED evidence,
+            // with the same bounded 180 s window used for absent devices.
+            if (plannedSegmentEnded && State.CurrentCommandId != 0 &&
+                State.Stage is (ProgramStage.Running or ProgramStage.WaitingForReadiness))
+            {
+                DateTimeOffset now = observedAtUtc ?? DateTimeOffset.UtcNow;
+                DateTimeOffset since = State.ReadinessWaitStartedAtUtc ?? now;
+                if (now - since >= ProductionRecoveryPolicy.ReadinessTimeout)
+                {
+                    Hold("At 00:00, participants still reported RUNNING/ARMED after 180 s; fleet held for operator review.");
+                    return new(ReconcileAction.Hold, State.Message);
+                }
+                string[] stale = active.Select(x => x.Execution.DeviceId).Order(StringComparer.Ordinal).ToArray();
+                Commit(State with { Stage = ProgramStage.WaitingForReadiness,
+                    ReadinessWaitStartedAtUtc = since,
+                    Message = "At 00:00; awaiting exact FINISHED evidence (up to 180 s): " + string.Join(", ", stale) });
+                return new(ReconcileAction.WaitForReadiness, State.Message);
+            }
             bool fault = missing || present.Any(x => !Matches(x) || !SameBoot(x));
             Commit(State with { Stage = ProgramStage.Running, RequiresOperator = State.RequiresOperator || present.Any(x => !Matches(x) || !SameBoot(x)),
                 Message = fault ? "A participant is missing or rebooted; healthy devices continue. Next segment will be held."
@@ -297,12 +333,33 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
         }
         if (missing)
         {
-            Hold("Required participants missing at the segment boundary: " + string.Join(", ", State.Program.Participants.Where(id => !fresh.ContainsKey(id))));
-            return new(ReconcileAction.Hold, State.Message);
+            string[] absent = State.Program.Participants.Where(id => !fresh.ContainsKey(id)).ToArray();
+            // A missing device at an ordinary RUNNING-segment boundary may return
+            // during a bounded wait. Never extend that automatic path to a held
+            // or unconfirmed ARM abort: no completion evidence can prove cancellation.
+            if (State.CurrentCommandId == 0 || State.RequiresOperator ||
+                State.Stage is not (ProgramStage.Running or ProgramStage.WaitingForReadiness))
+            {
+                Hold("Required participants missing; operator review: " + string.Join(", ", absent));
+                return new(ReconcileAction.Hold, State.Message);
+            }
+            DateTimeOffset now = observedAtUtc ?? DateTimeOffset.UtcNow;
+            DateTimeOffset since = State.ReadinessWaitStartedAtUtc ?? now;
+            if (now - since >= ProductionRecoveryPolicy.ReadinessTimeout)
+            {
+                Hold("Required participants remained missing for 180 s: " + string.Join(", ", absent));
+                return new(ReconcileAction.Hold, State.Message);
+            }
+            string[] pending = (State.PendingMissingParticipants ?? Array.Empty<string>())
+                .Concat(absent).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+            Commit(State with { Stage = ProgramStage.WaitingForReadiness, ReadinessWaitStartedAtUtc = since,
+                PendingMissingParticipants = pending,
+                Message = "At 00:00; waiting up to 180 s for missing participants: " + string.Join(", ", absent) });
+            return new(ReconcileAction.WaitForReadiness, State.Message);
         }
         if (State.CurrentCommandId != 0)
         {
-            if (!present.All(x => Matches(x) && SameBoot(x) && x.Execution.State == TimerState.Finished) || State.RequiresOperator)
+            if (!present.All(ConfirmedCurrentCompletion) || State.RequiresOperator)
             {
                 Hold("Execution or boot continuity needs operator review before the next segment.");
                 return new(ReconcileAction.Hold, State.Message);
@@ -325,6 +382,16 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
                     Message = "At 00:00; waiting up to 180 s for RTC recovery and fresh post-run temperature." });
                 return new(ReconcileAction.WaitForReadiness, State.Message);
             }
+            // Count automatic recoveries only after all original boards have
+            // supplied exact same-boot, same-command FINISHED evidence.
+            if (State.PendingMissingParticipants is { Count: > 0 } recovered)
+            {
+                var counts = (State.AutomaticRecoveryCounts ?? new Dictionary<string, uint>())
+                    .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
+                foreach (string id in recovered)
+                    counts[id] = checked(counts.GetValueOrDefault(id) + 1);
+                Commit(State with { AutomaticRecoveryCounts = counts });
+            }
             CompleteCurrent();
         }
         if (State.Stage == ProgramStage.Completed) return new(ReconcileAction.Complete, State.Message);
@@ -339,16 +406,39 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
 
     public void ResumeAfterOperatorReview(IReadOnlyDictionary<string, ProgramDeviceObservation> fresh)
     {
-        if (State.Stage != ProgramStage.Held || fresh.Count != State.Program.Participants.Count ||
-            State.Program.Participants.Any(id => !fresh.TryGetValue(id, out ProgramDeviceObservation? x) ||
-                !OperationalReady(x) || x.Execution.State is TimerState.Armed or TimerState.Running))
-            throw new InvalidOperationException("All frozen participants must be present, idle, and recovered.");
+        if (State.Stage != ProgramStage.Held)
+            throw new InvalidOperationException("RESUME requires a HELD program.");
+        string[] unavailable = State.Program.Participants.Select(id =>
+        {
+            fresh.TryGetValue(id, out ProgramDeviceObservation? x);
+            string reason = ProductionRecoveryPolicy.OperationalReadinessReason(x);
+            return reason == "READY" ? "" : id + ": " + reason;
+        }).Where(x => x.Length != 0).ToArray();
+        if (unavailable.Length != 0 || fresh.Count != State.Program.Participants.Count)
+            throw new InvalidOperationException("RESUME refused; frozen participants unready: " +
+                (unavailable.Length == 0 ? "unexpected participant inventory" : string.Join("; ", unavailable)));
         if (State.CurrentCommandId != 0)
         {
-            // Explicitly acknowledge a replacement board's missed repeats. Never
-            // replay a completed segment for the healthy boards.
-            if (!fresh.Values.Any(x => Matches(x) && SameBoot(x) && x.Execution.State == TimerState.Finished))
-                throw new InvalidOperationException("No confirmed completion; stop/reset this program before creating a replacement.");
+            // A matching FINISHED report from a single device never proves that
+            // the frozen fleet ran this segment. In particular, an ARM abort may
+            // have RESET some devices while another ran alone. An operator RESUME
+            // must not silently credit the non-running devices.
+            //
+            // A changed BootId explicitly denotes a replacement/rebooted board:
+            // the operator can accept that board's missed repetition on RESUME.
+            // Every original, same-boot participant must independently prove
+            // FINISHED for exactly the persisted plan/segment/command/T*.
+            string[] notFinished = State.Program.Participants
+                .Where(id => SameBoot(fresh[id]) && !ConfirmedCurrentCompletion(fresh[id]))
+                .ToArray();
+            if (notFinished.Length != 0)
+                throw new InvalidOperationException(
+                    "Cannot credit this segment: unchanged-boot participants lack matching FINISHED: " +
+                    string.Join(", ", notFinished) + ". Stop the program and start a new plan for the remaining repetitions; do not replay or skip this segment.");
+            if (!State.Program.Participants.Any(id => ConfirmedCurrentCompletion(fresh[id])))
+                throw new InvalidOperationException(
+                    "No original participant confirms completion. Unconfirmed ARM cannot be safely replayed; " +
+                    "prove cancellation before T* or stop/reset after reconciling the fleet.");
             CompleteCurrent();
         }
         else Commit(State with { Stage = ProgramStage.BetweenSegments, RequiresOperator = false,
@@ -373,6 +463,34 @@ public static class ProductionRecoveryPolicy
     public const int MaximumStartAttempts = 3; // initial attempt plus two retries
     public static readonly TimeSpan ReadinessTimeout = TimeSpan.FromSeconds(180);
     public static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
+
+    // A diagnostic view of the existing OperationalReady predicate. It changes
+    // no authorization threshold and is shared by operator refusals and audits.
+    public static string OperationalReadinessReason(ProgramDeviceObservation? x)
+    {
+        if (x is null) return "STATUS/EXEC missing";
+        var h = x.Health;
+        var e = x.Execution;
+        if (h.DeviceId != e.DeviceId) return "STATUS/EXEC device mismatch";
+        if (h.CommandId != e.CommandId) return "STATUS/EXEC command mismatch";
+        if (h.State != e.State) return "STATUS/EXEC state mismatch";
+        if (e.State is not (TimerState.Ready or TimerState.Finished))
+            return "timer state " + e.State + " is not idle";
+        if (!h.RtcQueueDrops.HasValue) return "RTC queue-drop telemetry missing";
+        if (h.RtcState != RtcDisciplineState.Locked) return "RTC state " + h.RtcState;
+        if (h.DiagnosticFlags != 0) return "DiagnosticFlags nonzero";
+        if (h.RtcFitPoints is not ushort points || points < 128) return "RTC fit points below 128";
+        if (h.RtcAcceptedEdges is not ulong accepted || accepted < 129) return "RTC accepted edges below 129";
+        if (h.RtcFitRmsMicroseconds is not double rms || !double.IsFinite(rms) || rms < 0)
+            return "RTC RMS invalid or unavailable";
+        if (rms > 3) return "RTC RMS " + rms.ToString("F3", System.Globalization.CultureInfo.InvariantCulture) + " us exceeds 3.0 us";
+        if (h.RtcTemperatureValid != true) return "RTC temperature unavailable";
+        if (string.IsNullOrWhiteSpace(h.FirmwareBuildId)) return "firmware build identity missing";
+        if (e.RtcRecoveredEdges < 129) return "RTC recovered edges below 129";
+        if (e.BootId == 0) return "boot identity missing";
+        return "READY";
+    }
+
     public static bool CanRetry(int attempts, bool safelyCancelled) => safelyCancelled && attempts < MaximumStartAttempts;
 }
 
@@ -419,12 +537,15 @@ public sealed class SegmentDriftMonitor
             bool discontinuity = innovation.HasValue && Math.Abs(innovation.Value) > 500;
             // Two consecutive estimates agreeing within 500 us over this interval
             // establish a new reference. Keep this interval's innovation visible,
-            // but allow subsequent sustained-rate alerts instead of latching forever.
+            // then use the new reference for subsequent innovation estimates.
             bool rebaseline = discontinuity && pendingRate.TryGetValue(item.Point.DeviceId, out double candidate) &&
                 Math.Abs(relative - candidate) * item.Interval / 1e6 <= 500;
             if (discontinuity && !rebaseline) pendingRate[item.Point.DeviceId] = relative;
             else pendingRate.Remove(item.Point.DeviceId);
-            int count = (!discontinuity || rebaseline) && Math.Abs(relative) > 1
+            // Sustained deviation is independent of phase innovation. One bad
+            // sync epoch can corrupt two adjacent intervals; three estimates
+            // beyond the limit also catch a steady ramp that never rebaselines.
+            int count = Math.Abs(relative) > 1
                 ? deviations.GetValueOrDefault(item.Point.DeviceId) + 1 : 0;
             deviations[item.Point.DeviceId] = count;
             if (!discontinuity || rebaseline) previousRelativeRate[item.Point.DeviceId] = relative;

@@ -101,6 +101,9 @@ public enum ProtocolParseError
     Cpu0MonitorMissedPeriods,
     FirmwareBuildId,
     DiagnosticFlags,
+    WifiDisconnectCount,
+    WifiReconnectCount,
+    WifiLastReconnectUptimeMs,
     Brightness,
 }
 
@@ -183,7 +186,10 @@ public sealed record StatusPacket(
     uint? Cpu0MonitorMissedPeriods = null,
     string? FirmwareBuildId = null,
     int StatusFieldCount = 0,
-    byte? DiagnosticFlags = null) : InboundPacket(DeviceId);
+    byte? DiagnosticFlags = null,
+    uint? WifiDisconnectCount = null,
+    uint? WifiReconnectCount = null,
+    ulong? WifiLastReconnectUptimeMs = null) : InboundPacket(DeviceId);
 
 // Separate post-run diagnostics keep monitor counters out of production STATUS.
 public sealed record RunDiagnosticPacket(
@@ -589,7 +595,7 @@ public static class FactoryProtocol
         // v6.23.15 appends missed-period count and ELF-SHA8 build identity (44 fields).
         // v6.23.19 appends a diagnostic-build byte (45 fields); queue drops use hex only in that form.
         if ((fields.Length == 9 || fields.Length == 10 || fields.Length == 14 ||
-             fields.Length == 28 || fields.Length == 31 || fields.Length == 42 || fields.Length == 44 || fields.Length == 45) &&
+             fields.Length == 28 || fields.Length == 31 || fields.Length == 42 || fields.Length == 44 || fields.Length == 45 || fields.Length == 48) &&
             fields[0] == Version2 && fields[1] == "STATUS")
         {
             if (!ValidDeviceId(fields[2]))
@@ -685,7 +691,7 @@ public static class FactoryProtocol
                     error = ProtocolParseError.RtcFitRms;
                     return false;
                 }
-                if (!uint.TryParse(fields[12], fields.Length == 45 ? NumberStyles.HexNumber : NumberStyles.None,
+                if (!uint.TryParse(fields[12], (fields.Length == 45 || fields.Length == 48) ? NumberStyles.HexNumber : NumberStyles.None,
                     CultureInfo.InvariantCulture, out uint queueDrops))
                 {
                     error = ProtocolParseError.RtcQueueDrops;
@@ -702,7 +708,7 @@ public static class FactoryProtocol
                 rtcTemperatureValid = fields[13] == "1";
             }
 
-            if (fields.Length == 28 || fields.Length == 31 || fields.Length == 42 || fields.Length == 44 || fields.Length == 45)
+            if (fields.Length == 28 || fields.Length == 31 || fields.Length == 42 || fields.Length == 44 || fields.Length == 45 || fields.Length == 48)
             {
                 if (!double.TryParse(fields[14], NumberStyles.Float, CultureInfo.InvariantCulture, out double ratePpm) ||
                     !double.IsFinite(ratePpm) || ratePpm is < -1_000_000d or > 1_000_000d)
@@ -780,7 +786,7 @@ public static class FactoryProtocol
                     return false;
                 }
 
-                if (fields.Length == 31 || fields.Length == 42 || fields.Length == 44 || fields.Length == 45)
+                if (fields.Length == 31 || fields.Length == 42 || fields.Length == 44 || fields.Length == 45 || fields.Length == 48)
                 {
                     NumberStyles continuityCounterStyle = fields.Length >= 44 ? NumberStyles.HexNumber : NumberStyles.None;
                     if (!ulong.TryParse(fields[28], continuityCounterStyle, CultureInfo.InvariantCulture, out ulong acceptedEdges))
@@ -803,7 +809,7 @@ public static class FactoryProtocol
                     rtcHoldoverEntries = holdoverEntries;
                 }
 
-                if (fields.Length == 42 || fields.Length == 44 || fields.Length == 45)
+                if (fields.Length == 42 || fields.Length == 44 || fields.Length == 45 || fields.Length == 48)
                 {
                     if (fields[31] != "0" && fields[31] != "1")
                     {
@@ -873,7 +879,7 @@ public static class FactoryProtocol
                     cpu0MonitorOverflow = monitorOverflow;
                     cpu0InterruptLevelMatch = fields[41] == "1";
 
-                    if (fields.Length == 44 || fields.Length == 45)
+                    if (fields.Length == 44 || fields.Length == 45 || fields.Length == 48)
                     {
                         if (!uint.TryParse(fields[42], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint missedPeriods))
                         {
@@ -916,7 +922,7 @@ public static class FactoryProtocol
                 }
             }
 
-            if (fields.Length == 45)
+            if (fields.Length == 45 || fields.Length == 48)
             {
                 string buildFlags = fields[44];
                 if (buildFlags.Length != 2 || !buildFlags.All(Uri.IsHexDigit) ||
@@ -928,6 +934,30 @@ public static class FactoryProtocol
                 diagnosticFlags = parsedFlags;
             }
 
+            uint? wifiDisconnectCount = null;
+            uint? wifiReconnectCount = null;
+            ulong? wifiLastReconnectUptimeMs = null;
+            if (fields.Length == 48)
+            {
+                if (!uint.TryParse(fields[45], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint dc))
+                {
+                    error = ProtocolParseError.WifiDisconnectCount;
+                    return false;
+                }
+                if (!uint.TryParse(fields[46], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint rc))
+                {
+                    error = ProtocolParseError.WifiReconnectCount;
+                    return false;
+                }
+                if (!ulong.TryParse(fields[47], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out ulong last))
+                {
+                    error = ProtocolParseError.WifiLastReconnectUptimeMs;
+                    return false;
+                }
+                wifiDisconnectCount = dc;
+                wifiReconnectCount = rc;
+                wifiLastReconnectUptimeMs = last;
+            }
             packet = new StatusPacket(
                 fields[2], commandId, state, remaining, rssi, channel, fields[8], rtcState,
                 rtcFitPoints, rtcFitRmsUs, rtcQueueDrops, rtcTemperatureValid,
@@ -940,7 +970,8 @@ public static class FactoryProtocol
                 cpu0MonitorWorstUs, cpu0MonitorWorstTask, cpu0CommitLateCount,
                 cpu0CommitWorstUs, cpu0CommitOverlap, cpu0WrongCoreCallbacks,
                 cpu0MonitorOverflow, cpu0InterruptLevelMatch, cpu0MonitorMissedPeriods,
-                firmwareBuildId, fields.Length, diagnosticFlags);
+                firmwareBuildId, fields.Length, diagnosticFlags,
+                wifiDisconnectCount, wifiReconnectCount, wifiLastReconnectUptimeMs);
             return true;
         }
 

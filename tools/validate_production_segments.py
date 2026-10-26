@@ -15,11 +15,14 @@ ANALYZER_TOOLS = Path(__file__).resolve().parents[2] / 'analyzer_v10_1' / 'tools
 sys.path.insert(0, str(ANALYZER_TOOLS))
 from analyzer_v10 import load_capture
 
+ASSOCIATION_WINDOW_US = 40_000
+COMMIT_LIMIT_US = 30_000
+
 FOOTER = re.compile(r'ANZ\|(SUMMARY|COUNTS|TRIPWIRE)\|(\d+)\|(\d+)\|(.+)')
 
 def evaluate(path, lengths, devices):
     replay = load_capture(path, prefer_qualified=True, train_min=970000,
-                          train_max=1030000, associate_us=40000)
+                          train_max=1030000, associate_us=ASSOCIATION_WINDOW_US)
     errors = list(replay.errors)
     absent = []
     footers = {}
@@ -67,6 +70,7 @@ def evaluate(path, lengths, devices):
     if len(trains) != len(lengths):
         errors.append(f'expected {len(lengths)} segments, found {len(trains)}')
     reports = []
+    timing_errors = []
     for index, (key, groups) in enumerate(trains):
         expected = lengths[index] + 1 if index < len(lengths) else None
         if expected != len(groups) or [g.boundary for g in groups] != list(range(len(groups))):
@@ -79,10 +83,13 @@ def evaluate(path, lengths, devices):
                 errors.append(f'segment {index+1}: changing channel identity')
                 break
         worst = max(g.span_us for g in groups)
-        if worst > 30000:
-            errors.append(f'segment {index+1}: worst COMMIT skew {worst} us exceeds 30000 us')
+        if worst > ASSOCIATION_WINDOW_US:
+            errors.append(f'segment {index+1}: group span exceeds {ASSOCIATION_WINDOW_US} us association window')
+        if worst > COMMIT_LIMIT_US:
+            timing_errors.append(f'segment {index+1}: worst COMMIT skew {worst} us exceeds {COMMIT_LIMIT_US} us')
         reports.append((index+1, len(groups), worst, groups[0].span_us))
-    return errors, absent, reports
+    structurally_complete = not errors and not absent
+    return errors + timing_errors, absent, reports, structurally_complete
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -95,9 +102,10 @@ def main():
         lengths = [int(s) for s in args.segment_seconds.split(',')]
         if not lengths or any(s < 1 or s > 6000 for s in lengths) or len(set(args.devices)) != 3:
             raise ValueError('Invalid segment geometry or channel identities')
-        errors, absent, reports = evaluate(args.capture, lengths, args.devices)
+        errors, absent, reports, structurally_complete = evaluate(args.capture, lengths, args.devices)
         for index, count, worst, start in reports:
             print(f'SEGMENT={index} BOUNDARIES={count} START_RANGE_US={start} WORST_RANGE_US={worst}')
+        print('CAPTURE_STRUCTURE=' + ('COMPLETE' if structurally_complete else 'INCOMPLETE'))
         if args.sync_csv:
             rows = list(csv.DictReader(args.sync_csv.open(encoding='utf-8-sig', newline='')))
             associations = {device: {r['Bssid'].upper() for r in rows if r['Device'] == device} for device in args.devices}

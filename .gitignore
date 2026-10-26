@@ -111,3 +111,6 @@ secrets.json
 Thumbs.db
 Desktop.ini
 /Directory.Build.zip
+
+**/__pycache__/
+*.py[cod]

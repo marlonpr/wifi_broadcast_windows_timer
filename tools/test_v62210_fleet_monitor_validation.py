@@ -9,7 +9,7 @@ tests=(ROOT/'tests/FactoryTimer.Protocol.Tests/FactoryProtocolTests.cs').read_te
 checks={
  'wire remains 42-field compatible': 'fields.Length == 42' in proto,
  'legacy STATUS compatibility retained': all(f'fields.Length == {n}' in proto for n in (9,10,14,28,31)),
- 'StatusFieldCount recorded by parser': 'StatusFieldCount = 0' in proto and 'fields.Length, diagnosticFlags);' in proto,
+ 'StatusFieldCount recorded by parser': 'StatusFieldCount = 0' in proto and 'fields.Length, diagnosticFlags,' in proto,
  'StatusFieldCount CSV column': 'StatusFieldCount' in vm and 'FirmwareBuildId,StatusFieldCount' in vm,
  'board hours from elapsed monitor window': 'clean_monitor_elapsed_us / 3_600_000_000.0' in sumtool,
  '251us cadence': '1_000_000.0 / 251.0' in sumtool,

@@ -3,6 +3,7 @@ using System.Net;
 using FactoryTimer.Controller.Core;
 using FactoryTimer.Protocol;
 using Microsoft.UI;
+using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media;
 
 namespace FactoryTimer.Controller;
@@ -82,6 +83,8 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
     public string ActualStartMasterTime { get => actualStartMasterTime; private set => SetProperty(ref actualStartMasterTime, value); }
     public string StartTimingError { get => startTimingError; private set => SetProperty(ref startTimingError, value); }
     public string Rssi { get => rssi; private set => SetProperty(ref rssi, value); }
+    public Visibility RssiNormalVisibility => HasWeakRssi ? Visibility.Collapsed : Visibility.Visible;
+    public Visibility RssiWarningVisibility => HasWeakRssi ? Visibility.Visible : Visibility.Collapsed;
     public string WifiChannelText { get => wifiChannelText; private set => SetProperty(ref wifiChannelText, value); }
     public string Bssid { get => bssid; private set => SetProperty(ref bssid, value); }
     public string LastStatusText { get => lastStatusText; private set => SetProperty(ref lastStatusText, value); }
@@ -262,6 +265,7 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         {
             rssiDbm = status.RssiDbm;
             Rssi = $"{status.RssiDbm.Value} dBm";
+            RefreshRssiAppearance();
         }
         if (status.WifiChannel.HasValue)
         {
@@ -507,9 +511,18 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         wifiChannel = null;
         bssidValue = null;
         Rssi = "—";
+        RefreshRssiAppearance();
         WifiChannelText = "—";
         Bssid = "—";
         ClearSynchronization();
+    }
+
+    private bool HasWeakRssi => rssiDbm is < -70;
+
+    private void RefreshRssiAppearance()
+    {
+        OnPropertyChanged(nameof(RssiNormalVisibility));
+        OnPropertyChanged(nameof(RssiWarningVisibility));
     }
 
     private static string FormatMilliseconds(long microseconds) =>

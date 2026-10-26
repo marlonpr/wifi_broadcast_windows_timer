@@ -4740,6 +4740,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
 
     private void ScheduleRecoveredRunningStatusPause(uint remainingSeconds)
     {
+        remainingSeconds = CapRecoveredRunningPauseToPlannedEnd(remainingSeconds);
         productionSilentRunCancellation?.Cancel();
         productionSilentRunCancellation?.Dispose();
         productionSilentRunCancellation = new CancellationTokenSource();
@@ -5010,7 +5011,9 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
             {
                 await udpService.SendTaggedStatusRequestAsync(
                     CreateCommandId(),
-                    target.Value,
+                    Devices.FirstOrDefault(d => d.DeviceId == target.Key) is DeviceViewModel current &&
+                        current.TryGetIpAddress(out IPAddress? updated) && updated is not null
+                        ? updated : target.Value,
                     "HEALTH_STATUS_REQUEST",
                     cancellationToken).ConfigureAwait(false);
             }
@@ -5088,17 +5091,17 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
             $"controller_health_{fileStamp}_{session.CommandId:X16}.csv");
 
         var builder = new StringBuilder();
-        builder.AppendLine(DeviceHealthSnapshot.CsvHeader + ",QualificationPhase,WarmupFirstCommandId,WarmupHistorySeconds,WarmupRateChangePpm,WarmupGoodFitPolls,WarmupReady,Start1RtcRatePpmVsRtc,RtcRateChangeSinceStart1Ppm,WarmupMaxRateChangePpm,WarmupRequiredFitPoints,ControllerSessionId");
+        builder.AppendLine(DeviceHealthSnapshot.CsvHeader + ",QualificationPhase,WarmupFirstCommandId,WarmupHistorySeconds,WarmupRateChangePpm,WarmupGoodFitPolls,WarmupReady,Start1RtcRatePpmVsRtc,RtcRateChangeSinceStart1Ppm,WarmupMaxRateChangePpm,WarmupRequiredFitPoints,ControllerSessionId,RssiDbm,WifiChannel,Bssid");
         foreach (string deviceId in session.ParticipantDeviceIds.OrderBy(id => id, StringComparer.Ordinal))
         {
             startHealth.TryGetValue(deviceId, out DeviceHealthSnapshot? start);
             postRunHealth.TryGetValue(deviceId, out DeviceHealthSnapshot? post);
             builder.AppendLine(DeviceHealthSnapshot.ToCsv(
                 session.CommandId, session.TargetMasterMicroseconds, session.DurationSeconds,
-                deviceId, "START", start) + WarmupHealthColumns(session, deviceId, start, start));
+                deviceId, "START", start) + WarmupHealthColumns(session, deviceId, start, start) + WifiHealthColumns(start));
             builder.AppendLine(DeviceHealthSnapshot.ToCsv(
                 session.CommandId, session.TargetMasterMicroseconds, session.DurationSeconds,
-                deviceId, "POST_RUN", post) + WarmupHealthColumns(session, deviceId, post, start));
+                deviceId, "POST_RUN", post) + WarmupHealthColumns(session, deviceId, post, start) + WifiHealthColumns(post));
         }
 
         if (session.WarmupProof is not null)
@@ -5126,6 +5129,12 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
             (proof is null ? ",,,0" : FormattableString.Invariant(
                 $"{proof.Readiness.HistorySeconds:R},{proof.Readiness.RateChangePpm:R},{proof.Readiness.GoodFitPolls},{(proof.Readiness.Ready ? 1 : 0)}")) +
             FormattableString.Invariant($",{firstRate:R},{rates.ChangePpm:R},{RtcWarmupHistory.MaximumRateChangePpm:R},{RtcWarmupHistory.RequiredFitPoints},{session.ControllerSessionId}");
+    }
+
+    private static string WifiHealthColumns(DeviceHealthSnapshot? health)
+    {
+        string bssid = health?.Bssid?.Replace("\"", "\"\"") ?? string.Empty;
+        return FormattableString.Invariant($",{health?.RssiDbm},{health?.WifiChannel},\"{bssid}\"");
     }
 
     private static long PositiveModulo(long value, long modulus)
@@ -5443,6 +5452,12 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
         byte? DiagnosticFlags)
     {
         public RunDiagnosticPacket? RunDiagnostic { get; init; }
+        public int? RssiDbm { get; init; }
+        public int? WifiChannel { get; init; }
+        public string? Bssid { get; init; }
+        public uint? WifiDisconnectCount { get; init; }
+        public uint? WifiReconnectCount { get; init; }
+        public ulong? WifiLastReconnectUptimeMs { get; init; }
 
         public const string CsvHeader =
             "RunCommandId,TStarMasterUs,DurationSeconds,DeviceId,Phase,StatusCaptured,CapturedMasterUs,TimerState,RtcState," +
@@ -5454,7 +5469,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
             "Cpu0MonitorMissedPeriods,Cpu0MonitorExpectedPeriods,FirmwareBuildId,StatusFieldCount," +
             "RunDiagnosticCaptured,RunDiagnosticValid,Cpu0MonitorPeriodUs,Cpu0MonitorThresholdUs," +
             "MonitorStartUs,TStarLocalUs,MonitorStartToTStarUs,MonitorEndUs,MonitorElapsedUs,FirstAlarmOffsetUs," +
-            "Cpu0EventsGe50Us,RtcDisciplineEventsGe50Us,WifiEventsGe50Us,UdpEventsGe50Us,CommitLateEvents,CommitGe300Us,MonitorRearmFailures,DiagnosticFlags";
+            "Cpu0EventsGe50Us,RtcDisciplineEventsGe50Us,WifiEventsGe50Us,UdpEventsGe50Us,CommitLateEvents,CommitGe300Us,MonitorRearmFailures,DiagnosticFlags,WifiDisconnectCount,WifiReconnectCount,WifiLastReconnectUptimeMs";
 
         public static DeviceHealthSnapshot FromStatus(StatusPacket status, long capturedMasterMicroseconds)
         {
@@ -5506,7 +5521,15 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                 status.Cpu0MonitorMissedPeriods,
                 status.FirmwareBuildId,
                 status.StatusFieldCount,
-                status.DiagnosticFlags);
+                status.DiagnosticFlags)
+            {
+                RssiDbm = status.RssiDbm,
+                WifiChannel = status.WifiChannel,
+                Bssid = status.Bssid,
+                WifiDisconnectCount = status.WifiDisconnectCount,
+                WifiReconnectCount = status.WifiReconnectCount,
+                WifiLastReconnectUptimeMs = status.WifiLastReconnectUptimeMs
+            };
         }
 
         public static string ToCsv(
@@ -5602,7 +5625,10 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                 UInt(health?.RunDiagnostic?.CommitGe300),
                 UInt(health?.RunDiagnostic?.RearmFailures),
                 health?.DiagnosticFlags is byte diagnosticFlags
-                    ? $"0x{diagnosticFlags:X2}" : string.Empty);
+                    ? $"0x{diagnosticFlags:X2}" : string.Empty,
+                UInt(health?.WifiDisconnectCount),
+                UInt(health?.WifiReconnectCount),
+                ULong(health?.WifiLastReconnectUptimeMs));
         }
     }
 

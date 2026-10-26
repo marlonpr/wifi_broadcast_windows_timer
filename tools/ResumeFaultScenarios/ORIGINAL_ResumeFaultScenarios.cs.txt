@@ -1,0 +1,85 @@
+// ResumeFaultScenarios.cs - replays segment-boundary and ARM-abort faults on
+// FactoryTimer.Controller.Core 6.23.6 (SegmentedProgramCoordinator).
+// Run as Program.cs of a net10.0 console project that references
+// windows-controller/FactoryTimer.Controller.Core/FactoryTimer.Controller.Core.csproj.
+//
+// Output on 6.23.6:
+// A (bench replica): Hold "Required participants missing..." -> RECONCILE still holds -> RESUME OK -> 1/2
+// B (unconfirmed abort, ESP05 never got START_AT): RECONCILE holds; RESUME REFUSED
+//   "No confirmed completion; stop/reset this program before creating a replacement." -> stuck at 1/2
+// C (unconfirmed abort, ESP05 ran alone, ESP02/03 RESET): RESUME OK -> "Program complete." 2/2
+//   although ESP02/03 never ran repeat 2
+// B and C are candidate ProductionSmoke cases: both should fail until RESUME is fixed.
+
+using FactoryTimer.Controller.Core;
+using FactoryTimer.Protocol;
+
+string[] ids = ["ESP02", "ESP03", "ESP05"];
+RepetitionProgram plan = RepetitionProgram.Create(0x6D503475DF7B7772, 180, 2, ids, 180);
+
+ProgramDeviceObservation Idle(string id, ulong command = 0, TimerState st = TimerState.Ready) => new(
+    new(id, 0x789, 0x456, 0, 0, command, st, 180, 1, 1, 1, 1, 0, 0, 0, 129),
+    new(id, command, st, 180, RtcState: RtcDisciplineState.Locked, RtcFitPoints: 129, RtcFitRmsMicroseconds: 0.5,
+        RtcQueueDrops: 0, RtcTemperatureValid: true, RtcAcceptedEdges: 1900, RtcInferredMissingEdges: 0,
+        RtcHoldoverEntries: 0, FirmwareBuildId: "a9a3c280", DiagnosticFlags: 0));
+ProgramDeviceObservation At(string id, ProgramExecutionState s, TimerState st) {
+    var i = Idle(id); var seg = s.CurrentSegment!;
+    long phase = st == TimerState.Finished ? seg.DurationSeconds * 1_000_000L : 5_000_000;
+    return new(i.Execution with { PlanId = plan.PlanId, SegmentIndex = seg.Index, CommandId = s.CurrentCommandId, State = st,
+        DurationSeconds = seg.DurationSeconds, RepeatCount = seg.RepeatCount, FirstRepeat = seg.FirstRepeat, TotalRepeats = plan.TotalRepeats,
+        CurrentRepeat = seg.FirstRepeat, ElapsedSegmentSeconds = (uint)(phase / 1_000_000), ElapsedSegmentMicroseconds = phase,
+        TargetMasterMicroseconds = s.TargetMasterMicroseconds, TStarLocalMicroseconds = 6_000_000 },
+        i.Health with { CommandId = s.CurrentCommandId, State = st, RemainingSeconds = st == TimerState.Finished ? 0u : 175u });
+}
+Dictionary<string, ProgramDeviceObservation> All(Func<string, ProgramDeviceObservation> f) => ids.ToDictionary(x => x, f);
+string Show(SegmentedProgramCoordinator c) => $"stage={c.State.Stage} repeats={c.State.CompletedRepeatCount}/2 next={c.State.NextSegmentIndex} cmd={c.State.CurrentCommandId:X} msg=\"{c.State.Message}\"";
+void Try(string label, Action a) { try { a(); Console.WriteLine($"  {label}: OK"); } catch (Exception e) { Console.WriteLine($"  {label}: REFUSED -> {e.Message}"); } }
+
+SegmentedProgramCoordinator SegmentOneDone() {
+    var c = new SegmentedProgramCoordinator(new Mem(), ProgramExecutionState.New(plan));
+    c.BeginPreparation(); c.RecordArm(0xE42F, 913_425_714, "s1", All(x => Idle(x)).Values.ToArray()); c.MarkRunning();
+    c.Reconcile(All(x => At(x, c.State, TimerState.Finished)));
+    return c;
+}
+
+Console.WriteLine("A. Bench replica: ESP05 silent at the segment-1 boundary, returns FINISHED on the same boot");
+{
+    var c = new SegmentedProgramCoordinator(new Mem(), ProgramExecutionState.New(plan));
+    c.BeginPreparation(); c.RecordArm(0xE42F, 913_425_714, "s1", All(x => Idle(x)).Values.ToArray()); c.MarkRunning();
+    var fin = All(x => At(x, c.State, TimerState.Finished));
+    var missing = new Dictionary<string, ProgramDeviceObservation>(fin); missing.Remove("ESP05");
+    Console.WriteLine("  boundary, ESP05 missing -> " + c.Reconcile(missing).Action + " | " + Show(c));
+    Console.WriteLine("  ESP05 back, RECONCILE   -> " + c.Reconcile(fin).Action + " | " + Show(c));
+    Try("RESUME", () => c.ResumeAfterOperatorReview(fin)); Console.WriteLine("  " + Show(c));
+}
+Console.WriteLine("B. Segment-2 ARM abort unconfirmed; ESP05 never received START_AT; all boards idle afterwards");
+{
+    var c = SegmentOneDone(); var seg1 = c.State.CurrentCommandId;
+    c.BeginPreparation(); c.RecordArm(0x21, 1_277_964_738, "s1", All(x => At2(x, seg1)).Values.ToArray());
+    c.Hold("ARM abort unconfirmed; no automatic retry. Reconcile the frozen boards before resuming.");
+    var fresh = new Dictionary<string, ProgramDeviceObservation> {
+        ["ESP02"] = Idle("ESP02", 0x31), ["ESP03"] = Idle("ESP03", 0x31), ["ESP05"] = At2("ESP05", seg1) };
+    Console.WriteLine("  RECONCILE -> " + c.Reconcile(fresh).Action + " | " + Show(c));
+    Try("RESUME", () => c.ResumeAfterOperatorReview(fresh)); Console.WriteLine("  " + Show(c));
+}
+Console.WriteLine("C. Segment-2 ARM abort unconfirmed; ESP05 did receive START_AT and runs alone; ESP02/03 were RESET");
+{
+    var c = SegmentOneDone(); var seg1 = c.State.CurrentCommandId;
+    c.BeginPreparation(); c.RecordArm(0x41, 1_277_964_738, "s1", All(x => At2(x, seg1)).Values.ToArray());
+    c.Hold("ARM abort unconfirmed; no automatic retry. Reconcile the frozen boards before resuming.");
+    var running = new Dictionary<string, ProgramDeviceObservation> {
+        ["ESP02"] = Idle("ESP02", 0x51), ["ESP03"] = Idle("ESP03", 0x51), ["ESP05"] = At("ESP05", c.State, TimerState.Running) };
+    Console.WriteLine("  RECONCILE while ESP05 runs -> " + c.Reconcile(running).Action + " | " + Show(c));
+    running["ESP05"] = At("ESP05", c.State, TimerState.Finished);
+    Console.WriteLine("  RECONCILE at its 00:00     -> " + c.Reconcile(running).Action + " | " + Show(c));
+    Try("RESUME", () => c.ResumeAfterOperatorReview(running)); Console.WriteLine("  " + Show(c));
+}
+
+// Segment-1 FINISHED evidence for a board, used as the idle state before segment 2.
+ProgramDeviceObservation At2(string id, ulong seg1Command) {
+    var i = Idle(id, seg1Command, TimerState.Finished);
+    return new(i.Execution with { PlanId = plan.PlanId, SegmentIndex = 1, DurationSeconds = 180, RepeatCount = 1, FirstRepeat = 1,
+        TotalRepeats = 2, ElapsedSegmentSeconds = 180, ElapsedSegmentMicroseconds = 180_000_000, TargetMasterMicroseconds = 913_425_714 },
+        i.Health with { RemainingSeconds = 0 });
+}
+sealed class Mem : IProgramStateStore { public ProgramExecutionState? Last; public ProgramExecutionState? Load() => Last; public void Save(ProgramExecutionState s) => Last = s; }

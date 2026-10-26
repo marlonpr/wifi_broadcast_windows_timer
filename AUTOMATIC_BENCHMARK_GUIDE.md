@@ -1,5 +1,7 @@
 # Automatic five-device benchmark
 
+Historical engineering workflow: the RUN BENCHMARK button and experimental controls described below are absent from the current production RC. For controller 6.23.3 Wi-Fi readings, use the timer cards and the controller_health CSV described in [V6_23_3_WIFI_STATUS.md](V6_23_3_WIFI_STATUS.md).
+
 ## Purpose
 
 This mode measures synchronization as an independent random/network event on every trial. It is intended to establish a statistically meaningful 5-device baseline before scaling to 10 and 15 timers.
@@ -114,7 +116,7 @@ The benchmark stops the 2-second periodic `STATUS_REQUEST` loop before each sync
 
 ## Wi-Fi diagnostics
 
-With the matching updated firmware, every STATUS packet also reports RSSI, Wi-Fi channel, and BSSID. The controller displays these values on each device card and exports `RssiDbm`, `WifiChannel`, and `Bssid` in the benchmark CSV. Legacy FCT1 STATUS remains accepted, but these three columns remain blank when legacy firmware is used.
+Controller 6.23.3 shows RSSI in dBm, Wi-Fi channel and AP BSSID below Last status on each timer card. The current `controller_health_*.csv` appends `RssiDbm,WifiChannel,Bssid` after all existing columns, using each START/POST_RUN STATUS snapshot. Missing values remain blank. The benchmark CSV described in this historical guide also contains these fields, but its benchmark action is not exposed in the production RC. Card readings reflect the last received STATUS and pause during active segments; this change sends no additional STATUS requests.
 
 ## v8 sample-count experiment
 

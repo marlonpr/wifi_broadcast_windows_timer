@@ -22,6 +22,7 @@ internal sealed partial class MainViewModel
     private bool recoveryProbeActive;
     private bool programManagementBusy;
     private readonly HashSet<ulong> auditedProgramCommands = [];
+    private readonly HashSet<string> auditedRtcWaitTransitions = new(StringComparer.Ordinal);
     private AwakeLease? programAwakeLease;
     private double repetitionsInput = 1;
     private double segmentCapSecondsInput = 6000;
@@ -159,6 +160,7 @@ internal sealed partial class MainViewModel
             productionProgram = new(programStore, state);
             programDriftAlert = "";
             programDrift.Reset();
+            auditedRtcWaitTransitions.Clear();
             programAwakeLease ??= new();
             await StartProgramLoopAsync();
         }
@@ -196,7 +198,16 @@ internal sealed partial class MainViewModel
             while (true)
             {
                 observations = await ProbeProgramAsync(deadline.Token);
-                ProgramReconciliation decision = productionProgram.Reconcile(observations);
+                ProgramExecutionState before = productionProgram.State;
+                // T* is only comparable to this PC clock within the original
+                // controller session; do not compare it after a PC restart.
+                bool plannedSegmentEnded = before.ControllerSessionId == controllerSessionId &&
+                    before.CurrentSegment is ProgramSegment scheduled &&
+                    MasterClock.NowMicroseconds >= checked(before.TargetMasterMicroseconds +
+                        (long)scheduled.Duration * 1_000_000L + 750_000L);
+                ProgramReconciliation decision = productionProgram.Reconcile(
+                    observations, plannedSegmentEnded: plannedSegmentEnded);
+                await WriteAutomaticRecoveryAuditAsync(before, productionProgram.State, observations);
                 StatusMessage = decision.Message;
                 UpdateProductionProgramText();
                 if (decision.Action != ReconcileAction.WaitForReadiness) return (observations, decision);
@@ -205,7 +216,11 @@ internal sealed partial class MainViewModel
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
         {
-            productionProgram.Hold("RTC/post-run temperature recovery exceeded 180 s; fleet remains at 00:00.");
+            ProgramExecutionState before = productionProgram.State;
+            productionProgram.Hold("Boundary recovery exceeded 180 s (missing device or RTC/temperature); fleet remains at 00:00.");
+            await WriteAutomaticRecoveryAuditAsync(before, productionProgram.State, observations);
+            StatusMessage = productionProgram.State.Message;
+            UpdateProductionProgramText();
             return (observations, new(ReconcileAction.Hold, productionProgram.State.Message));
         }
     }
@@ -313,6 +328,9 @@ internal sealed partial class MainViewModel
 
     private async Task PauseForRecoveredSegmentAsync(uint remaining, CancellationToken token)
     {
+        // Do not extend a same-session segment beyond our authoritative T*.
+        // Stale RUNNING reports after 00:00 must be re-probed, not trusted.
+        remaining = CapRecoveredRunningPauseToPlannedEnd(remaining);
         productionSilentRunActive = true;
         productionSilentRunOwnsExactWindow = false;
         foreach (DeviceViewModel device in ProgramParticipants()) device.BeginIntentionalStatusPause();
@@ -362,16 +380,56 @@ internal sealed partial class MainViewModel
         UpdateCanSend();
     }
 
+    // Only comparable with this PC's master clock while the same controller
+    // session remains alive. This also caps unsolicited STATUS/UI pauses.
+    private uint CapRecoveredRunningPauseToPlannedEnd(uint reportedSeconds)
+    {
+        ProgramExecutionState? state = productionProgram?.State;
+        if (state is null || state.ControllerSessionId != controllerSessionId ||
+            state.CurrentSegment is not ProgramSegment segment ||
+            state.TargetMasterMicroseconds <= 0 ||
+            state.Stage is not (ProgramStage.Running or ProgramStage.WaitingForReadiness))
+            return reportedSeconds;
+        long deadline = checked(state.TargetMasterMicroseconds +
+            (long)segment.Duration * 1_000_000L + 750_000L);
+        long untilDeadlineUs = deadline - MasterClock.NowMicroseconds;
+        uint seconds = untilDeadlineUs <= 0 ? 1u :
+            checked((uint)Math.Ceiling(untilDeadlineUs / 1_000_000d));
+        return Math.Min(reportedSeconds, seconds);
+    }
+
     private async Task ResumeProductionProgramCoreAsync()
     {
         if (productionProgram?.State.Stage != ProgramStage.Held || isSending || !programTask.IsCompleted) return;
         try
         {
             var observations = await ProbeProgramAsync(CancellationToken.None);
-            productionProgram.ResumeAfterOperatorReview(observations);
+            ProgramExecutionState before = productionProgram.State;
+            // Preserve the exact observations even if the authorization fails.
+            await WriteProgramResumeAuditAsync(before, observations);
+            try
+            {
+                productionProgram.ResumeAfterOperatorReview(observations);
+            }
+            catch (Exception refusal)
+            {
+                try { await WriteProgramResumeOutcomeAuditAsync(before, "REFUSED", refusal.Message); }
+                catch (Exception auditError) { StatusMessage = "RESUME refusal audit failed: " + auditError.Message; }
+                throw;
+            }
+            // Once the coordinator has accepted RESUME, audit I/O must never
+            // prevent continuation or silently leave an active plan stranded.
+            string? auditWarning = null;
+            try
+            {
+                await WriteProgramResumeOutcomeAuditAsync(before, "ACCEPTED", "Fleet qualified; RESUME authorized.");
+                await AppendRecoveredSegmentExecutionAuditAsync(before, observations);
+            }
+            catch (Exception auditError) { auditWarning = "RESUME audit incomplete: " + auditError.Message; }
             programDrift.Reset();
             programAwakeLease ??= new();
             await StartProgramLoopAsync();
+            if (auditWarning is not null) StatusMessage = auditWarning;
         }
         catch (Exception exception) { StatusMessage = "Fleet remains held: " + exception.Message; }
         UpdateProductionProgramText();
@@ -430,6 +488,184 @@ internal sealed partial class MainViewModel
             $"{productionProgram.State.Program.PlanId:X16},{productionSegmentContext.Index},{controllerSessionId},{device},{syncId:X16},{reply.Bssid ?? "UNKNOWN"},{sample.MasterT1Microseconds},{sample.DeviceT2Microseconds},{sample.DeviceT3Microseconds},{sample.MasterT4Microseconds},{sample.MasterMinusLocalOffsetMicroseconds},{sample.NetworkRttMicroseconds}"));
     }
 
+    private static string ProgramLogDirectory()
+    {
+        string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "FactoryTimer.Controller", "program_logs");
+        Directory.CreateDirectory(directory);
+        return directory;
+    }
+
+    private static string AuditCsvField(string? value) =>
+        "\"" + (value ?? "").Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+
+    private static string ResumeAuditFile(ProgramExecutionState state)
+    {
+        string directory = ProgramLogDirectory();
+        string stem = $"program_{state.Program.PlanId:X16}_segment_{state.CurrentSegmentIndex}";
+        string filename = Path.Combine(directory, stem + "_resume.csv");
+        // Never append 27-column rc2 rows to an earlier 18-column audit.
+        if (File.Exists(filename) &&
+            File.ReadLines(filename).FirstOrDefault()?.Contains("ReadinessReason", StringComparison.Ordinal) != true)
+            return Path.Combine(directory, stem + "_resume_rc2.csv");
+        return filename;
+    }
+
+    private const string ResumeAuditHeader =
+        "ObservedAtUtc,PlanId,SegmentId,ExpectedCommandId,Device,Present,BootId,ExpectedBootId,SameBoot,FirmwareBuildId,ExpectedBuildId,State,CommandId,PlanMatch,SegmentMatch,TargetMatch,CompletedUs,ExpectedDurationUs," +
+        "RtcState,RtcFitRmsUs,RtcFitPoints,RtcTemperatureValid,OperationalReady,ReadinessReason,Event,Outcome,DecisionReason";
+
+    private static async Task WriteProgramResumeAuditAsync(ProgramExecutionState state,
+        IReadOnlyDictionary<string, ProgramDeviceObservation> observations)
+    {
+        string filename = ResumeAuditFile(state);
+        var lines = new List<string>();
+        if (!File.Exists(filename)) lines.Add(ResumeAuditHeader);
+        ProgramSegment? segment = state.CurrentSegment;
+        long expectedDurationUs = segment is null ? 0L : checked((long)segment.Duration * 1_000_000);
+        string utc = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+        foreach (string id in state.Program.Participants)
+        {
+            state.BootIds.TryGetValue(id, out ulong expectedBoot);
+            state.FirmwareBuildIds.TryGetValue(id, out string? expectedBuild);
+            if (!observations.TryGetValue(id, out ProgramDeviceObservation? observed))
+            {
+                lines.Add(FormattableString.Invariant(
+                    $"{utc},{state.Program.PlanId:X16},{state.CurrentSegmentIndex},{state.CurrentCommandId:X16},{id},False,,{expectedBoot:X16},False,,{expectedBuild},MISSING,,,,,,{expectedDurationUs},,,,,{false},{AuditCsvField(ProductionRecoveryPolicy.OperationalReadinessReason(null))},OBSERVATION,PENDING,"));
+                continue;
+            }
+            var e = observed.Execution;
+            var h = observed.Health;
+            bool sameBoot = expectedBoot != 0 && e.BootId == expectedBoot &&
+                expectedBuild == h.FirmwareBuildId;
+            bool planMatch = e.PlanId == state.Program.PlanId;
+            bool segmentMatch = segment != null && e.SegmentIndex == segment.Index &&
+                e.DurationSeconds == segment.DurationSeconds && e.RepeatCount == segment.RepeatCount &&
+                e.FirstRepeat == segment.FirstRepeat && e.TotalRepeats == state.Program.TotalRepeats;
+            bool targetMatch = e.TargetMasterMicroseconds == state.TargetMasterMicroseconds;
+            string readyReason = ProductionRecoveryPolicy.OperationalReadinessReason(observed);
+            lines.Add(FormattableString.Invariant(
+                $"{utc},{state.Program.PlanId:X16},{state.CurrentSegmentIndex},{state.CurrentCommandId:X16},{id},True,{e.BootId:X16},{expectedBoot:X16},{sameBoot},{h.FirmwareBuildId},{expectedBuild},{e.State},{e.CommandId:X16},{planMatch},{segmentMatch},{targetMatch},{e.ElapsedSegmentMicroseconds},{expectedDurationUs},{h.RtcState},{h.RtcFitRmsMicroseconds},{h.RtcFitPoints},{h.RtcTemperatureValid},{readyReason == "READY"},{AuditCsvField(readyReason)},OBSERVATION,PENDING,"));
+        }
+        await File.AppendAllLinesAsync(filename, lines, Encoding.UTF8);
+    }
+
+    private static async Task WriteProgramResumeOutcomeAuditAsync(ProgramExecutionState state,
+        string outcome, string reason)
+    {
+        string filename = ResumeAuditFile(state);
+        string prefix = string.Join(",", new[] {
+            DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+            state.Program.PlanId.ToString("X16", System.Globalization.CultureInfo.InvariantCulture),
+            state.CurrentSegmentIndex.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            state.CurrentCommandId.ToString("X16", System.Globalization.CultureInfo.InvariantCulture),
+            "FLEET" }.Concat(Enumerable.Repeat("", 13)));
+        var lines = new List<string>();
+        if (!File.Exists(filename)) lines.Add(ResumeAuditHeader);
+        lines.Add(prefix + ",,,,,,,DECISION," + outcome + "," + AuditCsvField(reason));
+        await File.AppendAllLinesAsync(filename, lines, Encoding.UTF8);
+    }
+
+    private async Task WriteAutomaticRecoveryAuditAsync(ProgramExecutionState before,
+        ProgramExecutionState after, IReadOnlyDictionary<string, ProgramDeviceObservation> observations)
+    {
+        // Called after the silent window. Capture transitions only, not every poll.
+        string[] wasMissing = (before.PendingMissingParticipants ?? Array.Empty<string>()).ToArray();
+        string[] nowMissing = (after.PendingMissingParticipants ?? Array.Empty<string>()).ToArray();
+        var beforeCounts = before.AutomaticRecoveryCounts ?? new Dictionary<string, uint>();
+        var afterCounts = after.AutomaticRecoveryCounts ?? new Dictionary<string, uint>();
+        string[] newlyMissing = nowMissing.Except(wasMissing, StringComparer.Ordinal).ToArray();
+        string[] recovered = afterCounts.Keys.Where(id =>
+            afterCounts[id] > beforeCounts.GetValueOrDefault(id)).ToArray();
+        bool held = before.Stage != ProgramStage.Held && after.Stage == ProgramStage.Held;
+        bool timeout = held && after.Message.Contains("180 s", StringComparison.Ordinal);
+        var entries = new List<(string Device, string Event)>();
+        entries.AddRange(newlyMissing.Select(id => (id, "MISSING_WAIT")));
+        entries.AddRange(recovered.Select(id => (id, "AUTO_RECOVERED")));
+        if (after.Stage == ProgramStage.WaitingForReadiness)
+            foreach (string id in after.Program.Participants)
+                if (observations.TryGetValue(id, out ProgramDeviceObservation? obs) &&
+                    (obs.Execution.State is TimerState.Finished or TimerState.Ready) &&
+                    !SegmentedProgramCoordinator.OperationalReady(obs) &&
+                    auditedRtcWaitTransitions.Add($"{after.Program.PlanId:X16}:{after.CurrentSegmentIndex}:{id}"))
+                    entries.Add((id, "RTC_WAIT"));
+        if (held)
+        {
+            foreach (string id in after.Program.Participants)
+            {
+                if (!observations.TryGetValue(id, out ProgramDeviceObservation? obs))
+                    entries.Add((id, timeout ? "TIMEOUT_HOLD" : "RECOVERY_HOLD"));
+                else if (!SegmentedProgramCoordinator.OperationalReady(obs))
+                    entries.Add((id, timeout ?
+                        (obs.Execution.State is TimerState.Armed or TimerState.Running ? "STALE_RUNNING_TIMEOUT_HOLD" : "RTC_TIMEOUT_HOLD")
+                        : "READINESS_HOLD"));
+            }
+            if (!entries.Any(x => x.Event.EndsWith("HOLD", StringComparison.Ordinal)))
+                entries.Add(("FLEET", timeout ? "TIMEOUT_HOLD" : "RECOVERY_HOLD"));
+        }
+        if (entries.Count == 0) return;
+        string filename = Path.Combine(ProgramLogDirectory(), $"program_{after.Program.PlanId:X16}_recovery.csv");
+        const string oldHeader = "Utc,PlanId,SegmentId,Event,Device,Count,BootId,CommandId,State";
+        const string extraHeader = ",Reason,RtcState,RtcFitRmsUs,RtcFitPoints,RtcTemperatureValid";
+        bool legacy = File.Exists(filename) &&
+            File.ReadLines(filename).FirstOrDefault()?.Contains("Reason", StringComparison.Ordinal) != true;
+        var lines = new List<string>();
+        if (!File.Exists(filename)) lines.Add(oldHeader + extraHeader);
+        foreach ((string id, string ev) in entries.Distinct())
+        {
+            observations.TryGetValue(id, out ProgramDeviceObservation? obs);
+            afterCounts.TryGetValue(id, out uint count);
+            string line = FormattableString.Invariant(
+                $"{DateTimeOffset.UtcNow:O},{after.Program.PlanId:X16},{after.CurrentSegmentIndex},{ev},{id},{count},{obs?.Execution.BootId:X16},{obs?.Execution.CommandId:X16},{obs?.Execution.State}");
+            if (!legacy)
+            {
+                string reason = id == "FLEET" ? after.Message : ProductionRecoveryPolicy.OperationalReadinessReason(obs);
+                line += FormattableString.Invariant(
+                    $",{AuditCsvField(reason)},{obs?.Health.RtcState},{obs?.Health.RtcFitRmsMicroseconds},{obs?.Health.RtcFitPoints},{obs?.Health.RtcTemperatureValid}");
+            }
+            lines.Add(line);
+        }
+        await File.AppendAllLinesAsync(filename, lines, Encoding.UTF8);
+    }
+
+    private static async Task AppendRecoveredSegmentExecutionAuditAsync(ProgramExecutionState state,
+        IReadOnlyDictionary<string, ProgramDeviceObservation> observations)
+    {
+        // On HOLD the segment's execution audit contains only reachable boards.
+        // After a successful RESUME, append exact same-boot completion evidence
+        // for recovered originals without overwriting or duplicating prior rows.
+        if (state.CurrentCommandId == 0 || state.CurrentSegment is not ProgramSegment segment) return;
+        string filename = Path.Combine(ProgramLogDirectory(),
+            $"program_{state.Program.PlanId:X16}_segment_{segment.Index}_execution.csv");
+        if (!File.Exists(filename)) return;
+        string[] existing = await File.ReadAllLinesAsync(filename, Encoding.UTF8);
+        var recorded = existing.Skip(1).Select(line => line.Split(','))
+            .Where(fields => fields.Length >= 4).Select(fields => fields[3])
+            .ToHashSet(StringComparer.Ordinal);
+        var additions = new List<string>();
+        foreach (string id in state.Program.Participants)
+        {
+            if (recorded.Contains(id) || !observations.TryGetValue(id, out ProgramDeviceObservation? x)) continue;
+            var e = x.Execution;
+            var h = x.Health;
+            if (!state.BootIds.TryGetValue(id, out ulong boot) || boot == 0 || boot != e.BootId ||
+                !state.FirmwareBuildIds.TryGetValue(id, out string? build) || build != h.FirmwareBuildId ||
+                e.PlanId != state.Program.PlanId || e.SegmentIndex != segment.Index ||
+                e.CommandId != state.CurrentCommandId || h.CommandId != e.CommandId ||
+                e.State != TimerState.Finished || h.State != TimerState.Finished ||
+                e.DurationSeconds != segment.DurationSeconds || e.RepeatCount != segment.RepeatCount ||
+                e.FirstRepeat != segment.FirstRepeat || e.TotalRepeats != state.Program.TotalRepeats ||
+                e.TargetMasterMicroseconds != state.TargetMasterMicroseconds ||
+                e.CurrentRepeat != segment.LastRepeat || e.ElapsedSegmentSeconds != segment.Duration ||
+                e.ElapsedSegmentMicroseconds != checked((long)segment.Duration * 1_000_000L) ||
+                h.RemainingSeconds != 0) continue;
+            additions.Add(FormattableString.Invariant(
+                $"{e.PlanId:X16},{e.SegmentIndex},{e.CommandId:X16},{e.DeviceId},{e.BootId:X16},{h.FirmwareBuildId},{e.State},{e.CurrentRepeat},{e.ElapsedSegmentSeconds},{e.ElapsedSegmentMicroseconds},{e.RtcRecoveredEdges},{h.RtcAcceptedEdges},{h.RtcInferredMissingEdges},{h.RtcHoldoverEntries},{h.RtcQueueDrops},{h.RtcTemperatureValid},{h.DiagnosticFlags:X},{h.WifiDisconnectCount},{h.WifiReconnectCount},{h.WifiLastReconnectUptimeMs}"));
+        }
+        if (additions.Count != 0)
+            await File.AppendAllLinesAsync(filename, additions, Encoding.UTF8);
+    }
+
     private async Task WriteProgramSegmentAuditAsync(IReadOnlyDictionary<string, ProgramDeviceObservation> observations)
     {
         if (productionProgram is null) return;
@@ -443,9 +679,9 @@ internal sealed partial class MainViewModel
             await File.WriteAllLinesAsync(stem + "_sync.csv", new[] {
                 "PlanId,SegmentId,ControllerSessionId,Device,SyncId,Bssid,T1,T2,T3,T4,MasterMinusLocalUs,RttUs" }.Concat(programSyncSamples), Encoding.UTF8);
         var executionLines = new List<string> {
-            "PlanId,SegmentId,CommandId,Device,BootId,FirmwareBuildId,State,Repeat,ElapsedSeconds,ElapsedUs,RecoveredEdges,AcceptedEdges,MissingEdges,Holdovers,QueueDrops,TemperatureValid,DiagnosticFlags" };
+            "PlanId,SegmentId,CommandId,Device,BootId,FirmwareBuildId,State,Repeat,ElapsedSeconds,ElapsedUs,RecoveredEdges,AcceptedEdges,MissingEdges,Holdovers,QueueDrops,TemperatureValid,DiagnosticFlags,WifiDisconnectCount,WifiReconnectCount,WifiLastReconnectUptimeMs" };
         executionLines.AddRange(observations.Values.OrderBy(x => x.Execution.DeviceId).Select(x => FormattableString.Invariant(
-            $"{x.Execution.PlanId:X16},{x.Execution.SegmentIndex},{x.Execution.CommandId:X16},{x.Execution.DeviceId},{x.Execution.BootId:X16},{x.Health.FirmwareBuildId},{x.Execution.State},{x.Execution.CurrentRepeat},{x.Execution.ElapsedSegmentSeconds},{x.Execution.ElapsedSegmentMicroseconds},{x.Execution.RtcRecoveredEdges},{x.Health.RtcAcceptedEdges},{x.Health.RtcInferredMissingEdges},{x.Health.RtcHoldoverEntries},{x.Health.RtcQueueDrops},{x.Health.RtcTemperatureValid},{x.Health.DiagnosticFlags:X}")));
+            $"{x.Execution.PlanId:X16},{x.Execution.SegmentIndex},{x.Execution.CommandId:X16},{x.Execution.DeviceId},{x.Execution.BootId:X16},{x.Health.FirmwareBuildId},{x.Execution.State},{x.Execution.CurrentRepeat},{x.Execution.ElapsedSegmentSeconds},{x.Execution.ElapsedSegmentMicroseconds},{x.Execution.RtcRecoveredEdges},{x.Health.RtcAcceptedEdges},{x.Health.RtcInferredMissingEdges},{x.Health.RtcHoldoverEntries},{x.Health.RtcQueueDrops},{x.Health.RtcTemperatureValid},{x.Health.DiagnosticFlags:X},{x.Health.WifiDisconnectCount},{x.Health.WifiReconnectCount},{x.Health.WifiLastReconnectUptimeMs}")));
         await File.WriteAllLinesAsync(stem + "_execution.csv", executionLines, Encoding.UTF8);
         if (state.ControllerSessionId != controllerSessionId)
         {

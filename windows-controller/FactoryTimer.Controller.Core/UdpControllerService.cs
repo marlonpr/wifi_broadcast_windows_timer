@@ -276,6 +276,9 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         IPAddress destination,
         CancellationToken token = default)
     {
+#if FACTORY_ARM_FAULT_TEST
+        ArmFaultTestHook.ObserveStartAt(command, destination);
+#endif
         SocketSession activeSession = GetActiveSession();
         byte[] packet = FactoryProtocol.SerializeCommandBytes(command);
         await SendTracedAsync(
@@ -505,6 +508,15 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
         int attempt,
         CancellationToken cancellationToken)
     {
+#if FACTORY_ARM_FAULT_TEST
+        if (ArmFaultTestHook.DropOutbound(packetType, correlationId, destination.Address))
+        {
+            // Do not emit PacketSent: no datagram reached the network.
+            System.Diagnostics.Debug.WriteLine(
+                $"ARM_FAULT_TEST DROP_TX type={packetType} dst={destination.Address} command={correlationId:X16}");
+            return 0;
+        }
+#endif
         // Timestamp immediately before handing the datagram to the socket. The
         // trace handler runs only after SendAsync completes, so trace processing
         // cannot move the timestamp itself. MainViewModel only enqueues this
@@ -614,6 +626,15 @@ public sealed class UdpControllerService : IStatusRequestTransport, IDisposable
             out InboundPacket? packet,
             out ProtocolParseError error))
         {
+#if FACTORY_ARM_FAULT_TEST
+            if (packet is AckPacket injectedAck &&
+                ArmFaultTestHook.DropInboundAck(injectedAck, result.RemoteEndPoint.Address))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"ARM_FAULT_TEST DROP_ACK source={result.RemoteEndPoint.Address} command={injectedAck.CommandId:X16}");
+                return;
+            }
+#endif
             if (packet is SyncReplyPacket syncReply &&
                 syncReplyWaiters.TryGetValue(syncReply.SyncId, out TaskCompletionSource<ReceivedSyncReply>? syncWaiter))
             {

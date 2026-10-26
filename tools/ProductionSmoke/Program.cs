@@ -54,10 +54,111 @@ finished["ESP03"]=Idle("ESP03",0x457);
 Check(rebooted.Reconcile(finished).Action==ReconcileAction.Hold,"reboot holds next segment");
 rebooted.ResumeAfterOperatorReview(finished);
 Check(rebooted.State.NextSegmentIndex==2 && rebooted.State.BootIds["ESP03"]==0x457,"explicit review skips failed board repeats, no replay");
+// RESUME hardening: a partial ARM must not be credited when only one
+// original device ran. The test deliberately reproduces ResumeFaultScenarios C.
+var partialArm = new SegmentedProgramCoordinator(new MemoryStore(), restarted.State);
+partialArm.BeginPreparation();
+partialArm.RecordArm(0xA101, 25_000_000, "session1", IdleFleet().Values.ToArray());
+partialArm.Hold("ARM abort unconfirmed; some devices may execute the abandoned command.");
+var loneFinished = plan.Participants.ToDictionary(id => id,
+    id => id == "ESP01" ? At(id, partialArm.State, TimerState.Finished, 5999L * 1_000_000) : Idle(id));
+Reject(() => partialArm.ResumeAfterOperatorReview(loneFinished),
+    "unconfirmed partial ARM: one FINISHED cannot credit entire segment");
+Check(partialArm.State.Stage == ProgramStage.Held && partialArm.State.NextSegmentIndex == 2 &&
+    partialArm.State.CompletedRepeatCount == 1,
+    "partial ARM remains held and preserves prior repetition accounting");
+// Previous-command/RESET observations cannot prove that an abandoned ARM
+// never executed. An unconfirmed no-FINISHED snapshot must not be replayed.
+var noCompletion = new SegmentedProgramCoordinator(new MemoryStore(), restarted.State);
+noCompletion.BeginPreparation();
+noCompletion.RecordArm(0xA102, 26_000_000, "session1", IdleFleet().Values.ToArray());
+noCompletion.Hold("ARM abort unconfirmed; no automatic retry.");
+Reject(() => noCompletion.ResumeAfterOperatorReview(IdleFleet()),
+    "unconfirmed ARM: no FINISHED cannot authorize an unsafe replay");
+Check(noCompletion.State.Stage == ProgramStage.Held && noCompletion.State.NextSegmentIndex == 2,
+    "unconfirmed abort preserves the same segment until cancellation can be proved");
+// Healthy same-boot fleet can be credited exactly once after a transient
+// boundary outage; device reboot is an explicit accepted miss only.
+var verifiedResume = new SegmentedProgramCoordinator(new MemoryStore(), armed);
+verifiedResume.MarkRunning();
+var allFinishedForResume = plan.Participants.ToDictionary(id => id,
+    id => At(id, verifiedResume.State, TimerState.Finished, 5999L * 1_000_000));
+var withoutOne = new Dictionary<string, ProgramDeviceObservation>(allFinishedForResume);
+withoutOne.Remove("ESP03");
+Check(verifiedResume.Reconcile(withoutOne).Action == ReconcileAction.WaitForReadiness,
+    "transiently missing board waits at segment boundary");
+Check(verifiedResume.Reconcile(allFinishedForResume).Action == ReconcileAction.SynchronizeNextSegment,
+    "same-boot fleet FINISHED automatically advances from bounded wait");
+Check(verifiedResume.State.CompletedRepeatCount == 1 && verifiedResume.State.NextSegmentIndex == 2,
+    "all original FINISHED reports credit boundary segment once");
+var mismatchedFinish = new SegmentedProgramCoordinator(new MemoryStore(), armed);
+mismatchedFinish.Hold("Boundary missing participant");
+var oldCommand = allFinishedForResume.ToDictionary(x => x.Key, x => x.Value);
+oldCommand["ESP03"] = oldCommand["ESP03"] with {
+    Execution = oldCommand["ESP03"].Execution with { CommandId = 0xA200 },
+    Health = oldCommand["ESP03"].Health with { CommandId = 0xA200 } };
+Reject(() => mismatchedFinish.ResumeAfterOperatorReview(oldCommand),
+    "same-boot FINISHED with wrong CommandId cannot be counted");
+var shortCompletion = new SegmentedProgramCoordinator(new MemoryStore(), armed);
+shortCompletion.Hold("Boundary missing participant");
+var shortFleet = allFinishedForResume.ToDictionary(x => x.Key, x => x.Value);
+shortFleet["ESP03"] = shortFleet["ESP03"] with {
+    Execution = shortFleet["ESP03"].Execution with { ElapsedSegmentMicroseconds =
+        shortFleet["ESP03"].Execution.ElapsedSegmentMicroseconds - 1 } };
+Reject(() => shortCompletion.ResumeAfterOperatorReview(shortFleet),
+    "FINISHED with incomplete elapsed phase cannot be counted");
+
 var lost = new SegmentedProgramCoordinator(store,armed);
+lost.MarkRunning();
 finished.Remove("ESP03");
-Check(lost.Reconcile(finished).Action==ReconcileAction.Hold,"missing required participant holds fleet");
-Reject(()=>lost.ResumeAfterOperatorReview(finished),"missing participant cannot resume");
+Check(lost.Reconcile(finished).Action==ReconcileAction.WaitForReadiness,"missing participant enters bounded boundary recovery");
+Reject(()=>lost.ResumeAfterOperatorReview(finished),"missing participant cannot resume before HOLD");
+// Ordinary segment-boundary reconnect: no additional START until matching
+// FINISHED proof from every original participant and readiness passes.
+DateTimeOffset boundaryTime = DateTimeOffset.UtcNow;
+var autoRecovered = new SegmentedProgramCoordinator(new MemoryStore(), armed);
+autoRecovered.MarkRunning();
+var allAfterBoundary = plan.Participants.ToDictionary(id => id,
+    id => At(id, autoRecovered.State, TimerState.Finished, 5999L * 1_000_000));
+var wifiOutage = new Dictionary<string, ProgramDeviceObservation>(allAfterBoundary);
+wifiOutage.Remove("ESP03");
+var ambiguousArm = new SegmentedProgramCoordinator(new MemoryStore(), armed);
+Check(ambiguousArm.Reconcile(wifiOutage, boundaryTime).Action == ReconcileAction.Hold,
+    "unknown ARM outcome cannot enter automatic missing-device wait");
+Check(autoRecovered.Reconcile(wifiOutage, boundaryTime).Action == ReconcileAction.WaitForReadiness,
+    "boundary missing: wait without advancing repeats");
+Check(autoRecovered.State.CompletedRepeatCount == 0 && autoRecovered.State.PendingMissingParticipants!.Contains("ESP03"),
+    "missing identity persisted during bounded wait");
+Check(autoRecovered.Reconcile(wifiOutage, boundaryTime.AddSeconds(179)).Action == ReconcileAction.WaitForReadiness,
+    "missing board waits up to the 180s deadline");
+Check(autoRecovered.Reconcile(allAfterBoundary, boundaryTime.AddSeconds(179.5)).Action == ReconcileAction.SynchronizeNextSegment,
+    "same-boot exact FINISHED after reconnect resumes automatically");
+Check(autoRecovered.State.CompletedRepeatCount == 1 &&
+    autoRecovered.State.AutomaticRecoveryCounts!.GetValueOrDefault("ESP03") == 1,
+    "auto reconnect increments persisted per-device recovery count exactly once");
+var notBack = new SegmentedProgramCoordinator(new MemoryStore(), armed);
+notBack.MarkRunning();
+Check(notBack.Reconcile(wifiOutage, boundaryTime).Action == ReconcileAction.WaitForReadiness,
+    "permanently missing board starts timeout");
+Check(notBack.Reconcile(wifiOutage, boundaryTime.AddSeconds(180)).Action == ReconcileAction.Hold &&
+    notBack.State.NextSegmentIndex == 1,"missing board after180s holds without starting next segment");
+var rebootReturn = new SegmentedProgramCoordinator(new MemoryStore(), armed);
+rebootReturn.MarkRunning();
+rebootReturn.Reconcile(wifiOutage, boundaryTime);
+var replacedBoot = allAfterBoundary.ToDictionary(x => x.Key, x => x.Value);
+replacedBoot["ESP03"] = replacedBoot["ESP03"] with {
+    Execution = replacedBoot["ESP03"].Execution with { BootId = 0x999 } };
+Check(rebootReturn.Reconcile(replacedBoot, boundaryTime.AddSeconds(20)).Action == ReconcileAction.Hold,
+    "reconnected device with changed boot is never auto credited");
+var wrongAfterOutage = new SegmentedProgramCoordinator(new MemoryStore(), armed);
+wrongAfterOutage.MarkRunning();
+wrongAfterOutage.Reconcile(wifiOutage, boundaryTime);
+var wrongCommand = allAfterBoundary.ToDictionary(x => x.Key, x => x.Value);
+wrongCommand["ESP03"] = wrongCommand["ESP03"] with {
+    Execution = wrongCommand["ESP03"].Execution with { CommandId = 0xFACE },
+    Health = wrongCommand["ESP03"].Health with { CommandId = 0xFACE } };
+Check(wrongAfterOutage.Reconcile(wrongCommand, boundaryTime.AddSeconds(20)).Action == ReconcileAction.Hold,
+    "reconnected device with different command never auto credited");
 var foreign = new SegmentedProgramCoordinator(store,armed);
 active["ESP03"]=At("ESP03",armed,TimerState.Running,1) with { Execution=At("ESP03",armed,TimerState.Running,1).Execution with { CommandId=99 } };
 Check(foreign.Reconcile(active).Action==ReconcileAction.Hold,"foreign active command never duplicated");
@@ -79,6 +180,18 @@ Check(recoveredRtc.Reconcile(finished,waitStarted.AddSeconds(129)).Action==Recon
 var cancelled = new SegmentedProgramCoordinator(store,ProgramExecutionState.New(plan));
 Dictionary<string,ProgramDeviceObservation> ResetProof(ulong reset) => IdleFleet().ToDictionary(x=>x.Key,x=>new ProgramDeviceObservation(
     x.Value.Execution with { CommandId=reset }, x.Value.Health with { CommandId=reset }));
+// A fault while segment 2 is arming must preserve already completed repeats.
+var segmentTwoStore = new MemoryStore();
+var segmentTwoFault = new SegmentedProgramCoordinator(segmentTwoStore, restarted.State);
+Check(segmentTwoFault.State.NextSegmentIndex==2 && segmentTwoFault.State.CompletedRepeatCount==1,"segment2 fixture starts after confirmed segment1 completion");
+segmentTwoFault.BeginPreparation();
+segmentTwoFault.RecordArm(801,20_000_000,"session1",ResetProof(800).Values.ToArray());
+segmentTwoFault.ConfirmArmAbortForRetry(802,19_000_000,ResetProof(802));
+Check(segmentTwoFault.State.NextSegmentIndex==2 && segmentTwoFault.State.CompletedRepeatCount==1 && segmentTwoFault.State.CurrentCommandId==0,"segment2 safe ARM abort retains completed repetitions and retry position");
+var recoveredSegmentTwo = new SegmentedProgramCoordinator(segmentTwoStore,segmentTwoStore.Load()!);
+recoveredSegmentTwo.BeginPreparation();
+recoveredSegmentTwo.RecordArm(803,25_000_000,"session1",ResetProof(802).Values.ToArray());
+Check(recoveredSegmentTwo.State.CurrentSegmentIndex==2 && recoveredSegmentTwo.State.CurrentSegment!.FirstRepeat==2 && recoveredSegmentTwo.State.CurrentCommandId==803,"restart after safe abort arms segment2 once with a new command");
 for(int attempt=1;attempt<=3;attempt++) {
     cancelled.BeginPreparation();long retryTarget=9000000+attempt*10000000L;
     cancelled.RecordArm((ulong)(20+attempt),retryTarget,"session1",IdleFleet().Values.ToArray());
@@ -143,8 +256,8 @@ drift.Reset();drift.Observe(Points(1,0));drift.Observe(Points(540_000_001,0));
 Check(drift.Observe(Points(1_080_000_001,810)).Single(x=>x.DeviceId=="ESP01").ValidationRequired,"first 1.5ppm step innovation");
 Check(drift.Observe(Points(1_620_000_001,1620)).Single(x=>x.DeviceId=="ESP01").ValidationRequired,"second stable step remains visible and rebaselines");
 var settledStep=drift.Observe(Points(2_160_000_001,2430)).Single(x=>x.DeviceId=="ESP01");
-Check(!settledStep.ValidationRequired&&!settledStep.SustainedDeviation,"new reference clears innovation; sustained streak progresses");
-Check(drift.Observe(Points(2_700_000_001,3240)).Single(x=>x.DeviceId=="ESP01").SustainedDeviation,"mid-program step reaches three confirmed sustained estimates");
+Check(!settledStep.ValidationRequired&&settledStep.SustainedDeviation,"third 1.5ppm estimate flags sustained deviation after rebaseline");
+Check(drift.Observe(Points(2_700_000_001,3240)).Single(x=>x.DeviceId=="ESP01").SustainedDeviation,"mid-program sustained deviation remains visible");
 drift.Reset();drift.Observe(Points(1,0));drift.Observe(Points(6_000_000_001,0));
 drift.Observe(Points(12_000_000_001,600));drift.Observe(Points(18_000_000_001,1200));
 var smallStep=drift.Observe(Points(24_000_000_001,1800)).Single(x=>x.DeviceId=="ESP01");
@@ -154,6 +267,20 @@ drift.Observe(Points(1_080_000_001,810));drift.Observe(Points(1_620_000_001,2430
 Check(drift.Observe(Points(2_160_000_001,3240)).Single(x=>x.DeviceId=="ESP01").ValidationRequired,"alternating 1.5/3ppm estimates do not confirm new reference");
 var differentBoot=Points(2_700_000_001,4050);differentBoot[0]=differentBoot[0] with { BootId=2 };
 Check(!drift.Observe(differentBoot).Any(x=>x.DeviceId=="ESP01"),"reboot clears pending candidate and drift reference");
+// A ramp can keep innovating forever; sustained classification must still fire.
+foreach(int direction in new[]{-1,1}) {
+    drift.Reset();drift.Observe(Points(1,0));drift.Observe(Points(6_000_000_001,0));
+    long phase=0;
+    for(int step=1;step<=13;step++) {
+        phase+=direction*600L*step;
+        var ramp=drift.Observe(Points(6_000_000_001L+step*6_000_000_000L,phase)).Single(x=>x.DeviceId=="ESP01");
+        Check(ramp.ValidationRequired,"600us-per-segment ramp innovation remains visible");
+        Check(ramp.SustainedDeviation==(step>=13),"third consecutive ramp estimate above1ppm triggers independently of innovation");
+    }
+}
+drift.Reset();drift.Observe(Points(1,0));drift.Observe(Points(540_000_001,0));
+foreach(var (epoch,phase) in new (long,long)[]{(1_080_000_001,10000),(1_620_000_001,0),(2_160_000_001,0)})
+    Check(!drift.Observe(Points(epoch,phase)).Any(x=>x.SustainedDeviation),"one bad sync epoch affects only two intervals");
 // Last fleet measurement persists into a new plan, without reusing its ARM identities.
 var priorMeasured=armed with { MeasuredPairRatePpm=3, Stage=ProgramStage.Completed };
 var inherited=ProgramExecutionState.New(Plan(3000,2),priorMeasured);

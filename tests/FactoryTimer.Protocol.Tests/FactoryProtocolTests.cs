@@ -217,8 +217,16 @@ public sealed class FactoryProtocolTests
     {
         Assert.IsFalse(FactoryProtocol.TryParseInbound([0x46, 0x00], out _, out ProtocolParseError binaryError));
         Assert.AreEqual(ProtocolParseError.NonPrintable, binaryError);
-        Assert.IsFalse(FactoryProtocol.TryParseInbound(new string('X', 384), out _, out ProtocolParseError longError));
+        // The protocol permits up to 511 bytes; verify both parsing overloads at the boundary.
+        string oversized = new('X', FactoryProtocol.MaximumPacketLength + 1);
+        Assert.IsFalse(FactoryProtocol.TryParseInbound(oversized, out _, out ProtocolParseError longError));
         Assert.AreEqual(ProtocolParseError.TooLong, longError);
+        Assert.IsFalse(FactoryProtocol.TryParseInbound(Encoding.ASCII.GetBytes(oversized), out _, out ProtocolParseError longBytesError));
+        Assert.AreEqual(ProtocolParseError.TooLong, longBytesError);
+
+        // Exactly at the limit, an invalid header fails version parsing, not length parsing.
+        Assert.IsFalse(FactoryProtocol.TryParseInbound(new string('X', FactoryProtocol.MaximumPacketLength), out _, out ProtocolParseError versionError));
+        Assert.AreEqual(ProtocolParseError.Version, versionError);
     }
 
     [TestMethod]

@@ -1,4 +1,7 @@
-# Controller 6.23.2 — persistent segmented programs
+# Controller 6.23.6 — persistent segmented programs
+
+Sustained drift alerts count three consecutive estimates beyond +/-1 ppm even
+when phase innovations continue. See [the release notes](../CONTROLLER_6_23_6_DRIFT_ALERTS.md).
 
 See [production implementation and validation](../SEGMENTED_REPETITIONS.md).
 Ordinary START runs the selected repetition program. Qualification START controls
@@ -418,3 +421,15 @@ Production START uses the mean of the three fastest forward-ingress offset sampl
 ## 6.23.2 review corrections
 
 See `../REVIEW_FIXES_6_23_2.md`. Matching fleet spread survives new programs; fresh post-sync identities activate it before the first ARM. Drift-step confirmation avoids a permanently latched innovation classification.
+
+## 6.23.3 Wi-Fi status
+
+Timer cards show RSSI, channel and AP BSSID. Run-health CSV files append RssiDbm,WifiChannel,Bssid using the START/POST_RUN snapshots. See [V6_23_3_WIFI_STATUS.md](V6_23_3_WIFI_STATUS.md). Firmware and Analyzer are unchanged.
+
+## 6.23.4 card layout
+
+Cards use full-width rows with automatic height and page scrolling. AP BSSID wraps on a separate row. See [V6_23_4_READABLE_CARDS.md](V6_23_4_READABLE_CARDS.md).
+
+## 6.23.5 RSSI maintenance warning
+
+The dBm reading turns amber below -70 dBm; this does not affect START. See [V6_23_5_RSSI_WARNING.md](V6_23_5_RSSI_WARNING.md).

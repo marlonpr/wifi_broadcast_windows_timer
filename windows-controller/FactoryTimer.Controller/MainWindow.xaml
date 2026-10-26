@@ -15,6 +15,21 @@
                   HorizontalScrollBarVisibility="Disabled"
                   VerticalScrollMode="Enabled"
                   VerticalScrollBarVisibility="Auto">
+        <ScrollViewer.Resources>
+            <ResourceDictionary>
+                <ResourceDictionary.ThemeDictionaries>
+                    <ResourceDictionary x:Key="Default">
+                        <SolidColorBrush x:Key="WeakRssiTextBrush" Color="#FFB900" />
+                    </ResourceDictionary>
+                    <ResourceDictionary x:Key="Light">
+                        <SolidColorBrush x:Key="WeakRssiTextBrush" Color="#9D5D00" />
+                    </ResourceDictionary>
+                    <ResourceDictionary x:Key="HighContrast">
+                        <SolidColorBrush x:Key="WeakRssiTextBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    </ResourceDictionary>
+                </ResourceDictionary.ThemeDictionaries>
+            </ResourceDictionary>
+        </ScrollViewer.Resources>
         <Grid MaxWidth="1180" Padding="28" HorizontalAlignment="Center">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
@@ -177,12 +192,12 @@
                     <ItemsControl ItemsSource="{Binding Devices}">
                         <ItemsControl.ItemsPanel>
                             <ItemsPanelTemplate>
-                                <ItemsWrapGrid Orientation="Horizontal" />
+                                <StackPanel Orientation="Vertical" />
                             </ItemsPanelTemplate>
                         </ItemsControl.ItemsPanel>
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>
-                                <Border Width="350" Margin="0,0,10,10" Padding="14" CornerRadius="8"
+                                <Border HorizontalAlignment="Stretch" Margin="0,0,0,12" Padding="16" CornerRadius="8"
                                         Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
                                         BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
                                     <StackPanel Spacing="8">
@@ -215,6 +230,33 @@
                                             <TextBlock Text="Last status" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                             <TextBlock Grid.Column="1" Text="{Binding LastStatusText}" HorizontalAlignment="Right"
                                                        FontFamily="Consolas" />
+                                        </Grid>
+                                        <Grid ColumnSpacing="8" RowSpacing="6"
+                                              ToolTipService.ToolTip="Wi-Fi readings from the last received STATUS. Readings pause during an active segment.">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto" />
+                                                <RowDefinition Height="Auto" />
+                                            </Grid.RowDefinitions>
+                                            <TextBlock Text="Wi-Fi" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                                                <TextBlock Text="{Binding Rssi}" FontFamily="Consolas" FontWeight="SemiBold"
+                                                           Visibility="{Binding RssiNormalVisibility}"
+                                                           Foreground="{ThemeResource TextFillColorPrimaryBrush}" />
+                                                <TextBlock Text="{Binding Rssi}" FontFamily="Consolas" FontWeight="SemiBold"
+                                                           Visibility="{Binding RssiWarningVisibility}"
+                                                           Foreground="{ThemeResource WeakRssiTextBrush}"
+                                                           ToolTipService.ToolTip="Weak Wi-Fi signal (below -70 dBm). Maintenance warning only."
+                                                           AutomationProperties.HelpText="Weak Wi-Fi signal (below -70 dBm). Maintenance warning only." />
+                                                <TextBlock Text="ch" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                <TextBlock Text="{Binding WifiChannelText}" FontFamily="Consolas" />
+                                            </StackPanel>
+                                            <TextBlock Grid.Row="1" Text="AP BSSID" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Bssid}"
+                                                       FontFamily="Consolas" TextWrapping="Wrap" />
                                         </Grid>
                                     </StackPanel>
                                 </Border>
