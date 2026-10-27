@@ -1,4 +1,48 @@
-# Controller 6.23.6 — persistent segmented programs
+# Controller 6.23.16 — completion RESET and current timer state
+
+After the whole program completes, save diagnostics and RESET the executed
+roster. Production boundary recovery waits at most 10 seconds. A failed active
+STATUS probe updates an unresponsive timer card to OFFLINE / UNKNOWN immediately.
+See [release notes, build and bench steps](CONTROLLER_6_23_16_COMPLETION_RESET.md).
+Firmware, analyzer, protocol and 6.23.15 pause/resume behavior are retained.
+Rebuild the controller; no reflash is required.
+
+The release entries below are historical.
+
+# Controller 6.23.15 — selected START / STOP / RESET
+
+All three buttons apply to the current timer selection. START after STOP resumes
+the saved remaining time and repetition on the newly selected group. Timer
+selection is available while counting; old pause participants are not required.
+The visible action log and three-button layout are retained.
+See [release notes and build instructions](CONTROLLER_6_23_15_SELECTED_CONTROLS.md).
+Rebuild the controller; no firmware or analyzer reflash is needed.
+
+# Controller 6.23.14 — visible START log and selected-timer RESET
+
+The action log sits below the program/waiting text and retains START refusal
+reasons and per-timer stop-confirmation details. RESET now uses the current
+selection; unselected timers no longer block the next countdown. STOP/resume
+continues to use the original paused fleet. Three controls remain unchanged.
+See [release notes and build instructions](CONTROLLER_6_23_14_SELECTED_RESET_LOG.md).
+No firmware or analyzer reflash is required.
+
+# Controller 6.23.13 — RESET clears RECOVERY HELD
+
+RESET repairs an invalid saved STOP/RESET checkpoint and clears its recovery
+hold. START then prepares a fresh countdown using the configured settings.
+The original fleet confirmation and normal START checks are retained.
+See [release notes and build instructions](CONTROLLER_6_23_13_RESET_RECOVERY.md).
+Firmware and analyzer are unchanged; no reflash is required.
+
+# Controller 6.23.12 — START / STOP / RESET
+
+The three normal controls sit directly below Resync limit (seconds). START begins
+or continues, STOP saves a pause, and RESET clears progress for a new countdown.
+See [the build instructions and behavior notes](CONTROLLER_6_23_12_THREE_BUTTONS.md).
+Firmware 6.24.5-rc1 and analyzer 10.1.1 from RC2 remain unchanged.
+
+# Controller 6.23.6 — persistent segmented programs (historical)
 
 Sustained drift alerts count three consecutive estimates beyond +/-1 ppm even
 when phase innovations continue. See [the release notes](../CONTROLLER_6_23_6_DRIFT_ALERTS.md).

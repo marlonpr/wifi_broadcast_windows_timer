@@ -47,6 +47,8 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
     private readonly ParticipantReservationManager reservationManager = new();
     private readonly object controllerTxTraceGate = new();
     private ControllerTxTraceSession? controllerTxTraceSession;
+    private ulong controllerTxTraceCommandId;
+    private Task controllerTxTraceCompletion = Task.CompletedTask;
     private CancellationTokenSource? productionSilentRunCancellation;
     private Task productionSilentRunTask = Task.CompletedTask;
     private bool productionSilentRunActive;
@@ -115,8 +117,10 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
     public string QualificationGateText { get => qualificationGateText; private set => SetProperty(ref qualificationGateText, value); }
     private enum QualificationStartMode { Ordinary, First, Second, Preflight }
 
-    public MainViewModel(DispatcherQueue dispatcherQueue)
+    public MainViewModel(DispatcherQueue dispatcherQueue, IProgramStateStore? stateStore = null,
+        INetworkInterfaceProvider? interfaceProvider = null, IControllerUdpSocketFactory? socketFactory = null)
     {
+        if (stateStore is not null) programStore = stateStore;
         Devices =
         [
             Esp01, Esp02, Esp03, Esp04, Esp05,
@@ -125,11 +129,11 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
         ];
 
         this.dispatcherQueue = dispatcherQueue;
-        udpService = new UdpControllerService();
+        udpService = new UdpControllerService(socketFactory);
         udpService.ChangeReceiveTimestampMode(UdpReceiveTimestampMode.DedicatedBlockingThread);
         statusDiscovery = new StatusDiscoveryService(udpService);
         networkSelectionManager = new NetworkInterfaceSelectionManager(
-            new SystemNetworkInterfaceProvider(),
+            interfaceProvider ?? new SystemNetworkInterfaceProvider(),
             new FileSelectedInterfaceStore());
         uiTimer = dispatcherQueue.CreateTimer();
         uiTimer.Interval = TimeSpan.FromMilliseconds(100);
@@ -214,7 +218,11 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
     public string ControllerState { get => controllerState; private set => SetProperty(ref controllerState, value); }
     public string MasterTime { get => masterTime; private set => SetProperty(ref masterTime, value); }
     public string SynchronizationResolution { get => synchronizationResolution; private set => SetProperty(ref synchronizationResolution, value); }
-    public string StartSynchronizationResult { get => startSynchronizationResult; private set => SetProperty(ref startSynchronizationResult, value); }
+    public string StartSynchronizationResult
+    {
+        get => startSynchronizationResult;
+        private set { if (SetProperty(ref startSynchronizationResult, value)) AppendCountdownLog(value); }
+    }
     public string StaggeredTestResult { get => staggeredTestResult; private set => SetProperty(ref staggeredTestResult, value); }
     public string ManualStartAtCountdown { get => manualStartAtCountdown; private set => SetProperty(ref manualStartAtCountdown, value); }
     public bool CanManualSendEsp01 => CanSendManualStartAtTo("ESP01");
@@ -242,7 +250,11 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
     public string SelectedSubnetMask { get => selectedSubnetMask; private set => SetProperty(ref selectedSubnetMask, value); }
     public string CalculatedBroadcastAddress { get => calculatedBroadcastAddress; private set => SetProperty(ref calculatedBroadcastAddress, value); }
     public string EffectiveBroadcastAddress { get => effectiveBroadcastAddress; private set => SetProperty(ref effectiveBroadcastAddress, value); }
-    public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
+    public string StatusMessage
+    {
+        get => statusMessage;
+        private set { if (SetProperty(ref statusMessage, value)) AppendCountdownLog(value); }
+    }
     public string BenchmarkProgress { get => benchmarkProgress; private set => SetProperty(ref benchmarkProgress, value); }
     public string BenchmarkCsvPath { get => benchmarkCsvPath; private set => SetProperty(ref benchmarkCsvPath, value); }
     public string BenchmarkDiagnosticsCsvPath { get => benchmarkDiagnosticsCsvPath; private set => SetProperty(ref benchmarkDiagnosticsCsvPath, value); }
@@ -457,7 +469,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
         uiTimer.Start();
     }
 
-    public Task SendStartAsync() => StartRepetitionProgramAsync();
+    public Task SendStartAsync() => StartCountdownAsync();
 
     public Task SendQualificationFirstStartAsync() => SendStartAtAsync(QualificationStartMode.First);
 
@@ -495,7 +507,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
 
     public Task CancelManualStartAtTestAsync() => CancelManualStartAtTestInternalAsync();
 
-    public Task SendResetAsync() => productionProgram?.State.Active == true ? StopRepetitionProgramAsync() : SendResetInternalAsync();
+    public Task SendResetAsync() => ResetCountdownAsync();
 
     public Task SendBrightnessAsync() => SendBrightnessInternalAsync();
 
@@ -503,14 +515,14 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
 
     public void SelectAllParticipants()
     {
-        if (!CanSend) return;
+        if (!CanEditParticipants) return;
         foreach (DeviceViewModel device in Devices) device.IsSelected = true;
         StatusMessage = "All 15 timers selected.";
     }
 
     public void DeselectAllParticipants()
     {
-        if (!CanSend) return;
+        if (!CanEditParticipants) return;
         foreach (DeviceViewModel device in Devices) device.IsSelected = false;
         StatusMessage = "All timers deselected. Select one or more timers before START.";
     }
@@ -2939,7 +2951,9 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
 
     private async Task SendStartAtAsync(QualificationStartMode qualificationMode, ProgramSegment? programSegment = null)
     {
-        if (programSegment is null && (productionProgram?.State.Active == true || productionProgramLoadError is not null))
+        CancellationToken startToken = programSegment is null ? CancellationToken.None :
+            programCancellation?.Token ?? CancellationToken.None;
+        if (programSegment is null && (productionProgram?.State.Active == true || productionProgram?.State.StopCheckpoint is { DiscardProgress: false } or { PendingDeviceIds.Count: > 0 } || productionProgramLoadError is not null))
         {
             SetStartDiagnostic("An existing production program must be completed, reconciled, or stopped first.");
             return;
@@ -3042,7 +3056,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                 IReadOnlyList<StartBlock> preflightBlocks = await RefreshAndValidatePreflightAsync(
                     participants,
                     preflightAfterUtc,
-                    CancellationToken.None,
+                    startToken,
                     waitForRtcQualification: qualificationMode == QualificationStartMode.Preflight);
                 if (preflightBlocks.Count != 0)
                 {
@@ -3077,7 +3091,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                     ClearDegradedStartPending();
                     SetStartDiagnostic(
                         "START: preflight requirements passed. Entering timing-quiet synchronization...");
-                    await EnterTimingQuietPeriodAsync(CancellationToken.None);
+                    await EnterTimingQuietPeriodAsync(startToken);
                     timingQuiet = true;
 
                     SyncSamplingProfile productionSampling =
@@ -3098,7 +3112,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                         await SynchronizeParticipantsForwardOnlyRoundRobinAsync(
                             syncParticipants,
                             productionSampling,
-                            CancellationToken.None);
+                            startToken);
                     }
                     catch (Exception exception)
                     {
@@ -3126,7 +3140,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                 IReadOnlyList<StartBlock> postSyncStatusBlocks = await RefreshAndValidatePostSyncStatusAsync(
                     participants,
                     postSyncStatusAfterUtc,
-                    CancellationToken.None);
+                    startToken);
                 if (postSyncStatusBlocks.Count != 0)
                 {
                     ReportStartBlocks(postSyncStatusBlocks);
@@ -3272,7 +3286,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                 StartBlock? armFailure = await ArmPreparedRunAsync(
                     prepared,
                     command,
-                    CancellationToken.None);
+                    startToken);
                 if (armFailure is not null)
                 {
                     Volatile.Write(ref activeArmAcknowledgementTracker, null);
@@ -3281,8 +3295,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                         CancellationToken.None);
                     clock.Reset(prepared.DurationSeconds);
                     RefreshClockProperties();
-                    ReportPreparedRunAbort(armFailure, abort);
-                    if (programSegment is not null) ApplyProductionAbortResult(abort);
+                    ReportPreparedAbortOutcome(armFailure, abort, programSegment is not null);
                     preparedForAbort = null;
                     return;
                 }
@@ -3292,7 +3305,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                     programArmSucceeded = true;
                     UpdateProductionProgramText();
                 }
-                await StartProductionSilentRunAsync(prepared, CancellationToken.None);
+                await StartProductionSilentRunAsync(prepared, startToken);
                 qualificationWarmupProof = qualificationMode == QualificationStartMode.First ? runWarmupProof : null;
                 qualificationStart1Rates.Clear();
                 if (qualificationMode == QualificationStartMode.First)
@@ -3327,13 +3340,12 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                         CancellationToken.None);
                     clock.Reset(preparedForAbort.DurationSeconds);
                     RefreshClockProperties();
-                    ReportPreparedRunAbort(
+                    ReportPreparedAbortOutcome(
                         new StartBlock(
                             StartBlockReason.ArmAckMissing,
                             "controller",
                             $"START prepare raised an exception after ARMING began: {exception.Message}"),
-                        abort);
-                    if (programSegment is not null) ApplyProductionAbortResult(abort);
+                        abort, programSegment is not null);
                     preparedForAbort = null;
                 }
                 else
@@ -3437,7 +3449,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
         IReadOnlyList<DeviceViewModel> participants,
         CancellationToken cancellationToken)
     {
-        TimeSpan waitTimeout = productionSegmentContext is null ? RtcQualificationWaitTimeout : TimeSpan.FromSeconds(180);
+        TimeSpan waitTimeout = productionSegmentContext is null ? RtcQualificationWaitTimeout : ProductionRecoveryPolicy.ReadinessTimeout;
         DateTimeOffset deadlineUtc = DateTimeOffset.UtcNow + waitTimeout;
 
         // One explicit refresh at entry. After this, observe the normal pre-run
@@ -3642,6 +3654,21 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                 return;
             }
             await Task.Delay(40, cancellationToken);
+        }
+        MarkUnresponsiveParticipants(participants, requireStatusAfterUtc);
+    }
+
+    private void MarkUnresponsiveParticipants(IReadOnlyList<DeviceViewModel> participants, DateTimeOffset challenge)
+    {
+        foreach (DeviceViewModel device in participants)
+        {
+            // Missing EXEC alone can mean old/incompatible firmware. A live
+            // STATUS or challenged EXEC still proves that the link is alive.
+            if (device.SessionSnapshot.LastStatusAtUtc is DateTimeOffset status && status >= challenge ||
+                HasFreshExecutionReply(device.DeviceId, challenge)) continue;
+            if (device.OnlineText == "OFFLINE" && device.State == "UNKNOWN") continue;
+            device.MarkOffline();
+            AppendCountdownLog($"{CountdownDeviceNames([device.DeviceId])}: OFFLINE / UNKNOWN — no reply to the fresh STATUS probe.");
         }
     }
 
@@ -3879,6 +3906,9 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
         PreparedStartRun prepared,
         CancellationToken cancellationToken)
     {
+        prepared = RestrictPreparedAbortForOperator(prepared);
+        if (prepared.Participants.Count == 0)
+            return new(true, 0, [], [], ConfirmedAtMasterUs: MasterClock.NowMicroseconds);
         ulong resetCommandId = CreateCommandId();
         var reset = new CommandPacket(
             CommandType.Reset,
@@ -4271,7 +4301,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
             StatusMessage = "Select an active physical network interface before sending a command.";
             return;
         }
-        if (!TryDuration(out uint duration)) return;
+        uint duration = TryDuration(out uint draftDuration) ? draftDuration : Math.Clamp(clock.RemainingSeconds, 1u, 5999u);
 
         DeviceViewModel[] participants = Devices.Where(device => device.IsSelected).ToArray();
         if (participants.Length == 0)
@@ -4292,10 +4322,11 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
         {
             ulong commandId = CreateCommandId();
             var command = new CommandPacket(CommandType.Reset, commandId, duration, 0);
+            Dictionary<string, IPAddress> verifiedAddresses = await DiscoverResetTargetAddressesAsync(participants);
             var missing = new List<string>();
             foreach (DeviceViewModel device in participants)
             {
-                if (!device.TryGetIpAddress(out IPAddress? address) || address is null)
+                if (!verifiedAddresses.TryGetValue(device.DeviceId, out IPAddress? address))
                 {
                     missing.Add(device.DisplayName);
                     continue;
@@ -4690,6 +4721,8 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
 
     private void ObserveProductionRunningStatus(StatusPacket status)
     {
+        if (operatorStopInProgress || productionProgram?.State.StopCheckpoint is not null) return;
+        if (productionProgram is not null && !productionProgram.State.Program.Participants.Contains(status.DeviceId)) return;
         // Keep qualification/manual-test workflows behaviorally unchanged.
         if (IsBenchmarkRunning || isPreparingManualStartAtTest || manualStartAtSession is not null) return;
 
@@ -4804,10 +4837,12 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
 
     private void UpdateCanSend()
     {
-        CanSend = !programManagementBusy && !isSending && productionProgram?.State.Active != true && productionProgramLoadError is null && manualStartAtSession is null &&
+        CanSend = !completionResetInProgress && !programManagementBusy && !isSending && productionProgram?.State.Active != true && productionProgramLoadError is null && manualStartAtSession is null &&
+            (productionProgram?.State.StopCheckpoint is null or { DiscardProgress: true, PendingDeviceIds.Count: 0 }) &&
             SelectedNetworkInterface is not null && udpService.IsReady;
         OnPropertyChanged(nameof(CanStartDegraded));
         OnPropertyChanged(nameof(CanManageProgram));
+        NotifyCountdownControls();
         RefreshManualStartAtButtonStates();
     }
 
@@ -4848,7 +4883,8 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
         }
 
         ControllerTxTracePath = "TX trace: Capturing...";
-        _ = CompleteControllerTxTraceAfterRunAsync(session);
+        controllerTxTraceCommandId = commandId;
+        controllerTxTraceCompletion = CompleteControllerTxTraceAfterRunAsync(session);
     }
 
     private void UdpService_PacketSent(object? sender, PacketSentEventArgs e)
@@ -5281,7 +5317,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
     private void RefreshClockProperties()
     {
         ControllerRemaining = FormatMinutesSeconds(clock.RemainingSeconds);
-        ControllerState = clock.State.ToString().ToUpperInvariant();
+        ControllerState = clock.IsPaused ? "PAUSED" : clock.State.ToString().ToUpperInvariant();
     }
 
     private static string FormatMinutesSeconds(uint totalSeconds)

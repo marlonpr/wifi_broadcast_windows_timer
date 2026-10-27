@@ -16,10 +16,29 @@ public sealed record ProgramSegment(uint Index, uint FirstRepeat, uint RepeatCou
 }
 
 public sealed record RepetitionProgram(ulong PlanId, uint DurationSeconds, uint TotalRepeats,
-    uint SegmentCapSeconds, IReadOnlyList<string> Participants, IReadOnlyList<ProgramSegment> Segments)
+    uint SegmentCapSeconds, IReadOnlyList<string> Participants, IReadOnlyList<ProgramSegment> Segments,
+    CountdownPosition? ResumePosition = null)
 {
     public static RepetitionProgram Create(ulong id, uint duration, uint repeats,
-        IEnumerable<string> participants, uint cap = 6000)
+        IEnumerable<string> participants, uint cap = 6000) =>
+        CreateCore(id, duration, repeats, participants, cap, null);
+
+    public static RepetitionProgram ContinueFrom(ulong id, RepetitionProgram original, CountdownPosition position,
+        IEnumerable<string>? participants = null)
+    {
+        original.Validate();
+        return CreateCore(id, original.DurationSeconds, original.TotalRepeats,
+            participants ?? original.Participants, original.SegmentCapSeconds, position);
+    }
+
+    public RepetitionProgram WithParticipants(IEnumerable<string> participants)
+    {
+        Validate();
+        return CreateCore(PlanId, DurationSeconds, TotalRepeats, participants, SegmentCapSeconds, ResumePosition);
+    }
+
+    private static RepetitionProgram CreateCore(ulong id, uint duration, uint repeats,
+        IEnumerable<string> participants, uint cap, CountdownPosition? resume)
     {
         string[] roster = participants.Order(StringComparer.Ordinal).ToArray();
         if (id == 0 || duration is < 1 or > 5999 || repeats is < 1 or > 1_000_000 ||
@@ -27,22 +46,35 @@ public sealed record RepetitionProgram(ulong PlanId, uint DurationSeconds, uint 
             roster.Distinct(StringComparer.Ordinal).Count() != roster.Length ||
             roster.Any(x => string.IsNullOrWhiteSpace(x)))
             throw new ArgumentOutOfRangeException(nameof(duration), "Invalid repetition program.");
+        if (resume is not null && (resume.CurrentRepeat < 1 || resume.CurrentRepeat > repeats ||
+            resume.RemainingSeconds < 1 || resume.RemainingSeconds > duration))
+            throw new ArgumentOutOfRangeException(nameof(resume), "No valid paused countdown remains.");
         uint capacity = cap / duration;
-        if (((ulong)repeats + capacity - 1) / capacity > 10_000)
+        uint first = resume?.CurrentRepeat ?? 1;
+        bool partial = resume is not null && resume.RemainingSeconds < duration;
+        uint fullRepeats = repeats - first + (partial ? 0u : 1u);
+        // A continuation may prepend one shortened repeat to an otherwise
+        // valid 10,000-segment plan; do not strand a saved maximum-size plan.
+        if (((ulong)fullRepeats + capacity - 1) / capacity > 10_000)
             throw new ArgumentOutOfRangeException(nameof(repeats), "Programs may contain at most 10,000 segments.");
         var segments = new List<ProgramSegment>();
-        for (uint first = 1; first <= repeats;)
+        if (partial)
+        {
+            segments.Add(new(1, first, 1, resume!.RemainingSeconds));
+            first++;
+        }
+        while (first <= repeats)
         {
             uint count = Math.Min(capacity, repeats - first + 1);
             segments.Add(new((uint)segments.Count + 1, first, count, duration));
             first = checked(first + count);
         }
-        return new(id, duration, repeats, cap, roster, segments);
+        return new(id, duration, repeats, cap, roster, segments, resume);
     }
 
     public void Validate()
     {
-        RepetitionProgram canonical = Create(PlanId, DurationSeconds, TotalRepeats, Participants, SegmentCapSeconds);
+        RepetitionProgram canonical = CreateCore(PlanId, DurationSeconds, TotalRepeats, Participants, SegmentCapSeconds, ResumePosition);
         if (!canonical.Segments.SequenceEqual(Segments))
             throw new InvalidDataException("Saved segment plan does not match its geometry.");
     }
@@ -90,9 +122,11 @@ public sealed record ProgramExecutionState(RepetitionProgram Program, ProgramSta
     IReadOnlyDictionary<string, ulong> BootIds, IReadOnlyDictionary<string, string> FirmwareBuildIds,
     string Message, bool RequiresOperator = false, int SegmentStartAttempts = 0,
     DateTimeOffset? ReadinessWaitStartedAtUtc = null, double? MeasuredPairRatePpm = null, FleetRateEvidence? FleetRate = null,
-    IReadOnlyList<string>? PendingMissingParticipants = null, IReadOnlyDictionary<string, uint>? AutomaticRecoveryCounts = null)
+    IReadOnlyList<string>? PendingMissingParticipants = null, IReadOnlyDictionary<string, uint>? AutomaticRecoveryCounts = null,
+    StoppedCountdownCheckpoint? StopCheckpoint = null)
 {
-    public uint CompletedRepeatCount => (uint)Program.Segments.Where(s => s.Index < NextSegmentIndex).Aggregate(0UL, (sum, s) => sum + s.RepeatCount);
+    public uint CompletedRepeatCount => checked((Program.ResumePosition?.CurrentRepeat ?? 1) - 1 +
+        (uint)Program.Segments.Where(s => s.Index < NextSegmentIndex).Aggregate(0UL, (sum, s) => sum + s.RepeatCount));
     public bool Active => Stage is not (ProgramStage.Completed or ProgramStage.Stopped);
     public ProgramSegment? CurrentSegment => CurrentSegmentIndex == 0 ? null :
         Program.Segments.Single(s => s.Index == CurrentSegmentIndex);
@@ -107,12 +141,15 @@ public interface IProgramStateStore
 {
     ProgramExecutionState? Load();
     void Save(ProgramExecutionState state);
+    // RESET discards execution progress. It may recover a valid frozen roster
+    // even when the STOP checkpoint or ARM progress cannot be resumed.
+    RepetitionProgram? LoadPlanForReset() => Load()?.Program;
 }
 
 public sealed class FileProgramStateStore(string path) : IProgramStateStore
 {
     private sealed record Envelope(int Version, string Payload, string Sha256);
-    public ProgramExecutionState? Load()
+    private ProgramExecutionState? ReadJournal()
     {
         if (!File.Exists(path)) return null;
         Envelope envelope = JsonSerializer.Deserialize<Envelope>(File.ReadAllText(path))
@@ -122,7 +159,32 @@ public sealed class FileProgramStateStore(string path) : IProgramStateStore
             throw new InvalidDataException("Program journal is damaged; execution is held.");
         ProgramExecutionState state = JsonSerializer.Deserialize<ProgramExecutionState>(envelope.Payload)
             ?? throw new InvalidDataException("Invalid program journal.");
+        return state;
+    }
+
+    public RepetitionProgram? LoadPlanForReset()
+    {
+        try
+        {
+            ProgramExecutionState? state = ReadJournal();
+            state?.Program.Validate();
+            return state?.Program;
+        }
+        catch (Exception exception) when (exception is InvalidDataException or JsonException or
+            ArgumentException or OverflowException or NullReferenceException)
+        {
+            // No trustworthy plan remains. The operator's RESET will create a
+            // new journal for the selected and observed active devices.
+            return null;
+        }
+    }
+
+    public ProgramExecutionState? Load()
+    {
+        ProgramExecutionState? state = ReadJournal();
+        if (state is null) return null;
         state.Program.Validate();
+        state.StopCheckpoint?.Validate(state.Program, state.Stage);
         if (!Enum.IsDefined(state.Stage) || state.NextSegmentIndex < 1 ||
             state.NextSegmentIndex > state.Program.Segments.Count + 1 ||
             state.CurrentSegmentIndex > state.Program.Segments.Count || state.SegmentStartAttempts < 0 ||
@@ -140,6 +202,7 @@ public sealed class FileProgramStateStore(string path) : IProgramStateStore
     public void Save(ProgramExecutionState state)
     {
         state.Program.Validate();
+        state.StopCheckpoint?.Validate(state.Program, state.Stage);
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         string payload = JsonSerializer.Serialize(state);
         byte[] data = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new Envelope(1, payload,
@@ -245,10 +308,68 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
         Commit(State with { Stage = ProgramStage.Running, Message = "Segment active; network polling is silent." });
     }
 
-    public void Hold(string message) => Commit(State with { Stage = ProgramStage.Held,
-        RequiresOperator = true, Message = message });
+    public void Hold(string message) => Commit(State with {
+        // A late failure must not turn a persisted pause/reset into an invalid
+        // Held+StopCheckpoint journal, or resurrect a completed program.
+        Stage = State.Active ? ProgramStage.Held : State.Stage,
+        RequiresOperator = State.Active, Message = message });
     public void Stop() => Commit(State with { Stage = ProgramStage.Stopped,
         RequiresOperator = false, Message = "Program stopped by the operator." });
+
+    public void Stop(ulong resetCommandId, uint currentRepeat, uint remainingSeconds, bool positionKnown = true,
+        IEnumerable<string>? participants = null)
+    {
+        RepetitionProgram plan = participants is null ? State.Program : State.Program.WithParticipants(participants);
+        SaveStop(new(resetCommandId, currentRepeat, remainingSeconds, plan.Participants.ToArray(),
+            PositionKnown: positionKnown), plan);
+    }
+
+    public void SelectStoppedParticipants(IEnumerable<string> participants, ulong resetCommandId)
+    {
+        if (State.Stage != ProgramStage.Stopped || State.StopCheckpoint is not { } checkpoint)
+            throw new InvalidOperationException("No saved STOP/RESET checkpoint.");
+        RepetitionProgram plan = State.Program.WithParticipants(participants);
+        if (plan.Participants.SequenceEqual(State.Program.Participants)) return;
+        SaveStop(checkpoint with { ResetCommandId = resetCommandId, PendingDeviceIds = plan.Participants.ToArray() }, plan);
+    }
+
+    public void ResetProgress(ulong resetCommandId) => SaveStop(new(resetCommandId, 1,
+        State.Program.DurationSeconds, State.Program.Participants.ToArray(), DiscardProgress: true));
+
+    private void SaveStop(StoppedCountdownCheckpoint checkpoint, RepetitionProgram? plan = null)
+    {
+        plan ??= State.Program;
+        checkpoint.Validate(plan, ProgramStage.Stopped);
+        // A selected timer can be new to the paused run. Old ARM/boot identities
+        // must not be carried into its stopped journal or the next fresh sync.
+        Commit(ProgramExecutionState.New(plan, State) with { Stage = ProgramStage.Stopped, StopCheckpoint = checkpoint,
+            RequiresOperator = false, Message = checkpoint.DiscardProgress
+                ? "RESET: saved progress cleared; confirming the selected timers are stopped."
+                : "STOP: countdown position saved; confirming the selected timers are stopped." });
+    }
+
+    public void ConfirmStoppedDevices(IReadOnlyDictionary<string, ProgramDeviceObservation> fresh) =>
+        ConfirmStoppedDevices(fresh, recheckAll: false);
+
+    public void RecheckAllStoppedDevices(IReadOnlyDictionary<string, ProgramDeviceObservation> fresh) =>
+        ConfirmStoppedDevices(fresh, recheckAll: true);
+
+    private void ConfirmStoppedDevices(IReadOnlyDictionary<string, ProgramDeviceObservation> fresh, bool recheckAll)
+    {
+        if (State.Stage != ProgramStage.Stopped || State.StopCheckpoint is not { } checkpoint)
+            throw new InvalidOperationException("No STOP/RESET confirmation is pending.");
+        IEnumerable<string> required = recheckAll ? State.Program.Participants : checkpoint.PendingDeviceIds;
+        string[] pending = required.Where(id => !HasResetEvidence(id, checkpoint.ResetCommandId, fresh)).ToArray();
+        Commit(State with { StopCheckpoint = checkpoint with { PendingDeviceIds = pending },
+            Message = pending.Length != 0 ? "Stop not confirmed: " + string.Join(", ", pending) + ". Restore connectivity and retry."
+                : checkpoint.DiscardProgress ? "RESET confirmed. START will begin a new countdown."
+                : checkpoint.CanResumePosition ? "PAUSED. START will continue the saved countdown."
+                : "STOP confirmed. RESET to prepare a new countdown." });
+    }
+
+    private static bool HasResetEvidence(string id, ulong resetId,
+        IReadOnlyDictionary<string, ProgramDeviceObservation> fresh) =>
+        fresh.TryGetValue(id, out ProgramDeviceObservation? x) && StopResetConfirmation.Failure(id, resetId, x) is null;
 
     private bool Matches(ProgramDeviceObservation x)
     {
@@ -306,7 +427,7 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
             // firmware's disconnected CommandTask. Once our own same-session
             // deadline has passed, do not trust its RemainingSeconds as a new
             // countdown duration. Keep probing for exact FINISHED evidence,
-            // with the same bounded 180 s window used for absent devices.
+            // with the same bounded 10 s window used for absent devices.
             if (plannedSegmentEnded && State.CurrentCommandId != 0 &&
                 State.Stage is (ProgramStage.Running or ProgramStage.WaitingForReadiness))
             {
@@ -314,13 +435,13 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
                 DateTimeOffset since = State.ReadinessWaitStartedAtUtc ?? now;
                 if (now - since >= ProductionRecoveryPolicy.ReadinessTimeout)
                 {
-                    Hold("At 00:00, participants still reported RUNNING/ARMED after 180 s; fleet held for operator review.");
+                    Hold("At 00:00, participants still reported RUNNING/ARMED after 10 s; fleet held for operator review.");
                     return new(ReconcileAction.Hold, State.Message);
                 }
                 string[] stale = active.Select(x => x.Execution.DeviceId).Order(StringComparer.Ordinal).ToArray();
                 Commit(State with { Stage = ProgramStage.WaitingForReadiness,
                     ReadinessWaitStartedAtUtc = since,
-                    Message = "At 00:00; awaiting exact FINISHED evidence (up to 180 s): " + string.Join(", ", stale) });
+                    Message = "At 00:00; awaiting exact FINISHED evidence (up to 10 s): " + string.Join(", ", stale) });
                 return new(ReconcileAction.WaitForReadiness, State.Message);
             }
             bool fault = missing || present.Any(x => !Matches(x) || !SameBoot(x));
@@ -347,14 +468,14 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
             DateTimeOffset since = State.ReadinessWaitStartedAtUtc ?? now;
             if (now - since >= ProductionRecoveryPolicy.ReadinessTimeout)
             {
-                Hold("Required participants remained missing for 180 s: " + string.Join(", ", absent));
+                Hold("Required participants remained missing for 10 s: " + string.Join(", ", absent));
                 return new(ReconcileAction.Hold, State.Message);
             }
             string[] pending = (State.PendingMissingParticipants ?? Array.Empty<string>())
                 .Concat(absent).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
             Commit(State with { Stage = ProgramStage.WaitingForReadiness, ReadinessWaitStartedAtUtc = since,
                 PendingMissingParticipants = pending,
-                Message = "At 00:00; waiting up to 180 s for missing participants: " + string.Join(", ", absent) });
+                Message = "At 00:00; waiting up to 10 s for missing participants: " + string.Join(", ", absent) });
             return new(ReconcileAction.WaitForReadiness, State.Message);
         }
         if (State.CurrentCommandId != 0)
@@ -375,11 +496,11 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
                 DateTimeOffset since = State.ReadinessWaitStartedAtUtc ?? now;
                 if (now - since >= ProductionRecoveryPolicy.ReadinessTimeout)
                 {
-                    Hold("RTC/post-run temperature recovery exceeded 180 s; fleet remains at 00:00.");
+                    Hold("RTC/post-run temperature recovery exceeded 10 s; fleet remains at 00:00.");
                     return new(ReconcileAction.Hold, State.Message);
                 }
                 Commit(State with { Stage = ProgramStage.WaitingForReadiness, ReadinessWaitStartedAtUtc = since,
-                    Message = "At 00:00; waiting up to 180 s for RTC recovery and fresh post-run temperature." });
+                    Message = "At 00:00; waiting up to 10 s for RTC recovery and fresh post-run temperature." });
                 return new(ReconcileAction.WaitForReadiness, State.Message);
             }
             // Count automatic recoveries only after all original boards have
@@ -397,7 +518,7 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
         if (State.Stage == ProgramStage.Completed) return new(ReconcileAction.Complete, State.Message);
         if (State.Stage == ProgramStage.Held || present.Any(x => !OperationalReady(x)))
         {
-            Hold("Fleet held at 00:00; wait for recovery, then use RESUME HELD PROGRAM.");
+            Hold("Fleet held at 00:00; wait for recovery, then press START to continue.");
             return new(ReconcileAction.Hold, State.Message);
         }
         Commit(State with { Stage = ProgramStage.BetweenSegments });
@@ -461,8 +582,8 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
 public static class ProductionRecoveryPolicy
 {
     public const int MaximumStartAttempts = 3; // initial attempt plus two retries
-    public static readonly TimeSpan ReadinessTimeout = TimeSpan.FromSeconds(180);
-    public static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
+    public static readonly TimeSpan ReadinessTimeout = TimeSpan.FromSeconds(10);
+    public static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
 
     // A diagnostic view of the existing OperationalReady predicate. It changes
     // no authorization threshold and is shared by operator refusals and audits.

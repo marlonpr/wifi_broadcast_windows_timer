@@ -80,18 +80,41 @@
                         </Grid>
 
                         <NumberBox Header="Repetitions" Value="{Binding RepetitionsInput, Mode=TwoWay}"
-                                   Minimum="1" Maximum="1000000" SmallChange="1" IsEnabled="{Binding CanSend}"
+                                   Minimum="1" Maximum="1000000" SmallChange="1" IsEnabled="{Binding CanEditCountdownSettings}"
                                    SpinButtonPlacementMode="Inline" />
                         <NumberBox Header="Resync limit (seconds)" Value="{Binding SegmentCapSecondsInput, Mode=TwoWay}"
-                                   Minimum="1" Maximum="6000" SmallChange="1" IsEnabled="{Binding CanSend}"
+                                   Minimum="1" Maximum="6000" SmallChange="1" IsEnabled="{Binding CanEditCountdownSettings}"
                                    SpinButtonPlacementMode="Inline" />
-                        <TextBlock Text="{Binding ProductionProgramText}" TextWrapping="Wrap" />
-                        <TextBlock Text="Production readiness is checked before each segment. Qualification warm-up is separate."
+                        <Grid ColumnSpacing="12" Margin="0,6,0,0" AutomationProperties.Name="Countdown controls">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button Content="START" Click="Start_Click" IsEnabled="{Binding CanStartCountdown}"
+                                    HorizontalAlignment="Stretch" Style="{StaticResource AccentButtonStyle}"
+                                    ToolTipService.ToolTip="Start the selected timers, or resume the saved countdown on the selected timers." />
+                            <Button Grid.Column="1" Content="STOP" Click="StopProgram_Click" IsEnabled="{Binding CanStopCountdown}"
+                                    HorizontalAlignment="Stretch" ToolTipService.ToolTip="Pause the selected timers and save the remaining time and repetition." />
+                            <Button Grid.Column="2" Content="RESET" Click="Reset_Click" IsEnabled="{Binding CanResetCountdown}"
+                                    HorizontalAlignment="Stretch" ToolTipService.ToolTip="Stop and clear saved progress. The next START begins a new countdown." />
+                        </Grid>
+                        <TextBlock Text="All buttons use the selected timers. START begins or continues. STOP pauses. RESET clears progress."
                                    TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                        <Button Content="RECONCILE SAVED PROGRAM" Click="ReconcileProgram_Click" IsEnabled="{Binding CanManageProgram}" />
-                        <TextBlock Text="Resume acknowledges repeats missed by a failed or rebooted board; completed segments are never replayed." TextWrapping="Wrap" />
-                        <Button Content="RESUME HELD PROGRAM" Click="ResumeProgram_Click" IsEnabled="{Binding CanManageProgram}" />
-                        <Button Content="STOP PROGRAM / RESET FROZEN FLEET" Click="StopProgram_Click" IsEnabled="{Binding CanManageProgram}" />
+                        <TextBlock Text="{Binding ProductionProgramText}" TextWrapping="Wrap" />
+                        <Border Padding="10" CornerRadius="6"
+                                Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">
+                            <StackPanel Spacing="6">
+                                <TextBlock Text="Countdown / START log" FontWeight="SemiBold" />
+                                <TextBlock Text="{Binding CountdownStartAvailabilityText}" TextWrapping="Wrap" />
+                                <ScrollViewer MaxHeight="180" VerticalScrollBarVisibility="Auto"
+                                              HorizontalScrollBarVisibility="Disabled">
+                                    <TextBlock Text="{Binding CountdownActionLog}" TextWrapping="Wrap"
+                                               IsTextSelectionEnabled="True" FontFamily="Consolas" FontSize="12" />
+                                </ScrollViewer>
+                            </StackPanel>
+                        </Border>
 
                         <TextBlock Text="Panel brightness" FontWeight="SemiBold" Margin="0,5,0,0" />
                         <Grid ColumnSpacing="10">
@@ -114,12 +137,12 @@
                         <Grid Margin="0,5,0,0">
                             <TextBlock Text="Timers" FontWeight="SemiBold" VerticalAlignment="Center" />
                             <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-                                <Button Content="SELECT ALL" Click="SelectAll_Click" IsEnabled="{Binding CanSend}" />
-                                <Button Content="DESELECT ALL" Click="DeselectAll_Click" IsEnabled="{Binding CanSend}" />
+                                <Button Content="SELECT ALL" Click="SelectAll_Click" IsEnabled="{Binding CanEditParticipants}" />
+                                <Button Content="DESELECT ALL" Click="DeselectAll_Click" IsEnabled="{Binding CanEditParticipants}" />
                             </StackPanel>
                         </Grid>
 
-                        <ItemsControl ItemsSource="{Binding Devices}" IsEnabled="{Binding CanSend}">
+                        <ItemsControl ItemsSource="{Binding Devices}" IsEnabled="{Binding CanEditParticipants}">
                             <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
                                     <ItemsWrapGrid Orientation="Horizontal" />
@@ -134,6 +157,8 @@
                             </ItemsControl.ItemTemplate>
                         </ItemsControl>
 
+                        <Expander Header="Engineering diagnostics" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" IsExpanded="False">
+                            <StackPanel Spacing="10">
                         <ComboBox Header="Round-robin base order (diagnostic)"
                                   SelectedIndex="{Binding ProductionSyncOrderModeIndex, Mode=TwoWay}"
                                   IsEnabled="{Binding CanSend}" HorizontalAlignment="Stretch">
@@ -144,16 +169,6 @@
                         <TextBlock Text="{Binding ProductionSyncOrderDescription}" TextWrapping="Wrap"
                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
 
-                        <Grid ColumnSpacing="12" Margin="0,6,0,0">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <Button Content="START" Click="Start_Click" IsEnabled="{Binding CanSend}"
-                                    HorizontalAlignment="Stretch" Style="{StaticResource AccentButtonStyle}" />
-                            <Button Grid.Column="1" Content="RESET" Click="Reset_Click"
-                                    IsEnabled="{Binding CanSend}" HorizontalAlignment="Stretch" />
-                        </Grid>
 
                         <TextBlock Text="{Binding QualificationGateText}" FontFamily="Consolas" TextWrapping="Wrap" />
                         <Button Content="START #1 (QUALIFICATION)" Click="QualificationFirstStart_Click" IsEnabled="{Binding CanSend}" />
@@ -180,6 +195,8 @@
                         <Button Content="REFRESH STATUS (SELECTED)" Click="RefreshStatus_Click"
                                 IsEnabled="{Binding CanSend}" HorizontalAlignment="Stretch"
                                 ToolTipService.ToolTip="One-shot STATUS request. Automatic polling stays paused while timers are running." />
+                            </StackPanel>
+                        </Expander>
                     </StackPanel>
                 </Grid>
             </Border>

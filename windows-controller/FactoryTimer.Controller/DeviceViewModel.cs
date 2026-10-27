@@ -489,6 +489,7 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
             _ => "OFFLINE",
         };
         OnlineBrush = availability == DeviceAvailability.Online ? OnlineColor : OfflineColor;
+        if (availability != DeviceAvailability.Online) ClearLiveCountdownState();
     }
 
     public void BeginSearching()
@@ -507,6 +508,7 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         statusTracker.MarkOffline();
         OnlineText = "OFFLINE";
         OnlineBrush = OfflineColor;
+        ClearLiveCountdownState();
         rssiDbm = null;
         wifiChannel = null;
         bssidValue = null;
@@ -515,6 +517,14 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
         WifiChannelText = "—";
         Bssid = "—";
         ClearSynchronization();
+    }
+
+    private void ClearLiveCountdownState()
+    {
+        State = "UNKNOWN";
+        RemainingSeconds = "—";
+        lastStatusRemainingSeconds = null;
+        executionStatus = null;
     }
 
     private bool HasWeakRssi => rssiDbm is < -70;

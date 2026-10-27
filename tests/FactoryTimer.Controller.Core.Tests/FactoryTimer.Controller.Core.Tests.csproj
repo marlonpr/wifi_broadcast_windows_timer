@@ -13,5 +13,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\windows-controller\FactoryTimer.Controller.Core\FactoryTimer.Controller.Core.csproj" />
+    <Compile Include="..\..\windows-controller\FactoryTimer.Controller\ControllerClock.cs" Link="ControllerClock.cs" />
   </ItemGroup>
 </Project>

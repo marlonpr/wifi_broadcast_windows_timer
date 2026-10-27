@@ -8,7 +8,7 @@ namespace FactoryTimer.Controller;
 
 internal sealed partial class MainViewModel
 {
-    private readonly FileProgramStateStore programStore = new(Path.Combine(
+    private readonly IProgramStateStore programStore = new FileProgramStateStore(Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "FactoryTimer.Controller", "production_program.json"));
     private SegmentedProgramCoordinator? productionProgram;
@@ -29,6 +29,7 @@ internal sealed partial class MainViewModel
     private string productionProgramText = "No production program. Choose a duration and repetitions.";
     private readonly Dictionary<string, ulong> expectedExecutionReplies = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (ExecutionStatusPacket Packet, DateTimeOffset At)> matchedExecutionReplies = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (ulong Request, IPAddress Address)> matchedExecutionAddresses = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (ExecutionStatusPacket Packet, DateTimeOffset At)> latestProgramExecution = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (StatusPacket Packet, DateTimeOffset At)> latestProgramHealth = new(StringComparer.Ordinal);
     private readonly SegmentDriftMonitor programDrift = new();
@@ -38,7 +39,7 @@ internal sealed partial class MainViewModel
     public double RepetitionsInput { get => repetitionsInput; set => SetProperty(ref repetitionsInput, value); }
     public double SegmentCapSecondsInput { get => segmentCapSecondsInput; set => SetProperty(ref segmentCapSecondsInput, value); }
     public string ProductionProgramText { get => productionProgramText; private set => SetProperty(ref productionProgramText, value); }
-    public bool CanManageProgram => !programManagementBusy && !isSending && !IsBenchmarkRunning && productionProgram is not null;
+    public bool CanManageProgram => !completionResetInProgress && !programManagementBusy && !isSending && !IsBenchmarkRunning && productionProgram is not null;
 
     private void LoadProductionProgram()
     {
@@ -47,8 +48,19 @@ internal sealed partial class MainViewModel
             ProgramExecutionState? saved = programStore.Load();
             if (saved is null) return;
             productionProgram = new(programStore, saved);
+            DurationMinutesInput = saved.Program.DurationSeconds / 60;
+            DurationSecondsInput = saved.Program.DurationSeconds % 60;
+            RepetitionsInput = saved.Program.TotalRepeats;
+            SegmentCapSecondsInput = saved.Program.SegmentCapSeconds;
+            foreach (DeviceViewModel device in Devices) device.IsSelected = saved.Program.Participants.Contains(device.DeviceId);
+            if (saved.StopCheckpoint is { DiscardProgress: false } checkpoint)
+                clock.Pause(checkpoint.RemainingSeconds, checkpoint.CurrentRepeat, saved.Program.TotalRepeats);
+            else if (saved.Stage == ProgramStage.Stopped)
+                clock.Reset(saved.Program.DurationSeconds);
             if (saved.Active)
                 ProductionProgramText = $"Saved plan {saved.Program.PlanId:X16}: {saved.Stage}. Use RECONCILE before another START.";
+            UpdateProductionProgramText();
+            RefreshClockProperties();
         }
         catch (Exception exception)
         {
@@ -74,9 +86,14 @@ internal sealed partial class MainViewModel
         DateTimeOffset now = DateTimeOffset.UtcNow;
         latestProgramExecution[device.DeviceId] = (packet, now);
         if (packet.ResponseId != 0 && expectedExecutionReplies.GetValueOrDefault(device.DeviceId) == packet.ResponseId)
+        {
             matchedExecutionReplies[device.DeviceId] = (packet, now);
+            matchedExecutionAddresses[device.DeviceId] = (packet.ResponseId, address);
+        }
         device.ApplyExecution(packet);
-        if (packet.PlanId != 0 && (packet.State is TimerState.Armed or TimerState.Running) && !productionSilentRunOwnsExactWindow)
+        if (!operatorStopInProgress && productionProgram?.State.StopCheckpoint is null &&
+            (productionProgram is null || productionProgram.State.Program.Participants.Contains(device.DeviceId)) &&
+            packet.PlanId != 0 && (packet.State is TimerState.Armed or TimerState.Running) && !productionSilentRunOwnsExactWindow)
             ScheduleRecoveredRunningStatusPause(checked((uint)Math.Ceiling(
                 (packet.SegmentDurationSeconds * 1_000_000d - packet.ElapsedSegmentMicroseconds) / 1_000_000d)));
     }
@@ -101,19 +118,21 @@ internal sealed partial class MainViewModel
     private DeviceViewModel[] ProgramParticipants() => productionProgram!.State.Program.Participants
         .Select(id => Devices.Single(d => d.DeviceId == id)).ToArray();
 
-    private async Task<Dictionary<string, ProgramDeviceObservation>> ProbeProgramAsync(CancellationToken token)
+    private async Task<Dictionary<string, ProgramDeviceObservation>> ProbeProgramAsync(CancellationToken token,
+        IReadOnlyList<DeviceViewModel>? targets = null)
     {
         recoveryProbeActive = true;
         try
         {
-            DeviceViewModel[] participants = ProgramParticipants();
+            DeviceViewModel[] participants = targets?.ToArray() ?? ProgramParticipants();
             Dictionary<string, ProgramDeviceObservation> observations = [];
             for (int attempt = 0; attempt < 3; attempt++)
             {
                 DateTimeOffset after = DateTimeOffset.UtcNow;
                 await RequestFreshStatusesAsync(participants, token);
                 await WaitForFreshStatusesAsync(participants, after, token);
-                observations = CurrentProgramObservations(after);
+                observations = CurrentProgramObservations(after).Where(pair => participants.Any(d => d.DeviceId == pair.Key))
+                    .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
                 if (observations.Count == participants.Length) break;
             }
             return observations;
@@ -127,13 +146,13 @@ internal sealed partial class MainViewModel
         programManagementBusy = true;
         UpdateCanSend();
         try { await action(); }
+        catch (Exception exception) { StatusMessage = "Countdown operation held: " + exception.Message; }
         finally { programManagementBusy = false; UpdateCanSend(); }
     }
 
-    private Task StartRepetitionProgramAsync() => !CanSend ? Task.CompletedTask : ManageProgramAsync(StartRepetitionProgramCoreAsync);
     public Task ReconcileProductionProgramAsync() => ManageProgramAsync(ReconcileProductionProgramCoreAsync);
     public Task ResumeProductionProgramAsync() => ManageProgramAsync(ResumeProductionProgramCoreAsync);
-    public Task StopRepetitionProgramAsync() => ManageProgramAsync(StopRepetitionProgramCoreAsync);
+    public Task StopRepetitionProgramAsync() => StopCountdownAsync();
 
     private async Task StartRepetitionProgramCoreAsync()
     {
@@ -151,10 +170,20 @@ internal sealed partial class MainViewModel
             StatusMessage = "Use a whole repetition count 1–1,000,000 and a segment cap from the countdown duration to 6000 s.";
             return;
         }
+        DateTimeOffset admissionTime = DateTimeOffset.UtcNow;
+        DeviceViewModel[] chosen = Devices.Where(d => d.IsSelected).ToArray();
+        IReadOnlyList<StartBlock> admissionBlocks = InitialRosterAdmission.Evaluate(chosen.Select(d =>
+            new InitialRosterParticipant(d.DeviceId, d.TryGetIpAddress(out _), d.IsOnlineAt(admissionTime))));
+        if (admissionBlocks.Count != 0)
+        {
+            ReportStartBlocks(admissionBlocks);
+            StatusMessage += " Correct the selection and press START again; no countdown was created.";
+            return;
+        }
         try
         {
             RepetitionProgram plan = RepetitionProgram.Create(CreateCommandId(), duration, (uint)RepetitionsInput,
-                Devices.Where(d => d.IsSelected).Select(d => d.DeviceId), (uint)SegmentCapSecondsInput);
+                chosen.Select(d => d.DeviceId), (uint)SegmentCapSecondsInput);
             ProgramExecutionState state = ProgramExecutionState.New(plan, productionProgram?.State);
             programStore.Save(state);
             productionProgram = new(programStore, state);
@@ -217,7 +246,7 @@ internal sealed partial class MainViewModel
         catch (OperationCanceledException) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
         {
             ProgramExecutionState before = productionProgram.State;
-            productionProgram.Hold("Boundary recovery exceeded 180 s (missing device or RTC/temperature); fleet remains at 00:00.");
+            productionProgram.Hold("Boundary recovery exceeded 10 s (missing device or RTC/temperature); fleet remains at 00:00.");
             await WriteAutomaticRecoveryAuditAsync(before, productionProgram.State, observations);
             StatusMessage = productionProgram.State.Message;
             UpdateProductionProgramText();
@@ -262,6 +291,7 @@ internal sealed partial class MainViewModel
                     programSyncSamples.Clear();
                     try { await SendStartAtAsync(QualificationStartMode.Ordinary, productionSegmentContext); }
                     finally { productionSegmentContext = null; }
+                    token.ThrowIfCancellationRequested();
                     if (!programArmSucceeded)
                     {
                         if (productionProgram.State.Stage == ProgramStage.Preparing && productionProgram.State.CurrentCommandId == 0)
@@ -320,6 +350,7 @@ internal sealed partial class MainViewModel
         finally
         {
             productionSegmentContext = null;
+            await ResetCompletedProgramAsync();
             if (productionProgram?.State.Active != true) { programAwakeLease?.Dispose(); programAwakeLease = null; }
             UpdateProductionProgramText();
             UpdateCanSend();
@@ -372,7 +403,12 @@ internal sealed partial class MainViewModel
             else {
                 productionSilentRunCancellation?.Cancel();
                 ResumeAutomaticStatusDiscoveryAfterRun();
-                if (decision.Action == ReconcileAction.Complete) { programAwakeLease?.Dispose(); programAwakeLease = null; }
+                if (decision.Action == ReconcileAction.Complete)
+                {
+                    await WriteProgramSegmentAuditAsync(observations);
+                    await ResetCompletedProgramAsync();
+                    programAwakeLease?.Dispose(); programAwakeLease = null;
+                }
             }
         }
         catch (Exception exception) { StatusMessage = "Reconciliation held: " + exception.Message; }
@@ -436,38 +472,22 @@ internal sealed partial class MainViewModel
         UpdateCanSend();
     }
 
-    private async Task StopRepetitionProgramCoreAsync()
-    {
-        if (productionProgram is null) return;
-        programCancellation?.Cancel();
-        await programTask; // A finite prepare/abort already in progress owns sendLock.
-        try
-        {
-            productionProgram.Stop();
-            productionSilentRunCancellation?.Cancel();
-            ResumeAutomaticStatusDiscoveryAfterRun();
-            await sendLock.WaitAsync();
-            try
-            {
-                var reset = new CommandPacket(CommandType.Reset, CreateCommandId(), productionProgram.State.Program.DurationSeconds, 0);
-                foreach (DeviceViewModel device in ProgramParticipants())
-                    if (device.TryGetIpAddress(out IPAddress? address) && address is not null)
-                        await udpService.SendCommandUnicastAsync(reset, address);
-                clock.Reset(productionProgram.State.Program.DurationSeconds);
-                StatusMessage = "Program stopped. RESET sent to its frozen participants; verify every board is idle.";
-            }
-            finally { sendLock.Release(); }
-        }
-        catch (Exception exception) { StatusMessage = "Program stopped locally; RESET delivery needs checking: " + exception.Message; }
-        programAwakeLease?.Dispose(); programAwakeLease = null;
-        UpdateProductionProgramText(); UpdateCanSend();
-    }
-
     private void UpdateProductionProgramText()
     {
         if (productionProgramLoadError is not null) { ProductionProgramText = "RECOVERY HELD: " + productionProgramLoadError; return; }
         if (productionProgram is null) return;
         ProgramExecutionState state = productionProgram.State;
+        if (state.StopCheckpoint is { } checkpoint)
+        {
+            ProductionProgramText = checkpoint.DiscardProgress ? "RESET — START begins a new countdown." :
+                $"PAUSED — {FormatMinutesSeconds(checkpoint.RemainingSeconds)} — repetition {checkpoint.CurrentRepeat}/{state.Program.TotalRepeats}. START continues; RESET clears progress.";
+            if (!checkpoint.PositionKnown && !checkpoint.DiscardProgress)
+                ProductionProgramText = "STOPPED — saved position unavailable. RESET, then START for a new countdown.";
+            if (checkpoint.PendingDeviceIds.Count != 0)
+                ProductionProgramText += "\nWaiting for stop confirmation: " + string.Join(", ", checkpoint.PendingDeviceIds);
+            NotifyCountdownControls();
+            return;
+        }
         string plan = string.Join(" + ", state.Program.Segments.Take(12).Select(s => s.RepeatCount)) +
             (state.Program.Segments.Count > 12 ? " + …" : "");
         uint repeat = state.Stage == ProgramStage.Running ? clock.CurrentRepeat :
@@ -479,6 +499,7 @@ internal sealed partial class MainViewModel
             $"Frozen fleet: {string.Join(", ", state.Program.Participants)}. {state.Message}" +
             (programDriftAlert.Length == 0 ? "" : "\n" + programDriftAlert);
         OnPropertyChanged(nameof(CanManageProgram));
+        NotifyCountdownControls();
     }
 
     private void RecordProgramSyncSample(string device, ulong syncId, SyncReplyPacket reply, ClockSyncSample sample)
@@ -578,7 +599,7 @@ internal sealed partial class MainViewModel
         string[] recovered = afterCounts.Keys.Where(id =>
             afterCounts[id] > beforeCounts.GetValueOrDefault(id)).ToArray();
         bool held = before.Stage != ProgramStage.Held && after.Stage == ProgramStage.Held;
-        bool timeout = held && after.Message.Contains("180 s", StringComparison.Ordinal);
+        bool timeout = held && after.Message.Contains("10 s", StringComparison.Ordinal);
         var entries = new List<(string Device, string Event)>();
         entries.AddRange(newlyMissing.Select(id => (id, "MISSING_WAIT")));
         entries.AddRange(recovered.Select(id => (id, "AUTO_RECOVERED")));
@@ -683,9 +704,14 @@ internal sealed partial class MainViewModel
         executionLines.AddRange(observations.Values.OrderBy(x => x.Execution.DeviceId).Select(x => FormattableString.Invariant(
             $"{x.Execution.PlanId:X16},{x.Execution.SegmentIndex},{x.Execution.CommandId:X16},{x.Execution.DeviceId},{x.Execution.BootId:X16},{x.Health.FirmwareBuildId},{x.Execution.State},{x.Execution.CurrentRepeat},{x.Execution.ElapsedSegmentSeconds},{x.Execution.ElapsedSegmentMicroseconds},{x.Execution.RtcRecoveredEdges},{x.Health.RtcAcceptedEdges},{x.Health.RtcInferredMissingEdges},{x.Health.RtcHoldoverEntries},{x.Health.RtcQueueDrops},{x.Health.RtcTemperatureValid},{x.Health.DiagnosticFlags:X},{x.Health.WifiDisconnectCount},{x.Health.WifiReconnectCount},{x.Health.WifiLastReconnectUptimeMs}")));
         await File.WriteAllLinesAsync(stem + "_execution.csv", executionLines, Encoding.UTF8);
-        if (state.ControllerSessionId != controllerSessionId)
+        if (state.ControllerSessionId != controllerSessionId ||
+            (state.CurrentSegmentIndex == 1 && state.Program.ResumePosition is { } resumed &&
+             resumed.RemainingSeconds < state.Program.DurationSeconds))
         {
-            programDrift.Reset(); // A restarted controller has a different master-clock origin.
+            // A restart changes the PC epoch. The shortened first repeat after
+            // STOP is also excluded: its tiny sync interval can turn sync noise
+            // into a false frequency/spread limit for the following long segment.
+            programDrift.Reset();
             return;
         }
         var points = observations.Values.Where(x => x.Health.SyncEpochLocalMicroseconds > 0 &&

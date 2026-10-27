@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../windows-controller/FactoryTimer.Controller.Core/FactoryTimer.Controller.Core.csproj" />
+    <PackageReference Include="System.IO.Ports" Version="10.0.0" />
+    <Compile Include="../../windows-controller/FactoryTimer.Controller/*.cs"
+             Exclude="../../windows-controller/FactoryTimer.Controller/App.xaml.cs;../../windows-controller/FactoryTimer.Controller/MainWindow.xaml.cs" />
+    <Content Include="../../windows-controller/FactoryTimer.Controller/MainWindow.xaml" Link="MainWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

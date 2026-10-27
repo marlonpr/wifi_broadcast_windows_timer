@@ -13,7 +13,7 @@
 // ProductionPrograms then waits RemainingSeconds + 1 s (PauseForRecoveredSegmentAsync)
 // before probing again, with the rest of the line idle at 00:00.
 // Expected after the fix: a same-session board reporting RUNNING after the planned
-// segment end is re-probed within seconds, inside the 180 s boundary window.
+// segment end is re-probed within seconds, inside the 10 s boundary window.
 
 using FactoryTimer.Controller.Core;
 using FactoryTimer.Protocol;
@@ -56,13 +56,13 @@ var t0 = new DateTimeOffset(2026, 10, 22, 18, 0, 0, TimeSpan.Zero);
     Check(c.Reconcile(obs, t0, plannedSegmentEnded: true).Action == ReconcileAction.WaitForReadiness,
         "one missing participant waits at boundary");
     obs["ESP05"] = At("ESP05", c.State, TimerState.Running, 600L * 1_000_000);
-    var stale = c.Reconcile(obs, t0.AddSeconds(20), plannedSegmentEnded: true);
+    var stale = c.Reconcile(obs, t0.AddSeconds(2), plannedSegmentEnded: true);
     Check(stale.Action == ReconcileAction.WaitForReadiness && !stale.RemainingSeconds.HasValue,
         "stale RUNNING after deadline never schedules remaining 5399 seconds");
     Check(c.State.Stage == ProgramStage.WaitingForReadiness && c.State.CompletedRepeatCount == 0,
         "no false completion; wait remains bounded");
     obs["ESP05"] = At("ESP05", c.State, TimerState.Finished, 5999L * 1_000_000);
-    Check(c.Reconcile(obs, t0.AddSeconds(25), plannedSegmentEnded: true).Action == ReconcileAction.SynchronizeNextSegment,
+    Check(c.Reconcile(obs, t0.AddSeconds(5), plannedSegmentEnded: true).Action == ReconcileAction.SynchronizeNextSegment,
         "exact FINISHED is accepted after stale response");
     Check(c.State.CompletedRepeatCount == 1 && c.State.NextSegmentIndex == 2,
         "original repetition credited only once");
@@ -72,10 +72,10 @@ var t0 = new DateTimeOffset(2026, 10, 22, 18, 0, 0, TimeSpan.Zero);
     var obs = ids.ToDictionary(x => x, x => At(x, c.State, TimerState.Finished, 5999L * 1_000_000));
     obs["ESP05"] = At("ESP05", c.State, TimerState.Running, 600L * 1_000_000);
     Check(c.Reconcile(obs, t0, plannedSegmentEnded: true).Action == ReconcileAction.WaitForReadiness,
-        "stale RUNNING begins 180-second bound");
-    var held = c.Reconcile(obs, t0.AddSeconds(181), plannedSegmentEnded: true);
+        "stale RUNNING begins 10-second bound");
+    var held = c.Reconcile(obs, t0.AddSeconds(10), plannedSegmentEnded: true);
     Check(held.Action == ReconcileAction.Hold && c.State.Stage == ProgramStage.Held,
-        "stale RUNNING that never clears enters HOLD after 180 seconds");
+        "stale RUNNING that never clears enters HOLD after 10 seconds");
     Check(c.State.CompletedRepeatCount == 0,
         "no false repetition credited on timeout");
 }

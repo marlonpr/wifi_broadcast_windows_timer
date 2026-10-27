@@ -129,9 +129,9 @@ Check(autoRecovered.Reconcile(wifiOutage, boundaryTime).Action == ReconcileActio
     "boundary missing: wait without advancing repeats");
 Check(autoRecovered.State.CompletedRepeatCount == 0 && autoRecovered.State.PendingMissingParticipants!.Contains("ESP03"),
     "missing identity persisted during bounded wait");
-Check(autoRecovered.Reconcile(wifiOutage, boundaryTime.AddSeconds(179)).Action == ReconcileAction.WaitForReadiness,
-    "missing board waits up to the 180s deadline");
-Check(autoRecovered.Reconcile(allAfterBoundary, boundaryTime.AddSeconds(179.5)).Action == ReconcileAction.SynchronizeNextSegment,
+Check(autoRecovered.Reconcile(wifiOutage, boundaryTime.AddSeconds(9)).Action == ReconcileAction.WaitForReadiness,
+    "missing board waits up to the 10s deadline");
+Check(autoRecovered.Reconcile(allAfterBoundary, boundaryTime.AddSeconds(9.5)).Action == ReconcileAction.SynchronizeNextSegment,
     "same-boot exact FINISHED after reconnect resumes automatically");
 Check(autoRecovered.State.CompletedRepeatCount == 1 &&
     autoRecovered.State.AutomaticRecoveryCounts!.GetValueOrDefault("ESP03") == 1,
@@ -140,8 +140,8 @@ var notBack = new SegmentedProgramCoordinator(new MemoryStore(), armed);
 notBack.MarkRunning();
 Check(notBack.Reconcile(wifiOutage, boundaryTime).Action == ReconcileAction.WaitForReadiness,
     "permanently missing board starts timeout");
-Check(notBack.Reconcile(wifiOutage, boundaryTime.AddSeconds(180)).Action == ReconcileAction.Hold &&
-    notBack.State.NextSegmentIndex == 1,"missing board after180s holds without starting next segment");
+Check(notBack.Reconcile(wifiOutage, boundaryTime.AddSeconds(10)).Action == ReconcileAction.Hold &&
+    notBack.State.NextSegmentIndex == 1,"missing board after10s holds without starting next segment");
 var rebootReturn = new SegmentedProgramCoordinator(new MemoryStore(), armed);
 rebootReturn.MarkRunning();
 rebootReturn.Reconcile(wifiOutage, boundaryTime);
@@ -167,8 +167,8 @@ finished = plan.Participants.ToDictionary(x=>x,x=>At(x,armed,TimerState.Finished
 finished["ESP03"] = finished["ESP03"] with { Health=finished["ESP03"].Health with { RtcTemperatureValid=false } };
 var waitStarted=DateTimeOffset.UtcNow;
 Check(tempFault.Reconcile(finished,waitStarted).Action==ReconcileAction.WaitForReadiness && tempFault.State.NextSegmentIndex==1,"post-run temperature failure waits before advancing");
-Check(tempFault.Reconcile(finished,waitStarted.AddSeconds(179)).Action==ReconcileAction.WaitForReadiness,"recoverable fault waits for full180s");
-Check(tempFault.Reconcile(finished,waitStarted.AddSeconds(180)).Action==ReconcileAction.Hold,"180s boundary wait is bounded");
+Check(tempFault.Reconcile(finished,waitStarted.AddSeconds(9)).Action==ReconcileAction.WaitForReadiness,"recoverable fault waits for full10s");
+Check(tempFault.Reconcile(finished,waitStarted.AddSeconds(10)).Action==ReconcileAction.Hold,"10s boundary wait is bounded");
 var recoveredTemp = new SegmentedProgramCoordinator(store,armed);
 Check(recoveredTemp.Reconcile(finished,waitStarted).Action==ReconcileAction.WaitForReadiness,"temperature wait enters recovery");
 finished["ESP03"]=finished["ESP03"] with { Health=finished["ESP03"].Health with { RtcTemperatureValid=true } };
