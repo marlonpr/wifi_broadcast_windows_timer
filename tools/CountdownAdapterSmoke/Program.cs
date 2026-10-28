@@ -55,6 +55,7 @@ await vm.SendResetAsync();
 coordinator = Field<SegmentedProgramCoordinator>(vm, "productionProgram");
 resetId = coordinator.State.StopCheckpoint!.ResetCommandId;
 Check(coordinator.State.StopCheckpoint!.DiscardProgress && !coordinator.State.StopCheckpoint.CanContinue, "RESET discards continuation");
+Check(coordinator.State.Program.LogoSeconds == 4, "operator RESET preloads the new four-second-logo program");
 Check(!clock.IsPaused && clock.RemainingSeconds == 135 && vm.ControllerState == "READY", "RESET uses draft duration for new countdown");
 Check(coordinator.State.StopCheckpoint.PendingDeviceIds.SequenceEqual(new[] { "ESP02", "ESP03" }), "RESET requires only the currently selected fleet");
 ProgramDeviceObservation Ready(string id) => new(new(id, 17, 42, 0, 0, resetId, TimerState.Ready,
@@ -362,7 +363,7 @@ using (var abortScopeVm = new MainViewModel(new DispatcherQueue(), new MemorySto
         participants.SetValue(Activator.CreateInstance(participantType, preparingDevices[i], IPAddress.Loopback,
             preparingDevices[i].BuildStartGateInput(DateTimeOffset.UtcNow)), i);
     object prepared = Activator.CreateInstance(runType, 900ul, 20u, 9_000_000L, participants,
-        false, null, 901ul, 1u, 1u, 1u, 1u)!;
+        false, null, 901ul, 1u, 1u, 1u, 1u, 0u)!;
     var restrict = typeof(MainViewModel).GetMethod("RestrictPreparedAbortForOperator", BindingFlags.Instance | BindingFlags.NonPublic)!;
     int CountPrepared(object run) => ((System.Collections.IEnumerable)runType.GetProperty("Participants")!.GetValue(run)!).Cast<object>().Count();
     Check(CountPrepared(restrict.Invoke(abortScopeVm, [prepared])!) == 3,
@@ -524,6 +525,39 @@ using (var finishedVm = new MainViewModel(new DispatcherQueue(), completedStore,
     using var restored = new MainViewModel(new DispatcherQueue(), completedStore, new NoNetworkProvider());
     Check(restored.ControllerRemaining == "00:20" && restored.ControllerState == "READY" &&
         restored.ProductionProgramText.Contains("Waiting for stop confirmation"), "pending completion RESET survives controller restart");
+}
+
+using (var logoVm = new MainViewModel(new DispatcherQueue(), new MemoryStore(), new NoNetworkProvider()))
+{
+    var segment = RepetitionProgram.Create(900,20,3,["ESP01"],logoSeconds:4).Segments.Single();
+    var gate = typeof(MainViewModel).GetMethod("ValidateLogoFirmware",BindingFlags.Instance|BindingFlags.NonPublic)!;
+    DateTimeOffset challenge = DateTimeOffset.UtcNow;
+    StartBlock[] Evaluate() => (StartBlock[])gate.Invoke(logoVm,[segment,new[]{logoVm.Esp01},challenge])!;
+    Check(Evaluate().Single().Reason == StartBlockReason.FirmwareIncompatible, "missing logo capability blocks before sync or ARM");
+    var expected = Field<Dictionary<string,ulong>>(logoVm,"expectedExecutionReplies");
+    var replies = Field<Dictionary<string,(ExecutionStatusPacket Packet,DateTimeOffset At)>>(logoVm,"matchedExecutionReplies");
+    expected["ESP01"]=123;
+    var idle = new ExecutionStatusPacket("ESP01",123,42,0,0,0,TimerState.Ready,20,1,1,1,1,0,0,0,129);
+    replies["ESP01"]=(idle,DateTimeOffset.UtcNow);
+    Check(Evaluate().Length == 1,"old firmware cannot receive a four-second logo command");
+    replies["ESP01"]=(idle with { LogoSeconds=0 },challenge.AddTicks(-1));
+    Check(Evaluate().Length == 1,"stale capability cannot authorize a logo segment");
+    replies["ESP01"]=(idle with { LogoSeconds=0 },DateTimeOffset.UtcNow);
+    Check(Evaluate().Length == 0,"fresh challenged feature support authorizes normal START preparation");
+    expected["ESP01"]=124;Check(Evaluate().Length == 1,"old challenge ID cannot authorize logo START");
+    var device = logoVm.Esp01;
+    device.Apply(new StatusPacket("ESP01",77,TimerState.Running,1),new IPEndPoint(freshIp,5000),MasterClock.NowMicroseconds);
+    device.ApplyExecution(idle with { PlanId=900,SegmentIndex=1,CommandId=77,State=TimerState.Running,
+        RepeatCount=3,TotalRepeats=3,ElapsedSegmentSeconds=19,ElapsedSegmentMicroseconds=19_000_000,LogoSeconds=4 });
+    Set(device,"executionObservedAt",challenge);
+    device.UpdateRunningRemainingEstimate(challenge.AddSeconds(1));Check(device.RemainingSeconds=="LOGO","timer card shows logo during the gap");
+    device.UpdateRunningRemainingEstimate(challenge.AddSeconds(5));Check(device.RemainingSeconds=="00:20","timer card begins the next full repetition after four seconds");
+    var runType = typeof(MainViewModel).GetNestedType("PreparedStartRun",BindingFlags.NonPublic)!;
+    var participantType = typeof(MainViewModel).GetNestedType("PreparedParticipant",BindingFlags.NonPublic)!;
+    var participants = Array.CreateInstance(participantType,0);
+    var prepared = Activator.CreateInstance(runType,900ul,20u,5_000_000L,participants,false,null,900ul,1u,3u,1u,3u,4u)!;
+    Check((uint)runType.GetProperty("SegmentDurationSeconds")!.GetValue(prepared)! == 72,
+        "prepared ARM, trace and silent window include the final logo instead of ending at 60s");
 }
 
 XDocument xaml = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));

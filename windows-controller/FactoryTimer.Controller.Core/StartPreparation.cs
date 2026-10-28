@@ -20,6 +20,7 @@ public enum StartBlockReason
     ArmAckMissing,
     AbortUnconfirmed,
     MissingExpectedDevice,
+    FirmwareIncompatible,
 }
 
 public sealed record StartBlock(

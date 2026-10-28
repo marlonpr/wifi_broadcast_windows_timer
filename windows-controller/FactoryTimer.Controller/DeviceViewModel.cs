@@ -295,8 +295,9 @@ internal sealed class DeviceViewModel(string deviceId, bool initiallySelected = 
             double phase = Math.Max(0, execution.ElapsedSegmentMicroseconds / 1_000_000d +
                 (nowUtc - executionObservedAt).TotalSeconds);
             uint elapsed = (uint)Math.Min(execution.SegmentDurationSeconds, Math.Floor(phase));
-            uint value = elapsed >= execution.SegmentDurationSeconds ? 0 : execution.DurationSeconds - elapsed % execution.DurationSeconds;
-            RemainingSeconds = $"{value / 60u:00}:{value % 60u:00}";
+            uint value = FactoryProtocol.RepeatRemaining(execution.DurationSeconds, execution.RepeatCount, elapsed, execution.LogoSeconds.GetValueOrDefault());
+            RemainingSeconds = value == 0 && elapsed < execution.SegmentDurationSeconds && execution.LogoSeconds > 0
+                ? "LOGO" : $"{value / 60u:00}:{value % 60u:00}";
             return;
         }
         double elapsedSeconds = Math.Max(0d, (nowUtc - lastStatusAtUtc.Value).TotalSeconds);

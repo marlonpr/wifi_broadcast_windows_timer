@@ -3064,6 +3064,9 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                     return;
                 }
 
+                StartBlock[] logoBlocks = ValidateLogoFirmware(programSegment, participants, preflightAfterUtc);
+                if (logoBlocks.Length != 0) { ReportStartBlocks(logoBlocks); return; }
+
                 IReadOnlyList<StartBlock> warmupBlocks = ValidateQualificationWarmup(participants, qualificationMode);
                 if (warmupBlocks.Count != 0)
                 {
@@ -3169,7 +3172,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                     gateInputs,
                     gateNowUtc,
                     targetCandidateUs, programSegment is null ? StartReadinessGate.FleetPairBudgetMicroseconds :
-                        ProductionTimingBudget.StartAllowanceUs(programSegment.Duration, productionProgram!.State.MeasuredPairRatePpm));
+                        ProductionTimingBudget.StartAllowanceUs(programSegment.CountdownSpan, productionProgram!.State.MeasuredPairRatePpm));
                 if (!gateResult.Accepted)
                 {
                     ClearDegradedStartPending();
@@ -3239,7 +3242,8 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                     PlanId: programSegment is null ? 0 : productionProgram!.State.Program.PlanId,
                     SegmentIndex: programSegment?.Index ?? 0, RepeatCount: programSegment?.RepeatCount ?? 1,
                     FirstRepeat: programSegment?.FirstRepeat ?? 1,
-                    TotalRepeats: programSegment is null ? 1 : productionProgram!.State.Program.TotalRepeats);
+                    TotalRepeats: programSegment is null ? 1 : productionProgram!.State.Program.TotalRepeats,
+                    LogoSeconds: programSegment?.LogoSeconds ?? 0);
                 preparedForAbort = prepared;
 
                 // Start a low-overhead in-memory TX trace before any START_AT
@@ -3266,7 +3270,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                     0,
                     prepared.TargetMasterMicroseconds, PlanId: prepared.PlanId,
                     SegmentIndex: prepared.SegmentIndex, RepeatCount: prepared.RepeatCount,
-                    FirstRepeat: prepared.FirstRepeat, TotalRepeats: prepared.TotalRepeats);
+                    FirstRepeat: prepared.FirstRepeat, TotalRepeats: prepared.TotalRepeats, LogoSeconds: prepared.LogoSeconds);
                 if (programSegment is not null)
                     productionProgram!.RecordArm(prepared.CommandId, prepared.TargetMasterMicroseconds,
                         controllerSessionId, CurrentProgramObservations().Values.ToArray());
@@ -3278,7 +3282,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                 }
 
                 clock.ArmSegmentAt(prepared.DurationSeconds, prepared.RepeatCount, prepared.TargetMasterMicroseconds,
-                    prepared.FirstRepeat, prepared.TotalRepeats);
+                    prepared.FirstRepeat, prepared.TotalRepeats, prepared.LogoSeconds);
                 SetStartDiagnostic(
                     $"START: ARMING {prepared.Participants.Count} selected timer(s); waiting for ACKs and final STATUS barrier...");
 
@@ -3875,6 +3879,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                 if (execution.PlanId != prepared.PlanId || execution.SegmentIndex != prepared.SegmentIndex ||
                     execution.CommandId != prepared.CommandId || execution.State != TimerState.Armed ||
                     execution.DurationSeconds != prepared.DurationSeconds || execution.RepeatCount != prepared.RepeatCount ||
+                    execution.LogoSeconds.GetValueOrDefault() != prepared.LogoSeconds ||
                     execution.FirstRepeat != prepared.FirstRepeat || execution.TotalRepeats != prepared.TotalRepeats ||
                     execution.TargetMasterMicroseconds != prepared.TargetMasterMicroseconds ||
                     execution.BootId != participant.GateSnapshot.BootId)
@@ -4374,6 +4379,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
     private static string FormatStartBlockReason(StartBlockReason reason) => reason switch
     {
         StartBlockReason.Offline => "OFFLINE",
+        StartBlockReason.FirmwareIncompatible => "FIRMWARE UPDATE REQUIRED",
         StartBlockReason.StatusStale => "STATUS STALE",
         StartBlockReason.ParticipantBusy => "PARTICIPANT BUSY",
         StartBlockReason.RtcNotLocked => "RTC NOT LOCKED",
@@ -5317,7 +5323,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
     private void RefreshClockProperties()
     {
         ControllerRemaining = FormatMinutesSeconds(clock.RemainingSeconds);
-        ControllerState = clock.IsPaused ? "PAUSED" : clock.State.ToString().ToUpperInvariant();
+        ControllerState = clock.IsPaused ? "PAUSED" : clock.IsLogoPhase ? "LOGO" : clock.State.ToString().ToUpperInvariant();
     }
 
     private static string FormatMinutesSeconds(uint totalSeconds)
@@ -5380,9 +5386,9 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
         IReadOnlyList<PreparedParticipant> Participants,
         bool RequireWarmupHealth = false,
         QualificationWarmupProof? WarmupProof = null, ulong PlanId = 0, uint SegmentIndex = 0,
-        uint RepeatCount = 1, uint FirstRepeat = 1, uint TotalRepeats = 1)
+        uint RepeatCount = 1, uint FirstRepeat = 1, uint TotalRepeats = 1, uint LogoSeconds = 0)
     {
-        public uint SegmentDurationSeconds => checked(DurationSeconds * RepeatCount);
+        public uint SegmentDurationSeconds => FactoryProtocol.SegmentDuration(DurationSeconds, RepeatCount, LogoSeconds);
     }
 
     private sealed record StartTelemetryContext(

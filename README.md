@@ -1,3 +1,11 @@
+# Controller 6.23.17 — four-second repetition logos
+
+New production runs include four-second logo/output intervals. The planner,
+clock, silence window and completion RESET include those intervals. Requires
+firmware 6.24.6-rc1; COMMIT wiring moves to GPIO17.
+See [current release notes](CONTROLLER_6_23_17_LOGO_OUTPUT.md).
+Older entries below are historical.
+
 # Controller 6.23.16 — completion RESET and current timer state
 
 After the whole program completes, save diagnostics and RESET the executed

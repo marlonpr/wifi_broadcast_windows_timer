@@ -8,8 +8,13 @@ public sealed record CountdownPosition(uint CurrentRepeat, uint RemainingSeconds
     {
         ulong elapsed = (ulong)Math.Max(0L, elapsedMicroseconds) / 1_000_000;
         if (elapsed >= segment.Duration) return new(segment.LastRepeat, 0);
-        return new(segment.FirstRepeat + (uint)(elapsed / segment.DurationSeconds),
-            segment.DurationSeconds - (uint)(elapsed % segment.DurationSeconds));
+        uint index = segment.FirstRepeat + FactoryTimer.Protocol.FactoryProtocol.RepeatOffset(segment.DurationSeconds,
+            segment.RepeatCount, elapsed, segment.LogoSeconds);
+        uint remaining = FactoryTimer.Protocol.FactoryProtocol.RepeatRemaining(segment.DurationSeconds, segment.RepeatCount, elapsed, segment.LogoSeconds);
+        // Pausing in a logo interval preserves the next countdown, rather than
+        // persisting an invalid zero-second intermediate repetition.
+        if (remaining == 0 && index < segment.LastRepeat) return new(index + 1, segment.DurationSeconds);
+        return new(index, remaining);
     }
 
     public static CountdownPosition Capture(ProgramExecutionState state, long now, string session)

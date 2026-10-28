@@ -183,7 +183,7 @@ internal sealed partial class MainViewModel
         try
         {
             RepetitionProgram plan = RepetitionProgram.Create(CreateCommandId(), duration, (uint)RepetitionsInput,
-                chosen.Select(d => d.DeviceId), (uint)SegmentCapSecondsInput);
+                chosen.Select(d => d.DeviceId), (uint)SegmentCapSecondsInput, FactoryProtocol.RepetitionLogoSeconds);
             ProgramExecutionState state = ProgramExecutionState.New(plan, productionProgram?.State);
             programStore.Save(state);
             productionProgram = new(programStore, state);
@@ -279,7 +279,7 @@ internal sealed partial class MainViewModel
                         break;
                     }
                     ProgramSegment upcoming = state.Program.Segments.Single(s => s.Index == state.NextSegmentIndex);
-                    if (ProductionTimingBudget.StartAllowanceUs(upcoming.Duration, state.MeasuredPairRatePpm) <= 0)
+                    if (ProductionTimingBudget.StartAllowanceUs(upcoming.CountdownSpan, state.MeasuredPairRatePpm) <= 0)
                     {
                         productionProgram.Hold("Measured worst pair rate exceeds the next segment's 30 ms timing budget, including presentation reserve.");
                         break;
@@ -392,7 +392,7 @@ internal sealed partial class MainViewModel
                     .Min(x => x.Execution.ElapsedSegmentMicroseconds);
                 long target = MasterClock.NowMicroseconds - phase;
                 clock.ArmSegmentAt(segment.DurationSeconds, segment.RepeatCount, target,
-                    segment.FirstRepeat, productionProgram.State.Program.TotalRepeats);
+                    segment.FirstRepeat, productionProgram.State.Program.TotalRepeats, segment.LogoSeconds);
                 productionSilentRunActive = true;
                 productionSilentRunOwnsExactWindow = false;
                 foreach (DeviceViewModel device in ProgramParticipants()) device.BeginIntentionalStatusPause();
@@ -562,6 +562,7 @@ internal sealed partial class MainViewModel
             bool planMatch = e.PlanId == state.Program.PlanId;
             bool segmentMatch = segment != null && e.SegmentIndex == segment.Index &&
                 e.DurationSeconds == segment.DurationSeconds && e.RepeatCount == segment.RepeatCount &&
+                e.LogoSeconds.GetValueOrDefault() == segment.LogoSeconds &&
                 e.FirstRepeat == segment.FirstRepeat && e.TotalRepeats == state.Program.TotalRepeats;
             bool targetMatch = e.TargetMasterMicroseconds == state.TargetMasterMicroseconds;
             string readyReason = ProductionRecoveryPolicy.OperationalReadinessReason(observed);
@@ -675,6 +676,7 @@ internal sealed partial class MainViewModel
                 e.CommandId != state.CurrentCommandId || h.CommandId != e.CommandId ||
                 e.State != TimerState.Finished || h.State != TimerState.Finished ||
                 e.DurationSeconds != segment.DurationSeconds || e.RepeatCount != segment.RepeatCount ||
+                e.LogoSeconds.GetValueOrDefault() != segment.LogoSeconds ||
                 e.FirstRepeat != segment.FirstRepeat || e.TotalRepeats != state.Program.TotalRepeats ||
                 e.TargetMasterMicroseconds != state.TargetMasterMicroseconds ||
                 e.CurrentRepeat != segment.LastRepeat || e.ElapsedSegmentSeconds != segment.Duration ||

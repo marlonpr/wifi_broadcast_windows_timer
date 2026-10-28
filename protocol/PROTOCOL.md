@@ -1,3 +1,26 @@
+# Logo/output extension — firmware 6.24.6-rc1 / controller 6.23.17
+
+Logo-enabled segmented START_AT appends one decimal field `LogoSeconds=4` to
+the existing 13 fields. Legacy packets keep LogoSeconds=0 implicitly. Every
+repetition lasts D countdown seconds plus four logo seconds, including the last.
+Internal gaps count against the resync cap: n*D+(n-1)*L <= cap. Full completion,
+monitoring and network silence last n*(D+L). This preserves a 5999-second maximum
+individual countdown plus its final four-second post-countdown logo.
+
+EXEC_STATUS has an optional 20th decimal field LogoSeconds (0 or 4). Its presence
+announces support. The controller requires fresh challenged support before a logo
+START, and compares the field at final ARM/recovery. Elapsed phase includes logo
+seconds; remaining is 0 while still RUNNING in a logo, and repeat index advances
+when the next countdown begins. FINISHED requires the full elapsed segment.
+
+GPIO33 starts HIGH at accepted ARM for four local seconds, then LOW. A repeated
+command ID does not retrigger. Logo blink edges use absolute disciplined deadlines
+with 500,000 us half periods. RESET cancels the timer and drives LOW. COMMIT is on
+GPIO17 and retains its original one-second grid. STATUS is unchanged.
+
+The protocol history below describes legacy forms. Pair this firmware with the
+new controller; older controllers cannot parse the 20-field EXEC_STATUS.
+
 # Factory Timer Protocol — FCT1 + FCT2 synchronization extension
 
 The controller and timers use printable ASCII UDP datagrams on port `5000`.
