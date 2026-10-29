@@ -1,3 +1,14 @@
+# Controller 6.23.18 — repetition options
+
+Two checkboxes below the resync limit select a four-second start logo/steady
+active-LOW signal before each repetition, and synchronization before every
+repetition. Both default OFF. The seconds limit is disabled in per-repeat sync
+mode. Plans persist both options; RESET is required to change paused timing.
+Use firmware 6.24.8-rc1 for the new signal option. See
+[timing and build notes](CONTROLLER_6_23_18_REPETITION_OPTIONS.md).
+
+The entries below are historical.
+
 # Controller 6.23.17 — four-second repetition logos
 
 New production runs include four-second logo/output intervals. The planner,

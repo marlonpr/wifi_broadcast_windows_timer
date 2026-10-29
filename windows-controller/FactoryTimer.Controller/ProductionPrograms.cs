@@ -26,6 +26,8 @@ internal sealed partial class MainViewModel
     private AwakeLease? programAwakeLease;
     private double repetitionsInput = 1;
     private double segmentCapSecondsInput = 6000;
+    private bool signalEveryRepetitionStart;
+    private bool syncEveryRepetition;
     private string productionProgramText = "No production program. Choose a duration and repetitions.";
     private readonly Dictionary<string, ulong> expectedExecutionReplies = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (ExecutionStatusPacket Packet, DateTimeOffset At)> matchedExecutionReplies = new(StringComparer.Ordinal);
@@ -38,6 +40,14 @@ internal sealed partial class MainViewModel
 
     public double RepetitionsInput { get => repetitionsInput; set => SetProperty(ref repetitionsInput, value); }
     public double SegmentCapSecondsInput { get => segmentCapSecondsInput; set => SetProperty(ref segmentCapSecondsInput, value); }
+    public bool SignalEveryRepetitionStart { get => signalEveryRepetitionStart; set => SetProperty(ref signalEveryRepetitionStart, value); }
+    public bool SyncEveryRepetition
+    {
+        get => syncEveryRepetition;
+        set { if (SetProperty(ref syncEveryRepetition, value)) OnPropertyChanged(nameof(CanEditResyncLimit)); }
+    }
+    public bool CanEditRepetitionOptions => CanEditCountdownSettings && productionProgram?.State.StopCheckpoint is not { DiscardProgress: false };
+    public bool CanEditResyncLimit => CanEditRepetitionOptions && !SyncEveryRepetition;
     public string ProductionProgramText { get => productionProgramText; private set => SetProperty(ref productionProgramText, value); }
     public bool CanManageProgram => !completionResetInProgress && !programManagementBusy && !isSending && !IsBenchmarkRunning && productionProgram is not null;
 
@@ -52,6 +62,8 @@ internal sealed partial class MainViewModel
             DurationSecondsInput = saved.Program.DurationSeconds % 60;
             RepetitionsInput = saved.Program.TotalRepeats;
             SegmentCapSecondsInput = saved.Program.SegmentCapSeconds;
+            SignalEveryRepetitionStart = saved.Program.RepeatStartSeconds != 0;
+            SyncEveryRepetition = saved.Program.SyncEveryRepetition;
             foreach (DeviceViewModel device in Devices) device.IsSelected = saved.Program.Participants.Contains(device.DeviceId);
             if (saved.StopCheckpoint is { DiscardProgress: false } checkpoint)
                 clock.Pause(checkpoint.RemainingSeconds, checkpoint.CurrentRepeat, saved.Program.TotalRepeats);
@@ -165,7 +177,7 @@ internal sealed partial class MainViewModel
         if (!double.IsFinite(RepetitionsInput) || RepetitionsInput != Math.Truncate(RepetitionsInput) ||
             RepetitionsInput is < 1 or > 1_000_000 || !double.IsFinite(SegmentCapSecondsInput) ||
             SegmentCapSecondsInput != Math.Truncate(SegmentCapSecondsInput) ||
-            SegmentCapSecondsInput < duration || SegmentCapSecondsInput > 6000)
+            SegmentCapSecondsInput < 1 || SegmentCapSecondsInput > 6000 || (!SyncEveryRepetition && SegmentCapSecondsInput < duration))
         {
             StatusMessage = "Use a whole repetition count 1–1,000,000 and a segment cap from the countdown duration to 6000 s.";
             return;
@@ -183,7 +195,8 @@ internal sealed partial class MainViewModel
         try
         {
             RepetitionProgram plan = RepetitionProgram.Create(CreateCommandId(), duration, (uint)RepetitionsInput,
-                chosen.Select(d => d.DeviceId), (uint)SegmentCapSecondsInput, FactoryProtocol.RepetitionLogoSeconds);
+                chosen.Select(d => d.DeviceId), (uint)SegmentCapSecondsInput, FactoryProtocol.RepetitionLogoSeconds,
+                SignalEveryRepetitionStart ? FactoryProtocol.RepetitionLogoSeconds : 0u, SyncEveryRepetition);
             ProgramExecutionState state = ProgramExecutionState.New(plan, productionProgram?.State);
             programStore.Save(state);
             productionProgram = new(programStore, state);
@@ -392,7 +405,7 @@ internal sealed partial class MainViewModel
                     .Min(x => x.Execution.ElapsedSegmentMicroseconds);
                 long target = MasterClock.NowMicroseconds - phase;
                 clock.ArmSegmentAt(segment.DurationSeconds, segment.RepeatCount, target,
-                    segment.FirstRepeat, productionProgram.State.Program.TotalRepeats, segment.LogoSeconds);
+                    segment.FirstRepeat, productionProgram.State.Program.TotalRepeats, segment.LogoSeconds, segment.RepeatStartSeconds);
                 productionSilentRunActive = true;
                 productionSilentRunOwnsExactWindow = false;
                 foreach (DeviceViewModel device in ProgramParticipants()) device.BeginIntentionalStatusPause();
@@ -497,6 +510,8 @@ internal sealed partial class MainViewModel
         ProductionProgramText = $"Plan {state.Program.PlanId:X16} | {state.Stage} | repeat {repeat}/{state.Program.TotalRepeats} | " +
             $"segment {state.CurrentSegmentIndex}/{state.Program.Segments.Count} | plan {plan}\n" +
             $"Frozen fleet: {string.Join(", ", state.Program.Participants)}. {state.Message}" +
+            (state.Program.RepeatStartSeconds == 0 ? "" : "\nStart logo/output: every repetition.") +
+            (state.Program.SyncEveryRepetition ? "\nSynchronization: every repetition." : "") +
             (programDriftAlert.Length == 0 ? "" : "\n" + programDriftAlert);
         OnPropertyChanged(nameof(CanManageProgram));
         NotifyCountdownControls();
@@ -563,6 +578,7 @@ internal sealed partial class MainViewModel
             bool segmentMatch = segment != null && e.SegmentIndex == segment.Index &&
                 e.DurationSeconds == segment.DurationSeconds && e.RepeatCount == segment.RepeatCount &&
                 e.LogoSeconds.GetValueOrDefault() == segment.LogoSeconds &&
+                e.RepeatStartSeconds.GetValueOrDefault() == segment.RepeatStartSeconds &&
                 e.FirstRepeat == segment.FirstRepeat && e.TotalRepeats == state.Program.TotalRepeats;
             bool targetMatch = e.TargetMasterMicroseconds == state.TargetMasterMicroseconds;
             string readyReason = ProductionRecoveryPolicy.OperationalReadinessReason(observed);
@@ -677,6 +693,7 @@ internal sealed partial class MainViewModel
                 e.State != TimerState.Finished || h.State != TimerState.Finished ||
                 e.DurationSeconds != segment.DurationSeconds || e.RepeatCount != segment.RepeatCount ||
                 e.LogoSeconds.GetValueOrDefault() != segment.LogoSeconds ||
+                e.RepeatStartSeconds.GetValueOrDefault() != segment.RepeatStartSeconds ||
                 e.FirstRepeat != segment.FirstRepeat || e.TotalRepeats != state.Program.TotalRepeats ||
                 e.TargetMasterMicroseconds != state.TargetMasterMicroseconds ||
                 e.CurrentRepeat != segment.LastRepeat || e.ElapsedSegmentSeconds != segment.Duration ||

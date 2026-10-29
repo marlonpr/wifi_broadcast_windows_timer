@@ -3243,7 +3243,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                     SegmentIndex: programSegment?.Index ?? 0, RepeatCount: programSegment?.RepeatCount ?? 1,
                     FirstRepeat: programSegment?.FirstRepeat ?? 1,
                     TotalRepeats: programSegment is null ? 1 : productionProgram!.State.Program.TotalRepeats,
-                    LogoSeconds: programSegment?.LogoSeconds ?? 0);
+                    LogoSeconds: programSegment?.LogoSeconds ?? 0, RepeatStartSeconds: programSegment?.RepeatStartSeconds ?? 0);
                 preparedForAbort = prepared;
 
                 // Start a low-overhead in-memory TX trace before any START_AT
@@ -3270,7 +3270,8 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                     0,
                     prepared.TargetMasterMicroseconds, PlanId: prepared.PlanId,
                     SegmentIndex: prepared.SegmentIndex, RepeatCount: prepared.RepeatCount,
-                    FirstRepeat: prepared.FirstRepeat, TotalRepeats: prepared.TotalRepeats, LogoSeconds: prepared.LogoSeconds);
+                    FirstRepeat: prepared.FirstRepeat, TotalRepeats: prepared.TotalRepeats, LogoSeconds: prepared.LogoSeconds,
+                    RepeatStartSeconds: prepared.RepeatStartSeconds);
                 if (programSegment is not null)
                     productionProgram!.RecordArm(prepared.CommandId, prepared.TargetMasterMicroseconds,
                         controllerSessionId, CurrentProgramObservations().Values.ToArray());
@@ -3282,7 +3283,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                 }
 
                 clock.ArmSegmentAt(prepared.DurationSeconds, prepared.RepeatCount, prepared.TargetMasterMicroseconds,
-                    prepared.FirstRepeat, prepared.TotalRepeats, prepared.LogoSeconds);
+                    prepared.FirstRepeat, prepared.TotalRepeats, prepared.LogoSeconds, prepared.RepeatStartSeconds);
                 SetStartDiagnostic(
                     $"START: ARMING {prepared.Participants.Count} selected timer(s); waiting for ACKs and final STATUS barrier...");
 
@@ -3880,6 +3881,7 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
                     execution.CommandId != prepared.CommandId || execution.State != TimerState.Armed ||
                     execution.DurationSeconds != prepared.DurationSeconds || execution.RepeatCount != prepared.RepeatCount ||
                     execution.LogoSeconds.GetValueOrDefault() != prepared.LogoSeconds ||
+                    execution.RepeatStartSeconds.GetValueOrDefault() != prepared.RepeatStartSeconds ||
                     execution.FirstRepeat != prepared.FirstRepeat || execution.TotalRepeats != prepared.TotalRepeats ||
                     execution.TargetMasterMicroseconds != prepared.TargetMasterMicroseconds ||
                     execution.BootId != participant.GateSnapshot.BootId)
@@ -5386,9 +5388,9 @@ internal sealed partial class MainViewModel : ObservableObject, IDisposable
         IReadOnlyList<PreparedParticipant> Participants,
         bool RequireWarmupHealth = false,
         QualificationWarmupProof? WarmupProof = null, ulong PlanId = 0, uint SegmentIndex = 0,
-        uint RepeatCount = 1, uint FirstRepeat = 1, uint TotalRepeats = 1, uint LogoSeconds = 0)
+        uint RepeatCount = 1, uint FirstRepeat = 1, uint TotalRepeats = 1, uint LogoSeconds = 0, uint RepeatStartSeconds = 0)
     {
-        public uint SegmentDurationSeconds => FactoryProtocol.SegmentDuration(DurationSeconds, RepeatCount, LogoSeconds);
+        public uint SegmentDurationSeconds => FactoryProtocol.SegmentDuration(DurationSeconds, RepeatCount, LogoSeconds, RepeatStartSeconds);
     }
 
     private sealed record StartTelemetryContext(

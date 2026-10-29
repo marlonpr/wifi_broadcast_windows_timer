@@ -39,6 +39,8 @@ internal sealed partial class MainViewModel
         OnPropertyChanged(nameof(CanResetCountdown));
         OnPropertyChanged(nameof(CanEditParticipants));
         OnPropertyChanged(nameof(CanEditCountdownSettings));
+        OnPropertyChanged(nameof(CanEditRepetitionOptions));
+        OnPropertyChanged(nameof(CanEditResyncLimit));
         OnPropertyChanged(nameof(CountdownStartAvailabilityText));
     }
 
@@ -125,9 +127,12 @@ internal sealed partial class MainViewModel
     {
         if (segment is not { LogoSeconds: > 0 }) return [];
         return participants.Where(d => !HasFreshExecutionReply(d.DeviceId, challenge) ||
-                !matchedExecutionReplies[d.DeviceId].Packet.SupportsLogoOutput)
+                !matchedExecutionReplies[d.DeviceId].Packet.SupportsLogoOutput ||
+                (segment.RepeatStartSeconds != 0 && !matchedExecutionReplies[d.DeviceId].Packet.SupportsRepetitionStart))
             .Select(d => new StartBlock(StartBlockReason.FirmwareIncompatible, d.DeviceId,
-                "Four-second logo/output requires timer firmware 6.24.6-rc1 or later. Reflash this timer before START."))
+                segment.RepeatStartSeconds != 0
+                    ? "Repetition-start logo/output requires timer firmware 6.24.8-rc1 or later. Reflash this timer before START."
+                    : "Four-second logo/output requires timer firmware 6.24.6-rc1 or later. Reflash this timer before START."))
             .ToArray();
     }
 
@@ -145,7 +150,7 @@ internal sealed partial class MainViewModel
                 .Min(x => x.Execution.ElapsedSegmentMicroseconds);
             long target = before.ControllerSessionId == controllerSessionId ? before.TargetMasterMicroseconds :
                 MasterClock.NowMicroseconds - phase;
-            clock.ArmSegmentAt(segment.DurationSeconds, segment.RepeatCount, target, segment.FirstRepeat, before.Program.TotalRepeats, segment.LogoSeconds);
+            clock.ArmSegmentAt(segment.DurationSeconds, segment.RepeatCount, target, segment.FirstRepeat, before.Program.TotalRepeats, segment.LogoSeconds, segment.RepeatStartSeconds);
             await PauseForRecoveredSegmentSetupAsync(decision.RemainingSeconds ?? 1);
         }
         if (decision.Action is ReconcileAction.ObserveActiveSegment or ReconcileAction.SynchronizeNextSegment or ReconcileAction.WaitForReadiness)
@@ -279,14 +284,17 @@ internal sealed partial class MainViewModel
             uint repeats = double.IsFinite(RepetitionsInput) && RepetitionsInput == Math.Truncate(RepetitionsInput) &&
                 RepetitionsInput is >= 1 and <= 1_000_000 ? (uint)RepetitionsInput : 1u;
             uint cap = double.IsFinite(SegmentCapSecondsInput) && SegmentCapSecondsInput == Math.Truncate(SegmentCapSecondsInput) &&
-                SegmentCapSecondsInput >= duration && SegmentCapSecondsInput <= 6000 ? (uint)SegmentCapSecondsInput : 6000u;
+                SegmentCapSecondsInput >= (SyncEveryRepetition ? 1 : duration) && SegmentCapSecondsInput <= 6000 ? (uint)SegmentCapSecondsInput : 6000u;
             RepetitionProgram plan;
-            try { plan = RepetitionProgram.Create(CreateCommandId(), duration, repeats, selected, cap, FactoryProtocol.RepetitionLogoSeconds); }
+            try { plan = RepetitionProgram.Create(CreateCommandId(), duration, repeats, selected, cap, FactoryProtocol.RepetitionLogoSeconds,
+                SignalEveryRepetitionStart ? FactoryProtocol.RepetitionLogoSeconds : 0u, SyncEveryRepetition); }
             catch (ArgumentOutOfRangeException)
             {
                 // Invalid repetition/segment geometry must not prevent RESET.
                 // START will validate the draft before creating its next run.
-                plan = RepetitionProgram.Create(CreateCommandId(), duration, 1, selected, logoSeconds: FactoryProtocol.RepetitionLogoSeconds);
+                plan = RepetitionProgram.Create(CreateCommandId(), duration, 1, selected, logoSeconds: FactoryProtocol.RepetitionLogoSeconds,
+                    repeatStartSeconds: SignalEveryRepetitionStart ? FactoryProtocol.RepetitionLogoSeconds : 0u,
+                    syncEveryRepetition: SyncEveryRepetition);
             }
 
             StoppedCountdownCheckpoint? saved = previous?.StopCheckpoint;

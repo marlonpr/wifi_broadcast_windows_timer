@@ -118,9 +118,10 @@ public sealed record CommandPacket(
     uint SegmentIndex = 0,
     uint RepeatCount = 1,
     uint FirstRepeat = 1,
-    uint TotalRepeats = 1, ulong ExpectedBootId = 0, ulong ExpectedPreviousCommandId = 0, uint LogoSeconds = 0)
+    uint TotalRepeats = 1, ulong ExpectedBootId = 0, ulong ExpectedPreviousCommandId = 0, uint LogoSeconds = 0,
+    uint RepeatStartSeconds = 0)
 {
-    public uint SegmentDurationSeconds => FactoryProtocol.SegmentDuration(DurationSeconds, RepeatCount, LogoSeconds);
+    public uint SegmentDurationSeconds => FactoryProtocol.SegmentDuration(DurationSeconds, RepeatCount, LogoSeconds, RepeatStartSeconds);
 }
 
 public sealed record SyncRequestPacket(
@@ -217,11 +218,13 @@ public sealed record ExecutionStatusPacket(
     string DeviceId, ulong ResponseId, ulong BootId, ulong PlanId, uint SegmentIndex,
     ulong CommandId, TimerState State, uint DurationSeconds, uint RepeatCount,
     uint FirstRepeat, uint TotalRepeats, uint CurrentRepeat, uint ElapsedSegmentSeconds,
-    long TargetMasterMicroseconds, long TStarLocalMicroseconds, ushort RtcRecoveredEdges, long ElapsedSegmentMicroseconds = 0, uint? LogoSeconds = null)
+    long TargetMasterMicroseconds, long TStarLocalMicroseconds, ushort RtcRecoveredEdges, long ElapsedSegmentMicroseconds = 0, uint? LogoSeconds = null,
+    uint? RepeatStartSeconds = null)
     : InboundPacket(DeviceId)
 {
-    public uint SegmentDurationSeconds => FactoryProtocol.SegmentDuration(DurationSeconds, RepeatCount, LogoSeconds.GetValueOrDefault());
+    public uint SegmentDurationSeconds => FactoryProtocol.SegmentDuration(DurationSeconds, RepeatCount, LogoSeconds.GetValueOrDefault(), RepeatStartSeconds.GetValueOrDefault());
     public bool SupportsLogoOutput => LogoSeconds.HasValue;
+    public bool SupportsRepetitionStart => RepeatStartSeconds.HasValue;
 }
 
 public sealed record SyncAppliedPacket(
@@ -259,7 +262,9 @@ public static class FactoryProtocol
         {
             string basis = FormattableString.Invariant(
                 $"{Version2}|CMD|START_AT|{packet.CommandId:X16}|{packet.DurationSeconds}|{packet.StartAtMasterMicroseconds}|{packet.PlanId:X16}|{packet.SegmentIndex}|{packet.RepeatCount}|{packet.FirstRepeat}|{packet.TotalRepeats}|{packet.ExpectedBootId:X16}|{packet.ExpectedPreviousCommandId:X16}");
-            return packet.LogoSeconds == 0 ? basis : basis + FormattableString.Invariant($"|{packet.LogoSeconds}");
+            if (packet.LogoSeconds == 0) return basis;
+            string logo = basis + FormattableString.Invariant($"|{packet.LogoSeconds}");
+            return packet.RepeatStartSeconds == 0 ? logo : logo + FormattableString.Invariant($"|{packet.RepeatStartSeconds}");
         }
         return packet.CommandType switch
         {
@@ -324,13 +329,15 @@ public static class FactoryProtocol
         packet = null;
         if (!ValidateEnvelope(text, out error)) return false;
         string[] fields = text.Split('|', StringSplitOptions.None);
-        if (fields.Length is 13 or 14)
+        if (fields.Length is 13 or 14 or 15)
         {
             if (fields[0] != Version2 || fields[1] != "CMD" || fields[2] != "START_AT" ||
                 !TryParseCommand(string.Join("|", fields.Take(6)), out CommandPacket? basis, out error) || basis is null)
                 return false;
             uint logo = 0;
-            if ((fields.Length == 14 && (!TryUInt(fields[13], RepetitionLogoSeconds, RepetitionLogoSeconds, out logo))) ||
+            uint repeatStart = 0;
+            if ((fields.Length >= 14 && (!TryUInt(fields[13], RepetitionLogoSeconds, RepetitionLogoSeconds, out logo))) ||
+                (fields.Length == 15 && (!TryUInt(fields[14], RepetitionLogoSeconds, RepetitionLogoSeconds, out repeatStart))) ||
                 !TryCommandId(fields[6], false, out ulong planId) ||
                 !TryUInt(fields[7], 1, uint.MaxValue, out uint segmentIndex) ||
                 !TryUInt(fields[8], 1, uint.MaxValue, out uint repeats) ||
@@ -338,14 +345,14 @@ public static class FactoryProtocol
                 !TryUInt(fields[10], 1, uint.MaxValue, out uint total) ||
                 !TryCommandId(fields[11], false, out ulong boot) ||
                 !TryCommandId(fields[12], true, out ulong previous) ||
-                !ValidSegment(basis.DurationSeconds, repeats, first, total, segmentIndex, logo))
+                !ValidSegment(basis.DurationSeconds, repeats, first, total, segmentIndex, logo, repeatStart))
             {
                 error = ProtocolParseError.Duration;
                 return false;
             }
             packet = basis with { PlanId = planId, SegmentIndex = segmentIndex,
                 RepeatCount = repeats, FirstRepeat = first, TotalRepeats = total,
-                ExpectedBootId = boot, ExpectedPreviousCommandId = previous, LogoSeconds = logo };
+                ExpectedBootId = boot, ExpectedPreviousCommandId = previous, LogoSeconds = logo, RepeatStartSeconds = repeatStart };
             return true;
         }
         if (fields.Length != 6)
@@ -1044,10 +1051,10 @@ public static class FactoryProtocol
     {
         if (packet.PlanId != 0 && (packet.CommandType != CommandType.StartAt || packet.ExpectedBootId == 0 ||
             !ValidSegment(packet.DurationSeconds, packet.RepeatCount, packet.FirstRepeat,
-                          packet.TotalRepeats, packet.SegmentIndex, packet.LogoSeconds)))
+                          packet.TotalRepeats, packet.SegmentIndex, packet.LogoSeconds, packet.RepeatStartSeconds)))
             throw new ArgumentOutOfRangeException(nameof(packet), "Invalid segment geometry.");
         if (packet.PlanId == 0 && (packet.RepeatCount != 1 || packet.FirstRepeat != 1 ||
-            packet.TotalRepeats != 1 || packet.SegmentIndex != 0 || packet.ExpectedBootId != 0 || packet.ExpectedPreviousCommandId != 0 || packet.LogoSeconds != 0))
+            packet.TotalRepeats != 1 || packet.SegmentIndex != 0 || packet.ExpectedBootId != 0 || packet.ExpectedPreviousCommandId != 0 || packet.LogoSeconds != 0 || packet.RepeatStartSeconds != 0))
             throw new ArgumentOutOfRangeException(nameof(packet), "Segment fields require PlanId.");
 
         if (packet.CommandId == 0)
@@ -1109,27 +1116,33 @@ public static class FactoryProtocol
     }
 
     public const uint RepetitionLogoSeconds = 4;
-    public static ulong SegmentSeconds(uint duration, uint repeats, uint logo = 0) => ((ulong)duration + logo) * repeats;
-    public static uint SegmentDuration(uint duration, uint repeats, uint logo = 0) => checked((uint)SegmentSeconds(duration, repeats, logo));
-    public static uint RepeatOffset(uint duration, uint repeats, ulong elapsed, uint logo = 0) =>
-        duration == 0 || repeats == 0 ? 0 : (uint)Math.Min(elapsed / ((ulong)duration + logo), repeats - 1UL);
-    public static uint RepeatRemaining(uint duration, uint repeats, ulong elapsed, uint logo = 0)
+    public static ulong SegmentSeconds(uint duration, uint repeats, uint logo = 0, uint repeatStart = 0) =>
+        ((ulong)duration + logo) * repeats + (ulong)repeatStart * (repeats == 0 ? 0 : repeats - 1);
+    public static uint SegmentDuration(uint duration, uint repeats, uint logo = 0, uint repeatStart = 0) => checked((uint)SegmentSeconds(duration, repeats, logo, repeatStart));
+    public static bool IsRepeatStart(uint duration, uint repeats, ulong elapsed, uint logo = 0, uint repeatStart = 0) =>
+        duration > 0 && repeatStart > 0 && elapsed < SegmentSeconds(duration, repeats, logo, repeatStart) &&
+        elapsed % ((ulong)duration + logo + repeatStart) >= (ulong)duration + logo;
+    public static uint RepeatOffset(uint duration, uint repeats, ulong elapsed, uint logo = 0, uint repeatStart = 0) =>
+        duration == 0 || repeats == 0 ? 0 : (uint)Math.Min(elapsed / ((ulong)duration + logo + repeatStart) +
+            (IsRepeatStart(duration, repeats, elapsed, logo, repeatStart) ? 1UL : 0UL), repeats - 1UL);
+    public static uint RepeatRemaining(uint duration, uint repeats, ulong elapsed, uint logo = 0, uint repeatStart = 0)
     {
-        if (duration == 0 || elapsed >= SegmentSeconds(duration, repeats, logo)) return 0;
-        uint phase = (uint)(elapsed % ((ulong)duration + logo));
+        if (duration == 0 || elapsed >= SegmentSeconds(duration, repeats, logo, repeatStart)) return 0;
+        uint phase = (uint)(elapsed % ((ulong)duration + logo + repeatStart));
         return phase < duration ? duration - phase : 0;
     }
-    public static bool ValidSegment(uint duration, uint repeats, uint first, uint total, uint segment, uint logo = 0) =>
+    public static bool ValidSegment(uint duration, uint repeats, uint first, uint total, uint segment, uint logo = 0, uint repeatStart = 0) =>
         duration is >= 1 and <= MaximumRepeatDurationSeconds && repeats >= 1 && first >= 1 &&
         (logo == 0 || logo == RepetitionLogoSeconds) && total >= 1 && segment >= 1 &&
-        SegmentSeconds(duration, repeats, logo) - logo <= MaximumSegmentDurationSeconds && (ulong)first + repeats - 1 <= total;
+        (repeatStart == 0 || (repeatStart == RepetitionLogoSeconds && logo == RepetitionLogoSeconds)) &&
+        SegmentSeconds(duration, repeats, logo, repeatStart) - logo <= MaximumSegmentDurationSeconds && (ulong)first + repeats - 1 <= total;
 
     private static bool TryParseExecutionStatus(string[] f, out InboundPacket? packet,
                                                out ProtocolParseError error)
     {
         packet = null;
         error = ProtocolParseError.FieldCount;
-        if (f.Length is not (19 or 20)) return false;
+        if (f.Length is not (19 or 20 or 21)) return false;
         error = ProtocolParseError.PacketType;
         if (!ValidDeviceId(f[2]) || !TryCommandId(f[3], true, out ulong response) ||
             !TryCommandId(f[4], false, out ulong boot) || !TryCommandId(f[5], true, out ulong plan) ||
@@ -1145,21 +1158,24 @@ public static class FactoryProtocol
             !TryUInt(f[17], 0, 129, out uint recovery) ||
             !TryLong(f[18], false, out long phase)) return false;
         uint logo = 0;
-        if (f.Length == 20 && (!TryUInt(f[19], 0, RepetitionLogoSeconds, out logo) || (logo != 0 && logo != RepetitionLogoSeconds))) return false;
-        if (plan != 0 && (!ValidSegment(duration, repeats, first, total, segment, logo) ||
+        uint repeatStart = 0;
+        if (f.Length >= 20 && (!TryUInt(f[19], 0, RepetitionLogoSeconds, out logo) || (logo != 0 && logo != RepetitionLogoSeconds))) return false;
+        if (f.Length == 21 && (!TryUInt(f[20], 0, RepetitionLogoSeconds, out repeatStart) || (repeatStart != 0 && repeatStart != RepetitionLogoSeconds))) return false;
+        if (plan != 0 && (!ValidSegment(duration, repeats, first, total, segment, logo, repeatStart) ||
             command == 0 || target == 0 || local == 0)) return false;
-        if (plan == 0 && (segment != 0 || repeats != 1 || first != 1 || total != 1 || logo != 0)) return false;
-        ulong length = SegmentSeconds(duration, repeats, logo);
+        if (plan == 0 && (segment != 0 || repeats != 1 || first != 1 || total != 1 || logo != 0 || repeatStart != 0)) return false;
+        ulong length = SegmentSeconds(duration, repeats, logo, repeatStart);
         if ((state == TimerState.Ready && elapsed != 0) ||
             (state == TimerState.Armed && phase > 0) ||
             (state != TimerState.Armed && (phase < 0 || phase / 1_000_000 != elapsed)) ||
             phase > (long)length * 1_000_000 ||
-            elapsed > length || current != first + RepeatOffset(duration, repeats, elapsed, logo) ||
+            elapsed > length || current != first + RepeatOffset(duration, repeats, elapsed, logo, repeatStart) ||
             (state == TimerState.Armed && elapsed != 0) ||
             (state == TimerState.Running && elapsed >= length) ||
             (state == TimerState.Finished && elapsed != length)) return false;
         packet = new ExecutionStatusPacket(f[2], response, boot, plan, segment, command, state,
-            duration, repeats, first, total, current, elapsed, target, local, (ushort)recovery, phase, f.Length == 20 ? logo : null);
+            duration, repeats, first, total, current, elapsed, target, local, (ushort)recovery, phase,
+            f.Length >= 20 ? logo : null, f.Length == 21 ? repeatStart : null);
         error = ProtocolParseError.None;
         return true;
     }

@@ -1,3 +1,35 @@
+# Repetition-start extension — firmware 6.24.8-rc1 / controller 6.23.18
+
+START_AT may append `RepeatStartSeconds=4` after `LogoSeconds=4`, for 15 fields.
+If the new option is OFF, normal logo commands stay at 14 fields; legacy
+segments stay at 13. Only 4 is accepted in either explicitly appended command
+field. Repetition-start signaling requires end-logo mode as well.
+
+For n repetitions, countdown D, end logo L and optional start logo S:
+completion = n*(D+L)+(n-1)*S. The last countdown endpoint, completion-L, must fit
+the cap. S adds a logo and steady output before each internal repetition. The
+first repetition uses the existing pre-T* startup signal. The repetition index
+advances at its start-logo boundary; remaining=0 and state=RUNNING in both logo
+phases. The final repetition has its end logo and no following start signal.
+
+EXEC_STATUS always has 21 fields in new firmware, appending RepeatStartSeconds
+(0 or 4) after LogoSeconds. Its presence announces the capability. The new
+controller accepts 19/20/21 fields and requires fresh challenged 21-field
+evidence for the new command. Command fences, final ARM and recovery compare
+both durations. STATUS and RUN_DIAG remain unchanged.
+
+GPIO33 is active-LOW: LOW=ON, HIGH=OFF. Startup is steady LOW for four local
+seconds after accepted ARM, then HIGH. End logos blink 500 ms LOW / 500 ms HIGH;
+optional internal start logos stay LOW for four disciplined seconds. RESET,
+completion and timer-arm failure return HIGH. COMMIT remains GPIO17 on the same
+T* + n*1,000,000 us publication grid.
+
+Sync-every-repetition is a controller planning option: one repeat per segment,
+using normal readiness/sync/ARM for each. It adds no wire field or duplicate
+startup signal. The seconds-limit policy remains the default.
+
+The entries below are historical and describe their original versions/polarity.
+
 # Logo/output extension — firmware 6.24.6-rc1 / controller 6.23.17
 
 Logo-enabled segmented START_AT appends one decimal field `LogoSeconds=4` to

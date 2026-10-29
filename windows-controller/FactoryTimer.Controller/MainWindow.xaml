@@ -83,8 +83,18 @@
                                    Minimum="1" Maximum="1000000" SmallChange="1" IsEnabled="{Binding CanEditCountdownSettings}"
                                    SpinButtonPlacementMode="Inline" />
                         <NumberBox Header="Resync limit (seconds)" Value="{Binding SegmentCapSecondsInput, Mode=TwoWay}"
-                                   Minimum="1" Maximum="6000" SmallChange="1" IsEnabled="{Binding CanEditCountdownSettings}"
+                                   Minimum="1" Maximum="6000" SmallChange="1" IsEnabled="{Binding CanEditResyncLimit}"
                                    SpinButtonPlacementMode="Inline" />
+                        <CheckBox Content="Start logo + output before every repetition (4 seconds)"
+                                  IsChecked="{Binding SignalEveryRepetitionStart, Mode=TwoWay}"
+                                  IsEnabled="{Binding CanEditRepetitionOptions}"
+                                  ToolTipService.ToolTip="Adds a four-second logo and steady active-LOW signal before each internal repetition. Countdown duration stays unchanged. RESET to change a paused program." />
+                        <CheckBox Content="Sync before every repetition"
+                                  IsChecked="{Binding SyncEveryRepetition, Mode=TwoWay}"
+                                  IsEnabled="{Binding CanEditRepetitionOptions}"
+                                  ToolTipService.ToolTip="Checked: one repetition per segment, with synchronization between repeats. Unchecked: use the resync time limit. RESET to change a paused program." />
+                        <TextBlock Text="Unchecked: use the resync limit. Syncing every repetition adds a network pause."
+                                   TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         <Grid ColumnSpacing="12" Margin="0,6,0,0" AutomationProperties.Name="Countdown controls">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />

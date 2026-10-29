@@ -5,52 +5,59 @@ using FactoryTimer.Protocol;
 
 namespace FactoryTimer.Controller.Core;
 
-public sealed record ProgramSegment(uint Index, uint FirstRepeat, uint RepeatCount, uint DurationSeconds, uint LogoSeconds = 0)
+public sealed record ProgramSegment(uint Index, uint FirstRepeat, uint RepeatCount, uint DurationSeconds, uint LogoSeconds = 0,
+    uint RepeatStartSeconds = 0)
 {
-    public uint Duration => FactoryProtocol.SegmentDuration(DurationSeconds, RepeatCount, LogoSeconds);
+    public uint Duration => FactoryProtocol.SegmentDuration(DurationSeconds, RepeatCount, LogoSeconds, RepeatStartSeconds);
     public uint CountdownSpan => Duration - LogoSeconds;
     public uint LastRepeat => checked(FirstRepeat + RepeatCount - 1);
     public CommandPacket Command(ulong plan, uint total, ulong command, long target, ulong boot = 1, ulong previous = 0) =>
         new(CommandType.StartAt, command, DurationSeconds, 0, target,
             PlanId: plan, SegmentIndex: Index, RepeatCount: RepeatCount,
-            FirstRepeat: FirstRepeat, TotalRepeats: total, ExpectedBootId: boot, ExpectedPreviousCommandId: previous, LogoSeconds: LogoSeconds);
+            FirstRepeat: FirstRepeat, TotalRepeats: total, ExpectedBootId: boot, ExpectedPreviousCommandId: previous,
+            LogoSeconds: LogoSeconds, RepeatStartSeconds: RepeatStartSeconds);
 }
 
 public sealed record RepetitionProgram(ulong PlanId, uint DurationSeconds, uint TotalRepeats,
     uint SegmentCapSeconds, IReadOnlyList<string> Participants, IReadOnlyList<ProgramSegment> Segments,
-    CountdownPosition? ResumePosition = null, uint LogoSeconds = 0)
+    CountdownPosition? ResumePosition = null, uint LogoSeconds = 0,
+    uint RepeatStartSeconds = 0, bool SyncEveryRepetition = false)
 {
     public static RepetitionProgram Create(ulong id, uint duration, uint repeats,
-        IEnumerable<string> participants, uint cap = 6000, uint logoSeconds = 0) =>
-        CreateCore(id, duration, repeats, participants, cap, null, logoSeconds);
+        IEnumerable<string> participants, uint cap = 6000, uint logoSeconds = 0,
+        uint repeatStartSeconds = 0, bool syncEveryRepetition = false) =>
+        CreateCore(id, duration, repeats, participants, cap, null, logoSeconds, repeatStartSeconds, syncEveryRepetition);
 
     public static RepetitionProgram ContinueFrom(ulong id, RepetitionProgram original, CountdownPosition position,
         IEnumerable<string>? participants = null)
     {
         original.Validate();
         return CreateCore(id, original.DurationSeconds, original.TotalRepeats,
-            participants ?? original.Participants, original.SegmentCapSeconds, position, original.LogoSeconds);
+            participants ?? original.Participants, original.SegmentCapSeconds, position, original.LogoSeconds,
+            original.RepeatStartSeconds, original.SyncEveryRepetition);
     }
 
     public RepetitionProgram WithParticipants(IEnumerable<string> participants)
     {
         Validate();
-        return CreateCore(PlanId, DurationSeconds, TotalRepeats, participants, SegmentCapSeconds, ResumePosition, LogoSeconds);
+        return CreateCore(PlanId, DurationSeconds, TotalRepeats, participants, SegmentCapSeconds, ResumePosition,
+            LogoSeconds, RepeatStartSeconds, SyncEveryRepetition);
     }
 
     private static RepetitionProgram CreateCore(ulong id, uint duration, uint repeats,
-        IEnumerable<string> participants, uint cap, CountdownPosition? resume, uint logo)
+        IEnumerable<string> participants, uint cap, CountdownPosition? resume, uint logo, uint repeatStart, bool syncEvery)
     {
         string[] roster = participants.Order(StringComparer.Ordinal).ToArray();
         if (id == 0 || duration is < 1 or > 5999 || repeats is < 1 or > 1_000_000 ||
-            cap < duration || cap > 6000 || roster.Length is < 1 or > 15 ||
+            cap < 1 || cap > 6000 || (!syncEvery && cap < duration) || roster.Length is < 1 or > 15 ||
             roster.Distinct(StringComparer.Ordinal).Count() != roster.Length ||
-            roster.Any(x => string.IsNullOrWhiteSpace(x)) || (logo != 0 && logo != FactoryProtocol.RepetitionLogoSeconds))
+            roster.Any(x => string.IsNullOrWhiteSpace(x)) || (logo != 0 && logo != FactoryProtocol.RepetitionLogoSeconds) ||
+            (repeatStart != 0 && (repeatStart != FactoryProtocol.RepetitionLogoSeconds || logo != FactoryProtocol.RepetitionLogoSeconds)))
             throw new ArgumentOutOfRangeException(nameof(duration), "Invalid repetition program.");
         if (resume is not null && (resume.CurrentRepeat < 1 || resume.CurrentRepeat > repeats ||
             resume.RemainingSeconds < 1 || resume.RemainingSeconds > duration))
             throw new ArgumentOutOfRangeException(nameof(resume), "No valid paused countdown remains.");
-        uint capacity = (cap + logo) / (duration + logo);
+        uint capacity = syncEvery ? 1u : (cap + logo + repeatStart) / (duration + logo + repeatStart);
         uint first = resume?.CurrentRepeat ?? 1;
         bool partial = resume is not null && resume.RemainingSeconds < duration;
         uint fullRepeats = repeats - first + (partial ? 0u : 1u);
@@ -61,21 +68,22 @@ public sealed record RepetitionProgram(ulong PlanId, uint DurationSeconds, uint 
         var segments = new List<ProgramSegment>();
         if (partial)
         {
-            segments.Add(new(1, first, 1, resume!.RemainingSeconds, logo));
+            segments.Add(new(1, first, 1, resume!.RemainingSeconds, logo, repeatStart));
             first++;
         }
         while (first <= repeats)
         {
             uint count = Math.Min(capacity, repeats - first + 1);
-            segments.Add(new((uint)segments.Count + 1, first, count, duration, logo));
+            segments.Add(new((uint)segments.Count + 1, first, count, duration, logo, repeatStart));
             first = checked(first + count);
         }
-        return new(id, duration, repeats, cap, roster, segments, resume, logo);
+        return new(id, duration, repeats, cap, roster, segments, resume, logo, repeatStart, syncEvery);
     }
 
     public void Validate()
     {
-        RepetitionProgram canonical = CreateCore(PlanId, DurationSeconds, TotalRepeats, Participants, SegmentCapSeconds, ResumePosition, LogoSeconds);
+        RepetitionProgram canonical = CreateCore(PlanId, DurationSeconds, TotalRepeats, Participants, SegmentCapSeconds,
+            ResumePosition, LogoSeconds, RepeatStartSeconds, SyncEveryRepetition);
         if (!canonical.Segments.SequenceEqual(Segments))
             throw new InvalidDataException("Saved segment plan does not match its geometry.");
     }
@@ -380,6 +388,7 @@ public sealed class SegmentedProgramCoordinator(IProgramStateStore store, Progra
             e.SegmentIndex == segment.Index && e.CommandId == State.CurrentCommandId &&
             e.DurationSeconds == segment.DurationSeconds && e.RepeatCount == segment.RepeatCount &&
             e.LogoSeconds.GetValueOrDefault() == segment.LogoSeconds &&
+            e.RepeatStartSeconds.GetValueOrDefault() == segment.RepeatStartSeconds &&
             e.FirstRepeat == segment.FirstRepeat && e.TotalRepeats == State.Program.TotalRepeats &&
             e.TargetMasterMicroseconds == State.TargetMasterMicroseconds &&
             x.Health.CommandId == e.CommandId && x.Health.State == e.State;

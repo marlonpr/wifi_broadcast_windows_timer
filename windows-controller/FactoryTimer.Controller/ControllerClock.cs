@@ -10,6 +10,7 @@ internal sealed class ControllerClock
     private uint repeatCount = 1;
     private uint firstRepeat = 1;
     private uint logoSeconds;
+    private uint repeatStartSeconds;
     public bool IsLogoPhase => State == TimerState.Running && logoSeconds != 0 && RemainingSeconds == 0;
     public uint CurrentRepeat { get; private set; } = 1;
     public uint TotalRepeats { get; private set; } = 1;
@@ -23,12 +24,13 @@ internal sealed class ControllerClock
         ArmSegmentAt(duration, 1, startAtMasterMicroseconds, 1, 1);
     }
 
-    public void ArmSegmentAt(uint duration, uint repeats, long target, uint first, uint total, uint logo = 0)
+    public void ArmSegmentAt(uint duration, uint repeats, long target, uint first, uint total, uint logo = 0, uint repeatStart = 0)
     {
         IsPaused = false;
         durationSeconds = duration;
         repeatCount = repeats;
         logoSeconds = logo;
+        repeatStartSeconds = repeatStart;
         firstRepeat = first;
         CurrentRepeat = first;
         TotalRepeats = total;
@@ -42,6 +44,7 @@ internal sealed class ControllerClock
         IsPaused = false;
         durationSeconds = duration;
         logoSeconds = 0;
+        repeatStartSeconds = 0;
         repeatCount = firstRepeat = CurrentRepeat = TotalRepeats = 1;
         RemainingSeconds = duration;
         scheduledStartMasterUs = 0;
@@ -72,15 +75,15 @@ internal sealed class ControllerClock
         }
 
         ulong elapsedSeconds = (ulong)((now - scheduledStartMasterUs) / 1_000_000L);
-        CurrentRepeat = firstRepeat + FactoryProtocol.RepeatOffset(durationSeconds, repeatCount, elapsedSeconds, logoSeconds);
-        if (elapsedSeconds >= FactoryProtocol.SegmentSeconds(durationSeconds, repeatCount, logoSeconds))
+        CurrentRepeat = firstRepeat + FactoryProtocol.RepeatOffset(durationSeconds, repeatCount, elapsedSeconds, logoSeconds, repeatStartSeconds);
+        if (elapsedSeconds >= FactoryProtocol.SegmentSeconds(durationSeconds, repeatCount, logoSeconds, repeatStartSeconds))
         {
             RemainingSeconds = 0;
             State = TimerState.Finished;
         }
         else
         {
-            RemainingSeconds = FactoryProtocol.RepeatRemaining(durationSeconds, repeatCount, elapsedSeconds, logoSeconds);
+            RemainingSeconds = FactoryProtocol.RepeatRemaining(durationSeconds, repeatCount, elapsedSeconds, logoSeconds, repeatStartSeconds);
             State = TimerState.Running;
         }
     }

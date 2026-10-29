@@ -363,7 +363,7 @@ using (var abortScopeVm = new MainViewModel(new DispatcherQueue(), new MemorySto
         participants.SetValue(Activator.CreateInstance(participantType, preparingDevices[i], IPAddress.Loopback,
             preparingDevices[i].BuildStartGateInput(DateTimeOffset.UtcNow)), i);
     object prepared = Activator.CreateInstance(runType, 900ul, 20u, 9_000_000L, participants,
-        false, null, 901ul, 1u, 1u, 1u, 1u, 0u)!;
+        false, null, 901ul, 1u, 1u, 1u, 1u, 0u, 0u)!;
     var restrict = typeof(MainViewModel).GetMethod("RestrictPreparedAbortForOperator", BindingFlags.Instance | BindingFlags.NonPublic)!;
     int CountPrepared(object run) => ((System.Collections.IEnumerable)runType.GetProperty("Participants")!.GetValue(run)!).Cast<object>().Count();
     Check(CountPrepared(restrict.Invoke(abortScopeVm, [prepared])!) == 3,
@@ -555,17 +555,65 @@ using (var logoVm = new MainViewModel(new DispatcherQueue(), new MemoryStore(), 
     var runType = typeof(MainViewModel).GetNestedType("PreparedStartRun",BindingFlags.NonPublic)!;
     var participantType = typeof(MainViewModel).GetNestedType("PreparedParticipant",BindingFlags.NonPublic)!;
     var participants = Array.CreateInstance(participantType,0);
-    var prepared = Activator.CreateInstance(runType,900ul,20u,5_000_000L,participants,false,null,900ul,1u,3u,1u,3u,4u)!;
+    var prepared = Activator.CreateInstance(runType,900ul,20u,5_000_000L,participants,false,null,900ul,1u,3u,1u,3u,4u,0u)!;
     Check((uint)runType.GetProperty("SegmentDurationSeconds")!.GetValue(prepared)! == 72,
         "prepared ARM, trace and silent window include the final logo instead of ending at 60s");
 }
 
+using (var optionsVm = new MainViewModel(new DispatcherQueue(), new MemoryStore(), new NoNetworkProvider()))
+{
+    Check(!optionsVm.SignalEveryRepetitionStart && !optionsVm.SyncEveryRepetition,"new options default OFF");
+    Check(optionsVm.CanEditResyncLimit,"normal mode uses the resync limit");
+    optionsVm.SyncEveryRepetition=true;optionsVm.SignalEveryRepetitionStart=true;
+    Check(!optionsVm.CanEditResyncLimit,"sync each repeat disables the unused limit field");
+    optionsVm.SyncEveryRepetition=false;Check(optionsVm.CanEditResyncLimit,"time-limit mode can be selected again");
+    var p=RepetitionProgram.Create(901,20,3,["ESP01"],logoSeconds:4,repeatStartSeconds:4);
+    var segment=p.Segments.Single();
+    var gate=typeof(MainViewModel).GetMethod("ValidateLogoFirmware",BindingFlags.Instance|BindingFlags.NonPublic)!;
+    DateTimeOffset challenge=DateTimeOffset.UtcNow;
+    var expected=Field<Dictionary<string,ulong>>(optionsVm,"expectedExecutionReplies");expected["ESP01"]=123;
+    var replies=Field<Dictionary<string,(ExecutionStatusPacket Packet,DateTimeOffset At)>>(optionsVm,"matchedExecutionReplies");
+    var idle=new ExecutionStatusPacket("ESP01",123,42,0,0,0,TimerState.Ready,20,1,1,1,1,0,0,0,129,LogoSeconds:0);
+    StartBlock[] Evaluate()=>(StartBlock[])gate.Invoke(optionsVm,[segment,new[]{optionsVm.Esp01},challenge])!;
+    replies["ESP01"]=(idle,DateTimeOffset.UtcNow);
+    Check(Evaluate().Single().Reason==StartBlockReason.FirmwareIncompatible,"6.24.7 lacks the optional per-repeat start feature");
+    replies["ESP01"]=(idle with{RepeatStartSeconds=0},challenge.AddTicks(-1));
+    Check(Evaluate().Length==1,"stale new feature evidence cannot authorize START");
+    replies["ESP01"]=(idle with{RepeatStartSeconds=0},DateTimeOffset.UtcNow);
+    Check(Evaluate().Length==0,"fresh challenged 21-field support authorizes the start feature");
+    expected["ESP01"]=124;Check(Evaluate().Length==1,"a previous challenge cannot authorize the start feature");
+    var d=optionsVm.Esp01;
+    d.Apply(new StatusPacket("ESP01",77,TimerState.Running,1),new IPEndPoint(freshIp,5000),MasterClock.NowMicroseconds);
+    d.ApplyExecution(idle with{PlanId=901,SegmentIndex=1,CommandId=77,State=TimerState.Running,RepeatCount=3,TotalRepeats=3,
+        CurrentRepeat=2,ElapsedSegmentSeconds=24,ElapsedSegmentMicroseconds=24_000_000,LogoSeconds=4,RepeatStartSeconds=4});
+    Set(d,"executionObservedAt",challenge);
+    d.UpdateRunningRemainingEstimate(challenge.AddSeconds(3));Check(d.RemainingSeconds=="LOGO","card shows LOGO throughout the steady start signal");
+    d.UpdateRunningRemainingEstimate(challenge.AddSeconds(4));Check(d.RemainingSeconds=="00:20","next countdown starts at its full duration");
+    var runType=typeof(MainViewModel).GetNestedType("PreparedStartRun",BindingFlags.NonPublic)!;
+    var participantType=typeof(MainViewModel).GetNestedType("PreparedParticipant",BindingFlags.NonPublic)!;
+    var participants=Array.CreateInstance(participantType,0);
+    var prepared=Activator.CreateInstance(runType,901ul,20u,5_000_000L,participants,false,null,901ul,1u,3u,1u,3u,4u,4u)!;
+    Check((uint)runType.GetProperty("SegmentDurationSeconds")!.GetValue(prepared)! == 80,"silent window and completion include both optional start gaps");
+    var stopped=ProgramExecutionState.New(p) with{Stage=ProgramStage.Stopped,StopCheckpoint=new(99,2,20,[])};
+    Set(optionsVm,"productionProgram",new SegmentedProgramCoordinator(new MemoryStore(),stopped));
+    Check(!optionsVm.CanEditRepetitionOptions,"paused execution keeps its saved timing options until RESET");
+}
+var optionsStore=new MemoryStore();
+optionsStore.Save(ProgramExecutionState.New(RepetitionProgram.Create(902,20,3,["ESP01"],logoSeconds:4,repeatStartSeconds:4,syncEveryRepetition:true)));
+using(var restoredOptions=new MainViewModel(new DispatcherQueue(),optionsStore,new NoNetworkProvider()))
+    Check(restoredOptions.SignalEveryRepetitionStart && restoredOptions.SyncEveryRepetition,"saved options are restored with the recovered plan");
+
 XDocument xaml = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
 XNamespace ns = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
 XElement resync = xaml.Descendants(ns + "NumberBox").Single(x => (string?)x.Attribute("Header") == "Resync limit (seconds)");
-XElement controls = resync.ElementsAfterSelf().First();
+XElement controls = resync.ElementsAfterSelf().First(x=>x.Name.LocalName=="Grid");
 Check(controls.Name.LocalName == "Grid" && controls.Elements(ns + "Button").Select(x => (string?)x.Attribute("Content"))
-    .SequenceEqual(new[] { "START", "STOP", "RESET" }), "exactly three controls immediately below resync limit");
+    .SequenceEqual(new[] { "START", "STOP", "RESET" }), "exactly three controls below repetition options");
+var optionBoxes=resync.ElementsAfterSelf().TakeWhile(x=>x!=controls).Where(x=>x.Name.LocalName=="CheckBox").ToArray();
+Check(optionBoxes.Length==2 && optionBoxes.Select(x=>(string?)x.Attribute("IsChecked"))
+    .SequenceEqual(new[]{"{Binding SignalEveryRepetitionStart, Mode=TwoWay}","{Binding SyncEveryRepetition, Mode=TwoWay}"}),
+    "two checkboxes expose independent repeat-start signaling and sync policy");
+Check((string?)resync.Attribute("IsEnabled")=="{Binding CanEditResyncLimit}","unused resync limit is disabled by the sync policy");
 Check(xaml.Descendants(ns + "Button").Count(x => new[] { "START", "STOP", "RESET" }.Contains((string?)x.Attribute("Content"))) == 3,
     "no duplicate countdown action buttons");
 Check(xaml.Descendants(ns + "Expander").Any(x => (string?)x.Attribute("Header") == "Engineering diagnostics" &&
@@ -576,7 +624,7 @@ Check(actionLog.Descendants(ns + "TextBlock").Any(x => (string?)x.Attribute("Tex
     (string?)x.Attribute("IsTextSelectionEnabled") == "True"), "selectable action log sits immediately below waiting text");
 Check(actionLog.Descendants(ns + "ScrollViewer").Any(x => (string?)x.Attribute("MaxHeight") == "180"),
     "long diagnostic history scrolls inside a bounded log panel");
-Check((string?)resync.Attribute("IsEnabled") == "{Binding CanEditCountdownSettings}" &&
+Check((string?)resync.Attribute("IsEnabled") == "{Binding CanEditResyncLimit}" &&
     xaml.Descendants(ns + "ItemsControl").Any(x => (string?)x.Attribute("ItemsSource") == "{Binding Devices}" &&
         (string?)x.Attribute("IsEnabled") == "{Binding CanEditParticipants}"),
     "timer selection is enabled independently of active program setting edits");
